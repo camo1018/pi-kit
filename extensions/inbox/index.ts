@@ -843,7 +843,8 @@ class InboxComponent {
 	private scroll = 0;
 	private searching = false;
 	/** Inline rename of the selected row (edited in place, no trip to pi's chat view). */
-	private renaming?: { id: string; input: Input };
+	/** `replace`: the original name is shown but the first typed char wipes it; cleared once you move the cursor. */
+	private renaming?: { id: string; input: Input; replace: boolean };
 	private loading = false;
 	private timer?: ReturnType<typeof setInterval>;
 	private flash?: { text: string; until: number };
@@ -1027,9 +1028,13 @@ class InboxComponent {
 		this.rebuild();
 	}
 
+	/**
+	 * Cursor at the start, original name still shown; the first typed char replaces the whole name.
+	 * Moving the cursor first (arrows, home/end, …) keeps the name and edits it in place.
+	 */
 	private startRename(row: Row) {
 		const input = new Input({ prompt: this.theme.fg("accent", "✎ ") });
-		input.setValue(row.info.name || cleanTitle(row.title).slice(0, 60));
+		input.setValue(row.info.name || cleanTitle(row.title).slice(0, 60)); // a fresh Input's cursor sits at 0
 		const id = row.info.id;
 		input.onEscape = () => {
 			this.renaming = undefined;
@@ -1051,14 +1056,33 @@ class InboxComponent {
 			this.rebuild();
 			void this.refresh();
 		};
-		this.renaming = { id, input };
+		this.renaming = { id, input, replace: true };
+	}
+
+	private renameInput(data: string) {
+		const r = this.renaming!;
+		// Plain enter always saves here: Input only submits on tui.input.submit, which users may
+		// rebind away from enter (e.g. enter = newline in the main editor).
+		if (matchesKey(data, "enter") || data === "\n" || this.kb.matches(data, "tui.input.submit")) {
+			r.input.onSubmit?.(r.input.getValue());
+			return;
+		}
+		if (r.replace && !matchesKey(data, "escape")) {
+			r.replace = false;
+			const typing = printable(data) !== undefined || data.includes("\x1b[200~");
+			const deleting = matchesKey(data, "backspace") || matchesKey(data, "delete");
+			if (typing || deleting) r.input.setValue("");
+			if (deleting) return;
+			// any other key (arrows, home/end, …) just keeps the name and edits it in place
+		}
+		r.input.handleInput(data);
 	}
 
 	handleInput(data: string): void {
 		const kb = this.kb;
 
 		if (this.renaming) {
-			this.renaming.input.handleInput(data);
+			this.renameInput(data);
 			this.tui.requestRender();
 			return;
 		}
@@ -1356,7 +1380,12 @@ class InboxComponent {
 		const k = (key: string, label: string) => `${th.fg("accent", key)} ${th.fg("dim", label)}`;
 		const archLabel = this.state.view === "archived" ? "unarchive" : r?.meta.archivedAt ? "unarchive" : "archive";
 		const help = this.renaming
-			? [k("type", "new name"), k("enter", "save"), k("esc", "cancel")].join(th.fg("dim", " · "))
+			? [
+					k("type", this.renaming.replace ? "to replace" : "to edit"),
+					...(this.renaming.replace ? [k("←→", "edit instead")] : []),
+					k("enter", "save"),
+					k("esc", "cancel"),
+				].join(th.fg("dim", " · "))
 			: this.searching
 			? [k("type", "to filter"), k("enter", "keep"), k("esc", "clear")].join(th.fg("dim", " · "))
 			: orchestrating()
