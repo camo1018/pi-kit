@@ -21,7 +21,7 @@ import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { getAgent } from "../lib/inbox-agents.ts";
+import { getAgent } from "../../lib/inbox-agents.ts";
 
 /** Root of all session files: ~/.pi/agent/sessions (one dir per cwd, slugged). */
 const SESSIONS_DIR = path.join(getAgentDir(), "sessions");

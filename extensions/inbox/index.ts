@@ -52,6 +52,7 @@ import {
 	Editor,
 	type Focusable,
 	getKeybindings,
+	Input,
 	Markdown,
 	Text,
 	wrapTextWithAnsi,
@@ -83,7 +84,7 @@ import {
 	sendToAgent,
 	sessionModel,
 	spawnAgent,
-} from "../lib/inbox-agents.ts";
+} from "../../lib/inbox-agents.ts";
 
 // ───────────────────────────── storage ─────────────────────────────
 
@@ -829,7 +830,6 @@ type InboxResult =
 	| { action: "view"; row: Row }
 	| { action: "new"; pickModel: boolean }
 	| { action: "cancel"; row: Row }
-	| { action: "rename"; row: Row }
 	| { action: "home" }
 	| { action: "exitMode" }
 	| { action: "quit" }
@@ -842,6 +842,8 @@ class InboxComponent {
 	private selected = 0;
 	private scroll = 0;
 	private searching = false;
+	/** Inline rename of the selected row (edited in place, no trip to pi's chat view). */
+	private renaming?: { id: string; input: Input };
 	private loading = false;
 	private timer?: ReturnType<typeof setInterval>;
 	private flash?: { text: string; until: number };
@@ -858,6 +860,8 @@ class InboxComponent {
 		private onRows: (rows: Row[]) => void,
 		/** Orchestrator: true when this window sits on home (nothing taken over). */
 		private atHome = false,
+		/** Persists a new session name; throws on failure. */
+		private onRename?: (row: Row, name: string) => void,
 	) {
 		this.rows = initialRows;
 		this.rebuild();
@@ -1023,8 +1027,41 @@ class InboxComponent {
 		this.rebuild();
 	}
 
+	private startRename(row: Row) {
+		const input = new Input({ prompt: this.theme.fg("accent", "✎ ") });
+		input.setValue(row.info.name || cleanTitle(row.title).slice(0, 60));
+		const id = row.info.id;
+		input.onEscape = () => {
+			this.renaming = undefined;
+			this.say("rename cancelled");
+		};
+		input.onSubmit = (value) => {
+			this.renaming = undefined;
+			const next = value.trim();
+			const target = this.rows.find((r) => r.info.id === id) ?? row;
+			if (!next || next === target.info.name) return this.say("name unchanged");
+			try {
+				this.onRename?.(target, next);
+			} catch (e) {
+				return this.say(`rename failed: ${e instanceof Error ? e.message : String(e)}`);
+			}
+			target.info.name = next;
+			target.title = next;
+			this.say("✎ renamed");
+			this.rebuild();
+			void this.refresh();
+		};
+		this.renaming = { id, input };
+	}
+
 	handleInput(data: string): void {
 		const kb = this.kb;
+
+		if (this.renaming) {
+			this.renaming.input.handleInput(data);
+			this.tui.requestRender();
+			return;
+		}
 
 		if (this.searching) {
 			if (kb.matches(data, "tui.select.cancel")) {
@@ -1109,7 +1146,7 @@ class InboxComponent {
 		} else if (ch === "u") {
 			if (row) this.toggleUnread(row);
 		} else if (ch === "r") {
-			if (row) this.done({ action: "rename", row });
+			if (row) this.startRename(row);
 		} else if (ch === "?") {
 			this.done({ action: "help" });
 		} else if (ch === "R" || matchesKey(data, "ctrl+r")) {
@@ -1258,14 +1295,17 @@ class InboxComponent {
 				if (r.meta.archivedAt && this.state.view === "all") t += th.fg("dim", " [archived]");
 				if (r.rule && r.meta.filter === "show" && this.state.view !== "filtered") t += th.fg("dim", " [kept]");
 				const age = this.state.view === "archived" && r.meta.archivedAt ? relTime(r.meta.archivedAt) : relTime(r.info.modified);
+				const editing = this.renaming && this.renaming.id === r.info.id ? this.renaming.input : undefined;
+				const textCells = editing
+					? fit(editing.render(wText)[0] ?? "", wText)
+					: fit(t, wTitle) + (wLast ? " " + fit(this.latestCell(r), wLast) : "");
 				let content =
 					cursor +
 					pin +
 					liveDot +
 					fit(this.statusCell(r), wStatus) +
 					" " +
-					fit(t, wTitle) +
-					(wLast ? " " + fit(this.latestCell(r), wLast) : "") +
+					textCells +
 					" " +
 					fit(th.fg("muted", shortCwd(r.info.cwd)), wProj) +
 					" " +
@@ -1315,7 +1355,9 @@ class InboxComponent {
 		const flash = this.flash && this.flash.until > Date.now() ? this.flash.text : undefined;
 		const k = (key: string, label: string) => `${th.fg("accent", key)} ${th.fg("dim", label)}`;
 		const archLabel = this.state.view === "archived" ? "unarchive" : r?.meta.archivedAt ? "unarchive" : "archive";
-		const help = this.searching
+		const help = this.renaming
+			? [k("type", "new name"), k("enter", "save"), k("esc", "cancel")].join(th.fg("dim", " · "))
+			: this.searching
 			? [k("type", "to filter"), k("enter", "keep"), k("esc", "clear")].join(th.fg("dim", " · "))
 			: orchestrating()
 				? [
@@ -2205,6 +2247,11 @@ export default function (pi: ExtensionAPI) {
 							rowCache = rows;
 						},
 						atHome,
+						(row, name) => {
+							if (row.isCurrent) pi.setSessionName(name);
+							else if (!row.info.path) throw new Error("session isn't saved yet, try again in a moment");
+							else SessionManager.open(row.info.path).appendSessionInfo(name);
+						},
 					);
 				},
 				{ overlay: true, overlayOptions: overlayOpts() },
@@ -2235,18 +2282,6 @@ export default function (pi: ExtensionAPI) {
 
 			if (result.action === "help") {
 				await showHelp(ctx);
-				continue;
-			}
-
-			if (result.action === "rename") {
-				const row = result.row;
-				const name = await ctx.ui.input("Rename session", row.info.name || row.title.slice(0, 60));
-				const next = name?.trim();
-				if (next) {
-					if (row.isCurrent) pi.setSessionName(next);
-					else SessionManager.open(row.info.path).appendSessionInfo(next);
-					rowCache = await loadRows(currentId);
-				}
 				continue;
 			}
 
