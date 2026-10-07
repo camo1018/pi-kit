@@ -1,0 +1,10 @@
+{
+  "enabled": true,
+  "soundEnabled": true,
+  "notificationEnabled": true,
+  "sound": "~/.pi/agent/sounds/bork.m4a",
+  "errorSound": "Basso",
+  "minDurationMs": 0,
+  "notifyOnAbort": false,
+  "notifyInPrintMode": false
+}

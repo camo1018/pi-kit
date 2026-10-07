@@ -1,0 +1,23 @@
+{
+  "name": "pi-kit",
+  "version": "0.1.0",
+  "description": "pi extensions: orchestrator/inbox for background agents, plan mode, local voice dictation, notifications, and TUI tweaks",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "extensions/*.ts",
+      "extensions/plan-mode/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "typebox": "*"
+  },
+  "license": "MIT",
+  "repository": "github:camo1018/pi-kit"
+}
