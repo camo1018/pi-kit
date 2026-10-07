@@ -7,8 +7,15 @@
   ],
   "pi": {
     "extensions": [
-      "extensions/*.ts",
-      "extensions/plan-mode/index.ts"
+      "extensions/final-answer-divider/index.ts",
+      "extensions/inbox/index.ts",
+      "extensions/plan-mode/index.ts",
+      "extensions/inline-skills/index.ts",
+      "extensions/notify/index.ts",
+      "extensions/rename-chat/index.ts",
+      "extensions/snippet-copy/index.ts",
+      "extensions/tool-output-hide/index.ts",
+      "extensions/voice/index.ts"
     ]
   },
   "peerDependencies": {
