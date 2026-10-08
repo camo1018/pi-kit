@@ -18,6 +18,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -106,6 +107,7 @@ function firstText(content: unknown): string | undefined {
 }
 
 export default function renameChatExtension(pi: ExtensionAPI) {
+	registerLoadedExtension("rename-chat");
 	pi.registerTool({
 		name: "rename-chat",
 		label: "Rename Chat",
