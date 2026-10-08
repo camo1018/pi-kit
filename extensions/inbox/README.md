@@ -37,7 +37,7 @@ Source: `~/Code/pi-kit/extensions/inbox/index.ts` (background agents: `~/Code/pi
 | `c` | Cancel a running background agent |
 | `p` | Pin / unpin |
 | `a` | Archive / unarchive |
-| `u` | Mark read / unread (toggles the `•` dot) |
+| `u` | Mark read / unread (toggles the `•` dot). On the session you're in: marks it unread on purpose — the `»` turns blue until you open it again from the inbox or switch away (a run finishing in front of you doesn't clear it) |
 | `x` | Filter out / bring back (overrides the rules for that one session) |
 | `tab` / `shift+tab` | Cycle views |
 | `1` `2` `3` `4` | Inbox · Archived · All · Filtered |

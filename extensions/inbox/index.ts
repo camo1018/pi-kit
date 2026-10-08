@@ -232,6 +232,12 @@ function markRead(sessionId: string) {
 	}
 }
 
+/** Unread because you marked it so (`u`), not because something finished — those marks are intentional. */
+function manuallyUnread(sessionId: string): boolean {
+	const m = loadStore().sessions[sessionId];
+	return !!m?.unreadAt && m.unreadAt > (m.seenAt ?? 0);
+}
+
 // ───────────────────────────── filters (session blocklist) ─────────────────────────────
 
 /**
@@ -678,10 +684,11 @@ async function loadRows(currentId: string | undefined): Promise<Row[]> {
 
 /**
  * Needs your attention and you haven't looked since: it finished (your turn) or failed after you last
- * saw it. Running sessions and the one you're in are never unread.
+ * saw it. Running sessions and the one you're in are never unread — except a manual mark (`u`).
  */
 function isUnread(r: Row, since: number): boolean {
-	if (r.isCurrent) return false;
+	// The session you're in: unread only when you marked it so by hand (`u`) — it shows as a blue `»`.
+	if (r.isCurrent) return !!(r.meta.unreadAt && r.meta.unreadAt > (r.meta.seenAt ?? 0));
 	// marked unread by hand (`u`) and not looked at since: show it even while running
 	if (r.meta.unreadAt && r.meta.unreadAt > (r.meta.seenAt ?? 0)) return true;
 	if (isRunning(r.bg) || r.live?.state === "working") return false;
@@ -986,7 +993,6 @@ class InboxComponent {
 
 	/** Mark read (clear the dot, like opening it) or unread (a reminder dot until you next look). */
 	private toggleUnread(row: Row) {
-		if (row.isCurrent) return this.say("that's the session you're in");
 		const wasUnread = !!row.unread;
 		try {
 			if (wasUnread) markRead(row.info.id);
@@ -1000,7 +1006,7 @@ class InboxComponent {
 		const store = loadStore();
 		row.meta = store.sessions[row.info.id] ?? {};
 		row.unread = isUnread(row, unreadBaseline(store));
-		this.say(row.unread ? "• marked unread" : "marked read");
+		this.say(row.unread ? (row.isCurrent ? "» marked unread — clears when you open it again or switch away" : "• marked unread") : "marked read");
 		this.rebuild();
 	}
 
@@ -1311,9 +1317,17 @@ class InboxComponent {
 				const cursor = sel ? th.fg("accent", "▶ ") : "  ";
 				const pin = r.meta.pinnedAt ? th.fg("warning", "★ ") : "  ";
 				const liveDot = r.isCurrent || r.live || r.bg ? th.fg("success", "◉ ") : "  ";
-				// fixed 2-col slot before the title so titles stay aligned whether or not a row is unread
-				// shared with the current-session marker (the current session is never unread)
-				const unread = r.unread ? th.fg("accent", "• ") : r.isCurrent ? th.fg("success", "» ") : "  ";
+				// fixed 2-col slot before the title so titles stay aligned whether or not a row is unread,
+				// shared with the current-session marker: the session you're in marked unread by hand
+				// shows the same `»` in blue (mdLink) instead of the usual success green.
+				const unread =
+					r.unread && r.isCurrent
+						? th.fg("mdLink", "» ")
+						: r.unread
+							? th.fg("accent", "• ")
+							: r.isCurrent
+								? th.fg("success", "» ")
+								: "  ";
 				const titleColor = r.meta.archivedAt && this.state.view === "all" ? "dim" : "text";
 				let t = r.info.name ? th.bold(th.fg(titleColor, r.title)) : th.fg(titleColor, r.title);
 				// lead with the reason so a long title can't truncate it away
@@ -1963,7 +1977,9 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("agent_settled", async (_e, ctx) => {
 		writeLive(ctx, "idle");
-		if (ctx.mode === "tui") markRead(ctx.sessionManager.getSessionId()); // it finished in front of you
+		// it finished in front of you — but a manual unread (blue ») stays until you open it from the
+		// inbox or leave it; it wouldn't be intentional to clear it just because it ran.
+		if (ctx.mode === "tui" && !manuallyUnread(ctx.sessionManager.getSessionId())) markRead(ctx.sessionManager.getSessionId());
 	});
 	pi.on("session_shutdown", async (e: any) => {
 		// Leaving a session you were looking at: it's read. (Only interactive windows; background
@@ -2036,7 +2052,8 @@ export default function (pi: ExtensionAPI) {
 					const running = isRunning(getAgent(cur));
 					if (running) ms.wasRunning.add(cur);
 					else if (ms.wasRunning.delete(cur)) {
-						markRead(cur); // you're looking at it
+						// you watched it finish — but a manual unread (blue ») is intentional and stays
+						if (!manuallyUnread(cur)) markRead(cur);
 						scheduleRefresh(cur);
 					}
 					showLivePanel(ctx);
@@ -2413,7 +2430,8 @@ export default function (pi: ExtensionAPI) {
 
 			if (result.action === "view") {
 				const row = result.row;
-				markRead(row.info.id); // peeking counts as looking
+				// peeking counts as looking — except the session you're in: its manual unread (blue ») is intentional
+				if (!row.isCurrent) markRead(row.info.id);
 				const r: AgentViewResult = await ctx.ui.custom<AgentViewResult>(
 					(tui, theme, kb, done) =>
 						new AgentViewComponent(tui, theme, kb, done, {
@@ -2465,6 +2483,7 @@ export default function (pi: ExtensionAPI) {
 				const ms = modeState();
 				if (row.isCurrent || (currentFile && row.info.path === currentFile)) {
 					if (isHome(ctx)) continue;
+					markRead(id); // going back into it from the inbox: a manual unread (blue ») clears
 					if (result.takeover) return takeOverCurrent(ctx);
 					if (ms.stale.has(id) || ms.takeoverWhenDone.has(id)) await refreshCurrent(ctx);
 					return;
@@ -2509,6 +2528,7 @@ export default function (pi: ExtensionAPI) {
 				const row = result.row;
 				if (row.isCurrent || (currentFile && row.info.path === currentFile)) {
 					if (orchestrating() && isHome(ctx)) continue; // home itself isn't listed, but be safe
+					markRead(row.info.id); // going back into it from the inbox: a manual unread (blue ») clears
 					ctx.ui.notify("Already in this session", "info");
 					return;
 				}
