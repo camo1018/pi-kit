@@ -723,6 +723,12 @@ function handleEvent(a: BgAgent, ev: any, deltaGate: () => boolean) {
 			a.activity = "retrying…";
 			touch(a);
 			break;
+		case "auto_retry_end":
+			// A provider error that pi retried successfully isn't a run failure; exhausted
+			// retries (success: false) keep the error from the failed message_end.
+			if (ev.success) a.error = undefined;
+			touch(a);
+			break;
 		case "compaction_start":
 			a.activity = "compacting…";
 			touch(a);
