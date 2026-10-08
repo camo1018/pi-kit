@@ -255,7 +255,7 @@ function writeAtomic(file: string, data: string) {
 	fs.renameSync(tmp, file);
 }
 
-function removeAgentFiles(id: string) {
+function removeAgentFiles(id: string, keepName = false) {
 	let names: string[] = [];
 	try {
 		names = fs.readdirSync(AGENTS_DIR);
@@ -264,6 +264,7 @@ function removeAgentFiles(id: string) {
 	}
 	for (const n of names) {
 		if (!n.startsWith(`${id}.`)) continue;
+		if (keepName && n === `${id}.name`) continue;
 		try {
 			fs.rmSync(path.join(AGENTS_DIR, n), { recursive: true, force: true });
 		} catch {
@@ -274,7 +275,9 @@ function removeAgentFiles(id: string) {
 
 /** Save (or forget) an agent's durable state. Called on transitions and by the owner heartbeat. */
 function persist(a: BgAgent) {
-	if (!needsPersist(a)) return removeAgentFiles(a.id);
+	// A rename not yet saved (no session file yet) outlives the agent's other files, so a later
+	// run on this session id still picks it up.
+	if (!needsPersist(a)) return removeAgentFiles(a.id, true);
 	const s: SavedAgent = {
 		v: 1,
 		id: a.id,
@@ -303,6 +306,52 @@ function persist(a: BgAgent) {
 	} catch {
 		// best effort
 	}
+}
+
+function readPendingName(id: string): string | undefined {
+	try {
+		const n = JSON.parse(fs.readFileSync(agentFile(id, "name"), "utf-8"))?.name;
+		return typeof n === "string" && n.trim() ? n.trim() : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Remove the pending-name file, unless a newer rename replaced it meanwhile. */
+function clearPendingName(id: string, applied: string) {
+	if (readPendingName(id) !== applied) return;
+	try {
+		fs.rmSync(agentFile(id, "name"), { force: true });
+	} catch {
+		// ignore
+	}
+}
+
+/** Owner side: the run ended before the child applied the name; the file is ours alone now. */
+function flushPendingName(a: BgAgent) {
+	const name = readPendingName(a.id);
+	if (!name) return;
+	const file = a.sessionFile ?? findSessionFile(a.id);
+	if (!file || !fs.existsSync(file)) return; // nothing saved yet: next run's child applies it
+	try {
+		SessionManager.open(file).appendSessionInfo(name);
+		clearPendingName(a.id, name);
+	} catch {
+		// leave it for the next run
+	}
+}
+
+/**
+ * Rename a background agent's session deterministically, without writing its session file from
+ * this process. The running child picks it up within ~1s (pi.setSessionName); if the run ends
+ * first, the owner applies it in finishRun. Safe before the session file exists.
+ */
+export function renameAgent(id: string, name: string) {
+	const a = getAgent(id);
+	if (a) a.title = name;
+	fs.mkdirSync(AGENTS_DIR, { recursive: true });
+	writeAtomic(agentFile(id, "name"), JSON.stringify({ name, at: Date.now() }));
+	if (a && !a.proc && !isRunning(a)) flushPendingName(a);
 }
 
 function requestStop(id: string) {
@@ -355,7 +404,7 @@ function errTail(id: string): string {
  * Heartbeats, honours <id>.stop, and writes an exit marker so whoever owns it next knows how it
  * ended. The env var is removed so tools / nested pi runs don't impersonate the agent.
  */
-export function installAgentChildHooks() {
+export function installAgentChildHooks(applyName?: (name: string) => void) {
 	const id = process.env.PI_INBOX_BG_AGENT;
 	if (!id) return;
 	delete process.env.PI_INBOX_BG_AGENT;
@@ -381,8 +430,25 @@ export function installAgentChildHooks() {
 	beat();
 	let n = 0;
 	let stopping = false;
+	let appliedName: string | undefined;
 	setInterval(() => {
 		if (++n % 5 === 0) beat();
+		// Rename requested from a pi window: apply it here so only this process writes the session file.
+		// Kept on failure (e.g. session not set up yet) and retried next tick.
+		// The file is only cleared once the session file exists: pi keeps entries in memory until the
+		// first response, so a crash before then would otherwise lose the name.
+		if (applyName) {
+			const name = readPendingName(id);
+			if (name && name !== appliedName) {
+				try {
+					applyName(name);
+					appliedName = name;
+				} catch {
+					// retry next tick
+				}
+			}
+			if (name && name === appliedName && findSessionFile(id)) clearPendingName(id, name);
+		}
 		if (!stopping && fs.existsSync(agentFile(id, "stop"))) {
 			stopping = true;
 			writeExit(143, "stopped");
@@ -634,6 +700,7 @@ function finishRun(a: BgAgent, code: number, signal?: string) {
 	a.runPrompt = undefined;
 	a.runStartedAt = undefined;
 	if (!a.sessionFile) a.sessionFile = findSessionFile(a.id);
+	flushPendingName(a);
 	if (a.state === "cancelled") {
 		a.activity = "cancelled";
 		persist(a);
@@ -845,8 +912,9 @@ export function releaseHold(id: string) {
 export function releaseAgent(id: string) {
 	const a = getAgent(id);
 	if (!a || a.proc) return;
+	flushPendingName(a);
 	registry().agents.delete(id);
-	removeAgentFiles(id);
+	removeAgentFiles(id, true);
 	emit({ type: "changed" });
 }
 

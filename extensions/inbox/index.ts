@@ -81,6 +81,7 @@ import {
 	startAgentSupervisor,
 	releaseAgent,
 	releaseHold,
+	renameAgent,
 	sendToAgent,
 	sessionModel,
 	spawnAgent,
@@ -1824,7 +1825,8 @@ function playSound(failed: boolean) {
 // ───────────────────────────── extension ─────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-	installAgentChildHooks(); // no-op unless this pi IS a background agent
+	// no-op unless this pi IS a background agent; applies renames requested from a pi window
+	installAgentChildHooks((name) => pi.setSessionName(name));
 	installHangupGuard();
 	const uiState: UIState = { view: "inbox", query: "" };
 	let rowCache: Row[] = [];
@@ -2277,7 +2279,9 @@ export default function (pi: ExtensionAPI) {
 						},
 						atHome,
 						(row, name) => {
-							if (row.isCurrent) pi.setSessionName(name);
+							// Working (or not saved yet) background agent: its process applies the name itself.
+							if (row.bg && (isRunning(row.bg) || !row.info.path)) renameAgent(row.bg.id, name);
+							else if (row.isCurrent) pi.setSessionName(name);
 							else if (!row.info.path) throw new Error("session isn't saved yet, try again in a moment");
 							else SessionManager.open(row.info.path).appendSessionInfo(name);
 						},

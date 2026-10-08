@@ -41,7 +41,7 @@ Source: `~/Code/pi-kit/extensions/inbox/index.ts` (background agents: `~/Code/pi
 | `tab` / `shift+tab` | Cycle views |
 | `1` `2` `3` `4` | Inbox · Archived · All · Filtered |
 | `/` | Full-text search (type, `enter` keeps the filter, `esc` clears it) |
-| `r` | Rename session inline in the list (`enter` save · `esc` cancel) |
+| `r` | Rename session inline in the list (`enter` save · `esc` cancel). Works on agents still working or not saved yet: the agent process applies the name itself within ~1s (or the window applies it when the run ends) |
 | `R` / `ctrl+r` | Refresh now (auto-refreshes every 2.5s) |
 | `?` | This help |
 | `esc` / `q` | Close (first `esc` clears an active filter) |
