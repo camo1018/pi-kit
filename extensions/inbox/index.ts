@@ -2637,6 +2637,12 @@ export default function (pi: ExtensionAPI) {
 	pi.on("input", async (event: any, ctx) => {
 		let t = getReplyTarget();
 		if (event.source !== "interactive") return { action: "continue" };
+		// Orchestrator: what's on screen is what gets your prompt. A session open (attached or taken
+		// over) never sends elsewhere; home only ever starts a new agent. Stale targets are dropped.
+		if (t && orchestrating() && (!isHome(ctx) || t.kind !== "new")) {
+			setReplyTarget(undefined, ctx);
+			t = undefined;
+		}
 		// Orchestrator home (normally covered by the orchestrator): every message starts a background
 		// agent, so home never gets a conversation.
 		const text = String(event.text ?? "").trim();
@@ -2736,6 +2742,15 @@ export default function (pi: ExtensionAPI) {
 	// and this session is idle, so esc still closes dialogs/autocomplete and interrupts a run.
 	pi.on("session_start", async (_e, ctx) => {
 		if (!ctx.hasUI) return;
+		// Orchestrator: a reply target never survives into an open session (see the input hook).
+		const rt = getReplyTarget();
+		if (rt && orchestrating() && (!isHome(ctx) || rt.kind !== "new")) setReplyTarget(undefined, ctx);
+		// Started a new agent, then switched to another session: stop waiting for it, so it neither
+		// grabs later prompts typed at home nor auto-opens over what you're looking at.
+		if (orchestrating() && !isHome(ctx) && modeState().openWhenReady) {
+			modeState().openWhenReady = undefined;
+			showLivePanel(ctx);
+		}
 		G.__piInboxEscUnsub?.();
 		G.__piInboxEscUnsub = ctx.ui.onTerminalInput((data) => {
 			if (!getReplyTarget() || !matchesKey(data, "escape")) return undefined;
