@@ -3,7 +3,7 @@
  *
  * Registers a `rename-chat` tool the model can call (e.g. from a PR-review skill
  * that says "rename the chat session to `<author> <PR title>`"), plus a
- * `/rename [title]` command for interactive use.
+ * `/rename [title]` command and a ctrl+r shortcut for interactive use.
  *
  * Renaming writes a session_info entry to the target session's file, so it works
  * for:
@@ -245,6 +245,43 @@ export default function renameChatExtension(pi: ExtensionAPI) {
 			}
 			pi.setSessionName(auto.slice(0, 200));
 			ctx.ui.notify(`Session renamed: ${auto.slice(0, 200)}`, "info");
+		},
+	});
+
+	// ctrl+r: prompt for a new name for the current session (main editor only;
+	// the /resume picker keeps its own ctrl+r rename for the selected row).
+	pi.registerShortcut("ctrl+r", {
+		description: "Rename current session",
+		handler: async (ctx) => {
+			// Inbox/orchestrator: on home or with a new-agent prompt pending, name that agent instead.
+			const hook = (globalThis as any)[Symbol.for("pi.inbox.rename-target")];
+			const inbox = typeof hook === "function" ? hook(ctx) : undefined;
+			if (inbox) {
+				const v = await ctx.ui.input(inbox.label, inbox.current ?? "new agent name");
+				if (v === undefined || v === null) return;
+				const msg = inbox.apply(v.replace(/[\r\n]+/g, " ").trim().slice(0, 200));
+				if (msg) ctx.ui.notify(msg, "info");
+				return;
+			}
+			const current = pi.getSessionName();
+			const input = await ctx.ui.input(
+				"Rename session (empty = auto-title)",
+				current ?? "new session name",
+			);
+			// esc / cancel
+			if (input === undefined || input === null) return;
+			let title = input.replace(/[\r\n]+/g, " ").trim();
+			if (!title) {
+				const file = ctx.sessionManager.getSessionFile();
+				title = (file ? titleFromFirstMessage(file) : undefined) ?? "";
+				if (!title) {
+					ctx.ui.notify("No user message yet to auto-title from — type a name.", "warning");
+					return;
+				}
+			}
+			title = title.slice(0, 200);
+			pi.setSessionName(title);
+			ctx.ui.notify(`Session renamed: ${title}`, "info");
 		},
 	});
 }

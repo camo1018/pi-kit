@@ -18,6 +18,7 @@ Source: `~/Code/pi-kit/extensions/inbox/index.ts` (background agents: `~/Code/pi
 | `/pin` | Toggle pin on the current session |
 | `/archive` | Toggle archive (done) on the current session |
 | `/rename [title]` | Rename the current session (no title: auto-title from its first user message). Also available to the agent as the `rename-chat` tool — same naming, works on background-agent sessions too via its `session` param |
+| `ctrl+r` | Rename the current session. On orchestrator home / while typing a new agent's first prompt (`n`), names that new agent instead (empty = name from its prompt); after sending, renames the just-started agent |
 
 ## Keys inside the inbox
 
