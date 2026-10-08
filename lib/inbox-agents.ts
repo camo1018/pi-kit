@@ -944,28 +944,54 @@ export function agentsSummary(): string | undefined {
 	return parts.length ? `agents: ${parts.join(" · ")}` : undefined;
 }
 
-/** The model a session will use next: "provider/model:thinking" from its last change entries. */
+/**
+ * What pi restores from a session branch, mirroring pi's getSessionContextSettings: the model
+ * comes from the last model_change OR assistant message, the thinking level only from the last
+ * thinking_level_change. Those can disagree: pi doesn't record a `--model x:level` override on a
+ * resumed session, so after such a run the model is right (assistant messages) but the level is
+ * whatever was recorded last (e.g. a stale `off` from cycling past glm).
+ */
+export function branchSettings(branch: any[]): { model?: string; level?: string } {
+	let model: string | undefined;
+	let level: string | undefined;
+	for (const e of branch) {
+		if (e?.type === "thinking_level_change" && e.thinkingLevel) level = e.thinkingLevel;
+		else if (e?.type === "model_change" && e.provider && e.modelId) model = `${e.provider}/${e.modelId}`;
+		else if (e?.type === "message" && e.message?.role === "assistant" && e.message.provider && e.message.model)
+			model = `${e.message.provider}/${e.message.model}`;
+	}
+	return { model, level };
+}
+
+/** The model a session will use next: "provider/model:thinking", as pi restores it from the active branch. */
 export function sessionModel(file: string | undefined): string | undefined {
 	if (!file) return undefined;
-	let text = "";
+	let branch: any[];
 	try {
-		text = fs.readFileSync(file, "utf-8");
+		branch = SessionManager.open(file).getBranch() as any[];
 	} catch {
 		return undefined;
 	}
-	let model: string | undefined;
-	let level: string | undefined;
-	for (const line of text.split("\n")) {
-		if (!line.includes('"model_change"') && !line.includes('"thinking_level_change"')) continue;
-		try {
-			const e = JSON.parse(line);
-			if (e.type === "model_change" && e.provider && e.modelId) model = `${e.provider}/${e.modelId}`;
-			if (e.type === "thinking_level_change" && e.thinkingLevel) level = e.thinkingLevel;
-		} catch {
-			// skip partial lines
-		}
-	}
+	const { model, level } = branchSettings(branch);
 	return model ? `${model}${level ? `:${level}` : ""}` : undefined;
+}
+
+/**
+ * Background agent child: make the session file record the thinking level this run actually uses.
+ * A run started with `--model provider/model:level` on an existing session applies the level but
+ * pi writes no thinking_level_change for it, so later runs (and any pi window opening the session)
+ * restore the old recorded level instead. Call on session_start; we're the only writer then.
+ */
+export function recordActualThinkingLevel(sessionManager: any, actual: string | undefined) {
+	if (!actual || typeof sessionManager?.appendThinkingLevelChange !== "function") return;
+	let branch: any[];
+	try {
+		branch = sessionManager.getBranch() as any[];
+	} catch {
+		return;
+	}
+	if (branchSettings(branch).level === actual) return;
+	sessionManager.appendThinkingLevelChange(actual);
 }
 
 // ───────────────────────────── transcript ─────────────────────────────
