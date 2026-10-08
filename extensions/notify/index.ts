@@ -13,6 +13,7 @@
 
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
+import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -195,6 +196,7 @@ function summarizePrompt(prompt?: string): string {
 }
 
 export default function notifyExtension(pi: ExtensionAPI) {
+	registerLoadedExtension("notify");
 	let config = loadConfig();
 
 	// Session runtime tracking

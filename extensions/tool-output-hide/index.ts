@@ -26,6 +26,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CustomEditor, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
+import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 
 type Mode = "collapsed" | "expanded" | "hidden";
 const MODES: Mode[] = ["collapsed", "expanded", "hidden"];
@@ -76,6 +77,7 @@ function installPatches(): void {
 }
 
 export default function (pi: ExtensionAPI) {
+	registerLoadedExtension("tool-output-hide");
 	installPatches();
 
 	let ctx: ExtensionContext | undefined;

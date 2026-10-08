@@ -19,6 +19,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { KeyId } from "@earendil-works/pi-tui";
 import { type ChildProcess, spawn } from "node:child_process";
+import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -131,6 +132,7 @@ type State =
 	| { kind: "transcribing" };
 
 export default function (pi: ExtensionAPI) {
+	registerLoadedExtension("voice");
 	const config = loadConfig();
 	const shortcuts = (Array.isArray(config.shortcut) ? config.shortcut : [config.shortcut]).filter(Boolean);
 	const shortcutLabel = shortcuts[0] ?? "/voice";

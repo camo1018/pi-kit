@@ -13,6 +13,7 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Markdown } from "@earendil-works/pi-tui";
+import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 
 /** Fence info strings that get unwrapped and rendered as Markdown. */
 const RENDER_LANGS = new Set(["markdown", "md"]);
@@ -139,6 +140,7 @@ function patchCodeBlocks() {
 }
 
 export default function mdFenceRender(pi: ExtensionAPI) {
+	registerLoadedExtension("md-fence-render");
 	patchCodeBlocks();
 
 	pi.on("before_agent_start", (event) => {

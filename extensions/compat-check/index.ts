@@ -18,6 +18,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { registerLoadedExtension, finalizeLoadPass, getLoadedExtensions } from "../../lib/loaded-extensions.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import * as agent from "@earendil-works/pi-coding-agent";
 import * as tui from "@earendil-works/pi-tui";
@@ -239,10 +240,18 @@ interface Result {
 	probe: Probe;
 	ok: boolean;
 	detail?: string;
+	/** Probe skipped: its extension is not loaded (selective install). */
+	skipped?: boolean;
 }
 
 function runProbes(ctx: Ctx, pi: ExtensionAPI): Result[] {
+	// This factory runs last among pi-kit extensions, so finalize first: the
+	// pass set then contains exactly the extensions loaded *this* time.
+	const loaded = finalizeLoadPass();
 	return PROBES.map((probe) => {
+		// Extensions excluded by a selective install (install.sh --extensions,
+		// pi config) are not loaded and cannot be broken; skip their probes.
+		if (!loaded.has(probe.ext)) return { probe, ok: true, skipped: true };
 		try {
 			const r = probe.check(ctx, pi);
 			return r === true ? { probe, ok: true } : { probe, ok: false, detail: r };
@@ -277,26 +286,33 @@ function report(results: Result[], all: boolean): string {
 	for (const [ext, rs] of byExt) {
 		const bad = rs.filter((r) => !r.ok);
 		if (!all && !bad.length) continue;
+		if (all && rs.every((r) => r.skipped)) {
+			lines.push(`· ${ext}  (not loaded — selective install; probes skipped)`);
+			continue;
+		}
 		lines.push(`${bad.length ? "✗" : "✓"} ${ext}${bad.length ? `  → ${path.join(EXT_DIR, ext, "README.md")}` : ""}`);
-		for (const r of all ? rs : bad) lines.push(`    ${r.ok ? "✓" : "✗"} ${r.probe.id}${r.detail ? `: ${r.detail}` : ""}`);
+		for (const r of all ? rs : bad)
+			lines.push(`    ${r.skipped ? "·" : r.ok ? "✓" : "✗"} ${r.probe.id}${r.detail ? `: ${r.detail}` : ""}`);
 	}
 	return lines.join("\n");
 }
 
 export default function compatCheck(pi: ExtensionAPI) {
+	registerLoadedExtension("compat-check");
 	pi.on("session_start", (event, ctx) => {
 		if (event.reason !== "startup" && event.reason !== "reload") return;
 		if (!ctx.hasUI) return;
 		const version: string = A.VERSION ?? "unknown";
 		const results = runProbes(ctx, pi);
-		const failed = results.filter((r) => !r.ok);
+		const failed = results.filter((r) => !r.ok && !r.skipped);
 		if (failed.length) {
 			ctx.ui.notify(`pi-kit: ${failed.length} internal check(s) failed on Pi ${version}\n${report(results, false)}`, "warning");
 			return;
 		}
 		const state = readState();
 		if (state.lastOkVersion !== version) {
-			if (state.lastOkVersion) ctx.ui.notify(`pi-kit: all ${results.length} internal checks pass on Pi ${version} (was ${state.lastOkVersion})`, "info");
+			const run = results.filter((r) => !r.skipped).length;
+			if (state.lastOkVersion) ctx.ui.notify(`pi-kit: all ${run} internal checks pass on Pi ${version} (was ${state.lastOkVersion})`, "info");
 			try {
 				fs.writeFileSync(STATE_FILE, JSON.stringify({ lastOkVersion: version, checkedAt: new Date().toISOString() }, null, 2));
 			} catch {
@@ -309,8 +325,9 @@ export default function compatCheck(pi: ExtensionAPI) {
 		description: "Check pi-kit extensions against this Pi version's internals",
 		handler: async (_args, ctx) => {
 			const results = runProbes(ctx, pi);
-			const failed = results.filter((r) => !r.ok).length;
-			const head = `Pi ${A.VERSION ?? "unknown"}: ${results.length - failed}/${results.length} checks pass`;
+			const failed = results.filter((r) => !r.ok && !r.skipped).length;
+			const run = results.filter((r) => !r.skipped).length;
+			const head = `Pi ${A.VERSION ?? "unknown"}: ${run - failed}/${run} checks pass`;
 			ctx.ui.notify(`${head}\n${report(results, true)}`, failed ? "warning" : "info");
 		},
 	});

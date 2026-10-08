@@ -22,6 +22,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 
 const DIVIDER_MD = "\n---\n**▼ FINAL ANSWER**\n\n";
 
@@ -75,6 +76,7 @@ interface SessionManagerLike {
 }
 
 export default function finalAnswerDivider(pi: ExtensionAPI) {
+	registerLoadedExtension("final-answer-divider");
 	// Restore markers for historical messages when a session is started/loaded/reloaded,
 	// since message_end won't re-fire for them. Only the current branch is inspected
 	// (abandoned branches are alternative histories).

@@ -15,6 +15,7 @@
  * skill to the front of the line.
  */
 import { readFileSync } from "node:fs";
+import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 import type { ExtensionAPI, SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import { stripFrontmatter } from "@earendil-works/pi-coding-agent";
 import { fuzzyFilter } from "@earendil-works/pi-tui";
@@ -90,6 +91,7 @@ function buildSkillBlock(skills: SkillRef[]): string {
 }
 
 export default function (pi: ExtensionAPI): void {
+	registerLoadedExtension("inline-skills");
 	// ---- Expand $skill mentions on submit ---------------------------------
 	pi.on("input", async (event, ctx) => {
 		if (event.source === "extension") return { action: "continue" };

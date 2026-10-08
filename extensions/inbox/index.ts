@@ -43,6 +43,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, SessionInfo, Theme } from "@earendil-works/pi-coding-agent";
@@ -1850,6 +1851,7 @@ function playSound(failed: boolean) {
 // ───────────────────────────── extension ─────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+	registerLoadedExtension("inbox");
 	// no-op unless this pi IS a background agent; applies renames requested from a pi window
 	installAgentChildHooks((name) => pi.setSessionName(name));
 
