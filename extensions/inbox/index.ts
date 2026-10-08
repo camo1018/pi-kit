@@ -78,6 +78,7 @@ import {
 	installAgentChildHooks,
 	isAgentChild,
 	markSeen,
+	recordActualThinkingLevel,
 	startAgentSupervisor,
 	releaseAgent,
 	releaseHold,
@@ -1853,6 +1854,15 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_e, ctx) => {
 		writeLive(ctx, "idle");
+		// Background agent: persist a `--model x:level` override pi applied but didn't record, so the
+		// next run / any window opening this session doesn't restore a stale level (e.g. `off`).
+		if (isAgentChild()) {
+			try {
+				recordActualThinkingLevel(ctx.sessionManager, ctx.thinkingLevel ?? pi.getThinkingLevel());
+			} catch {
+				// best effort
+			}
+		}
 		// Interactive windows heartbeat their agents and adopt orphans left by closed/quit windows.
 		if (ctx.mode === "tui" && !isAgentChild()) startAgentSupervisor();
 		if (ctx.mode === "tui") {
