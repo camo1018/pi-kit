@@ -1567,7 +1567,18 @@ function getReplyTarget(): ReplyTarget | undefined {
 }
 function setReplyTarget(t: ReplyTarget | undefined, ctx?: ExtensionContext) {
 	(globalThis as any)[REPLY_KEY] = t;
+	// A pre-name only ever belongs to the new agent being typed; dropping the target drops it.
+	if (!t) setNextAgentName(undefined);
 	if (ctx) showReplyWidget(ctx);
+}
+
+/** Name for the next new background agent, set with ctrl+r before sending its first prompt. */
+const NEXT_NAME_KEY = Symbol.for("pi.inbox.next-agent-name");
+function getNextAgentName(): string | undefined {
+	return (globalThis as any)[NEXT_NAME_KEY];
+}
+function setNextAgentName(name: string | undefined) {
+	(globalThis as any)[NEXT_NAME_KEY] = name || undefined;
 }
 // Session names in status lines get a stable per-session color, so different targets are easy to
 // tell apart (pi renders notify() text dim gray otherwise).
@@ -1589,11 +1600,24 @@ function showReplyWidget(ctx: ExtensionContext) {
 	if (!ctx.hasUI) return;
 	const t = getReplyTarget();
 	const th = ctx.ui.theme;
+	const nextName = getNextAgentName();
+	if (!t && nextName) {
+		// Orchestrator home without an explicit target: still show the pending name.
+		return ctx.ui.setWidget("inbox-reply", [
+			`${th.fg("accent", "🏷  Next new agent: ")}${th.bold(nextName.slice(0, 60))}${th.fg("dim", " · ctrl+r to change")}`,
+		]);
+	}
 	if (!t) return ctx.ui.setWidget("inbox-reply", undefined);
 	const cancel = th.fg("dim", " · esc to cancel");
+	const named =
+		t.kind === "new"
+			? nextName
+				? `${th.fg("dim", " · named ")}${th.bold(nextName.slice(0, 50))}`
+				: th.fg("dim", " · ctrl+r to name it")
+			: "";
 	const text =
 		t.kind === "new"
-			? `${th.fg("accent", "＋ Your next message starts a new background agent")}${th.fg("dim", ` · ${shortCwd(t.cwd)} · ${t.model ?? "default model"}`)}`
+			? `${th.fg("accent", "＋ Your next message starts a new background agent")}${th.fg("dim", ` · ${shortCwd(t.cwd)} · ${t.model ?? "default model"}`)}${named}`
 			: `${th.fg("accent", "↪ Your next message goes to ")}${th.bold(th.fg(nameColor(t.id), t.title.slice(0, 50)))}${th.fg(
 					"dim",
 					` · ${t.model ? `${t.model} (changed)` : (t.agentModel ?? "its current model")}${isRunning(getAgent(t.id)) ? " · queued: it's working" : ""}`,
@@ -1828,6 +1852,39 @@ function playSound(failed: boolean) {
 export default function (pi: ExtensionAPI) {
 	// no-op unless this pi IS a background agent; applies renames requested from a pi window
 	installAgentChildHooks((name) => pi.setSessionName(name));
+
+	// ctrl+r (registered by the rename-chat extension) asks here first: on orchestrator home, or
+	// while a new-agent prompt is pending, it names that new agent instead of this session.
+	(globalThis as any)[Symbol.for("pi.inbox.rename-target")] = (ctx: ExtensionContext) => {
+		const t = getReplyTarget();
+		if (t?.kind === "agent") return undefined;
+		const home = orchestrating() && isHome(ctx);
+		const pendingId = home ? modeState().openWhenReady : undefined;
+		const pending = pendingId ? getAgent(pendingId) : undefined;
+		if (t?.kind !== "new" && pending) {
+			return {
+				label: "Rename the new agent",
+				current: pending.title,
+				apply: (name: string) => {
+					if (!name) return undefined;
+					renameAgent(pending.id, name);
+					showLivePanel(ctx);
+					return `New agent renamed: ${name}`;
+				},
+			};
+		}
+		if (t?.kind !== "new" && !home) return undefined;
+		return {
+			label: "Name the new agent (empty = from its prompt)",
+			current: getNextAgentName(),
+			apply: (name: string) => {
+				setNextAgentName(name);
+				// the reply banner shows the name; no notify (it'd be a permanent chat line)
+				showReplyWidget(ctx);
+				return undefined;
+			},
+		};
+	};
 	installHangupGuard();
 	const uiState: UIState = { view: "inbox", query: "" };
 	let rowCache: Row[] = [];
@@ -2701,11 +2758,14 @@ export default function (pi: ExtensionAPI) {
 				return { action: "handled" };
 			}
 		}
+		const preName = t.kind === "new" ? getNextAgentName() : undefined;
 		setReplyTarget(undefined, ctx); // one message per target
 		if (event.images?.length) ctx.ui.notify("Images can't be sent to background agents yet — sent the text only.", "warning");
 
 		if (t.kind === "new") {
-			const a = spawnAgent({ prompt: text, cwd: t.cwd, model: t.model, title: cleanTitle(text).slice(0, 120) });
+			const a = spawnAgent({ prompt: text, cwd: t.cwd, model: t.model, title: preName ?? cleanTitle(text).slice(0, 120) });
+			// ctrl+r pre-name: the child applies it as its session name (works before the file exists).
+			if (preName) renameAgent(a.id, preName);
 			uiState.view = "inbox";
 			uiState.selectedId = a.id; // the inbox opens on it next time
 			ctx.ui.notify(`＋ Started background agent: ${coloredName(ctx.ui.theme, a.id, a.title.slice(0, 60))}`, "info");
@@ -2759,6 +2819,11 @@ export default function (pi: ExtensionAPI) {
 		// Orchestrator: a reply target never survives into an open session (see the input hook).
 		const rt = getReplyTarget();
 		if (rt && orchestrating() && (!isHome(ctx) || rt.kind !== "new")) setReplyTarget(undefined, ctx);
+		// A new-agent pre-name never follows you into another session.
+		if (!isHome(ctx) && getNextAgentName()) {
+			setNextAgentName(undefined);
+			showReplyWidget(ctx);
+		}
 		// Started a new agent, then switched to another session: stop waiting for it, so it neither
 		// grabs later prompts typed at home nor auto-opens over what you're looking at.
 		if (orchestrating() && !isHome(ctx) && modeState().openWhenReady) {
