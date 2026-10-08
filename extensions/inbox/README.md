@@ -152,7 +152,7 @@ A rule with no conditions, an unknown field, or an invalid regex is skipped and 
 | `⚠ stalled` | The run was cut off partway (process quit or crashed while working) |
 | `· empty` | No messages yet |
 
-Other markers: `★` = pinned, `◉` = open in some Pi process or run by a background agent, `•` (before the title) = unread, `»` (same slot) = the session you're in.
+Other markers: `★` = pinned, `◉` = open in some Pi process or run by a background agent, `•` (before the title) = unread, `»` (same slot) = the session you're in — gold when read, blue when you marked it unread on purpose.
 
 **Unread (`•`):** a session that finished (`◆ your turn`) or failed (`✗ error`) after you last looked at it. Running sessions and the one you're in are never unread. Opening a session, peeking with `v`, watching it finish while attached, or leaving it marks it read (stored as `seenAt` in `~/.pi/agent/inbox.json`). History from before unread tracking started counts as read. Press `u` to toggle it by hand: marking read clears the dot (and a background agent's "needs you"); marking unread keeps a reminder dot on it, even while it runs, until you next open or peek at it (stored as `unreadAt`).
 

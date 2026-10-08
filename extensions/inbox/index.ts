@@ -1318,15 +1318,15 @@ class InboxComponent {
 				const pin = r.meta.pinnedAt ? th.fg("warning", "★ ") : "  ";
 				const liveDot = r.isCurrent || r.live || r.bg ? th.fg("success", "◉ ") : "  ";
 				// fixed 2-col slot before the title so titles stay aligned whether or not a row is unread,
-				// shared with the current-session marker: the session you're in marked unread by hand
-				// shows the same `»` in blue (mdLink) instead of the usual success green.
+				// shared with the current-session marker: gold `»` (warning) is the session you're in and
+				// it's read; blue `»` (mdLink) is the session you're in but you marked it unread by hand.
 				const unread =
 					r.unread && r.isCurrent
 						? th.fg("mdLink", "» ")
 						: r.unread
 							? th.fg("accent", "• ")
 							: r.isCurrent
-								? th.fg("success", "» ")
+								? th.fg("warning", "» ")
 								: "  ";
 				const titleColor = r.meta.archivedAt && this.state.view === "all" ? "dim" : "text";
 				let t = r.info.name ? th.bold(th.fg(titleColor, r.title)) : th.fg(titleColor, r.title);
@@ -1982,9 +1982,14 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.mode === "tui" && !manuallyUnread(ctx.sessionManager.getSessionId())) markRead(ctx.sessionManager.getSessionId());
 	});
 	pi.on("session_shutdown", async (e: any) => {
-		// Leaving a session you were looking at: it's read. (Only interactive windows; background
-		// agent subprocesses load this extension too and must not mark their own sessions read.)
-		if (viewing) markRead(viewing);
+		// Leaving a session you were looking at: it's read — except a manual unread (`u`), which is
+		// a reminder to come back: it stays unread until you actually open the session again (from
+		// the inbox or by switching back). (Only interactive windows; background agent subprocesses
+		// load this extension too and must not mark their own sessions read.)
+		if (viewing) {
+			if (!manuallyUnread(viewing)) markRead(viewing);
+			else markSeen(viewing);
+		}
 		viewing = undefined;
 		removeLive();
 		// Background agents are NOT stopped on quit: they're detached and keep running; the next
