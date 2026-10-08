@@ -91,7 +91,7 @@ import {
 const AGENT_DIR = getAgentDir();
 const STORE_PATH = path.join(AGENT_DIR, "inbox.json");
 const FILTERS_PATH = path.join(AGENT_DIR, "inbox-filters.json");
-const README_PATH = path.join(path.dirname(new URL(import.meta.url).pathname), "inbox.README.md");
+const README_PATH = path.join(path.dirname(new URL(import.meta.url).pathname), "README.md");
 
 function readReadme(): string {
 	try {
