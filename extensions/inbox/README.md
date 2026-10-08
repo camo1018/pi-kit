@@ -2,7 +2,7 @@
 
 A visual "todo box" for every Pi session across all projects: see status at a glance, pin what matters, archive what's done, and filter out sessions you never want to see (automated jobs). It's also a control panel for **background agents**: start agents, watch them work and reply to them, all without leaving the session you're in.
 
-Source: `~/Code/pi-kit/extensions/inbox.ts` (background agents: `~/Code/pi-kit/lib/inbox-agents.ts`) · Data: `~/.pi/agent/inbox.json` · Filter rules: `~/.pi/agent/inbox-filters.json`
+Source: `~/Code/pi-kit/extensions/inbox/index.ts` (background agents: `~/Code/pi-kit/lib/inbox-agents.ts`) · Data: `~/.pi/agent/inbox.json` · Filter rules: `~/.pi/agent/inbox-filters.json`
 
 ## Commands
 
@@ -180,3 +180,54 @@ The preview pane under the list shows the dir, created/updated/pinned/archived t
 - **Reset all pins, archives and filter overrides**: delete `~/.pi/agent/inbox.json`.
 - **A session you expected to be filtered still shows up**: run `/inbox filters` to check for rule errors and per-rule hit counts. Also check it isn't `[kept]` by an `x` override.
 - **Turn all filtering off**: rename or delete `~/.pi/agent/inbox-filters.json`. Manual `x` hides still apply.
+
+## Pi internals this depends on
+
+⚠️ Mostly public API, but a few features reach into **private** pi-tui
+methods or undocumented file layout. Last verified on **Pi 0.99.1**.
+`compat-check` probes each row on startup and `/reload` (`/compat` shows all).
+
+| Probe id | Depends on | Used for | If Pi changes it |
+|---|---|---|---|
+| `tui-composite-methods` | `compositeOverlays` (protected) and `compositeLineAt` (private) on `TuiMainScreen`/`TuiAltScreen` | `coverImagesUnderOverlays()`: blanks terminal-image rows under the inbox and full-width overlays | Guarded by `typeof`: pasted screenshots / images draw over the inbox again |
+| `tui-composite-dispatch` | TUI calls them as `this.compositeOverlays(...)` / `this.compositeLineAt(...)` so per-instance overrides take effect | Same | Same, silently |
+| `tui-focused-component` | `tui.getFocusedComponent()` | `editorFocused()`: esc cancels the "next message goes to …" reply target only when the editor has focus | esc-to-cancel stops working (returns false) |
+| `editor-methods` | `Editor#getText`, `#insertTextAtCursor`, `#isShowingAutocomplete` (duck-typed on the focused component) | Same | Same |
+| `keybindings-get-keys` | `getKeybindings().getKeys(id)` | Key labels in the orchestrator help | Falls back to hard-coded labels |
+| `session-manager-api` | `SessionManager.open()`, `#getBranch`, `#getSessionFile`, `#getSessionId`, `#appendSessionInfo` | Reading other sessions; renaming (also used by `rename-chat`) | Inbox list / agent view / rename throw |
+| `session-file-layout` | Sessions live at `~/.pi/agent/sessions/<cwd-slug>/<timestamp>_<id>.jsonl` | `findSessionFile()` here and in `rename-chat` | Background agents' sessions not found; rename by id fails |
+| `ui-custom` | `ctx.ui.custom()` overlays (public) | The inbox itself | Inbox can't open |
+| `json-mode-events` | `pi --mode json` emits `agent_start`, `tool_execution_start/end`, `message_update`, `message_end`, `auto_retry_start/end`, `compaction_start` (documented in `docs/json.md`) | Live status/transcript of background agents | Agent view goes blank or status sticks |
+
+Other assumptions (not probed):
+
+- **CLI flags** for children: `--mode json --session-id <id> [--model m] -- <msg>`
+  (documented in `docs/cli.md`). `PI_INBOX_AGENT_ARGS` adds extra args.
+- **Session JSONL tail parsing** for status: `type: "message"` entries with
+  `message.role` in `user|assistant|toolResult` and `stopReason` in
+  `stop|toolUse|error|aborted` (`docs/session-format.md`). A renamed
+  `stopReason` shows sessions as the wrong status (e.g. everything "your turn").
+- `compositeTuiLine` returning image lines untouched is *why* the image patch
+  exists. If Pi fixes that upstream, `coverImagesUnderOverlays()` can go.
+- Extension instances are re-created on every session switch; long-lived state
+  lives on `globalThis` under `Symbol.for("pi.inbox.*")` keys.
+
+## Recovering after a Pi upgrade
+
+1. Run `/compat` to see which probe failed.
+2. Check the current TUI and session shapes:
+
+   ```bash
+   R=~/.pi/agent/install/releases/$(cat ~/.pi/agent/install/current-version)
+   D=$R/node_modules/@earendil-works
+   grep -n "composite\|getFocusedComponent" $D/pi-tui/dist/tui.d.ts
+   grep -n "getText\|insertTextAtCursor\|isShowingAutocomplete" \
+     $D/pi-tui/dist/editor-component.d.ts
+   ```
+
+3. For JSON-mode or session-format changes, diff the bundled docs between
+   releases (`$D/pi-coding-agent/docs/json.md`, `session-format.md`) and
+   update the `switch (ev.type)` in `lib/inbox-agents.ts` / `readTail()` in
+   `index.ts`.
+4. The image-overlay patch is cosmetic. If it breaks, delete the
+   `coverImagesUnderOverlays(tui)` calls and the rest of the inbox keeps working.

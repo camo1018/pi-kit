@@ -20,15 +20,30 @@ git clone https://github.com/camo1018/pi-kit ~/Code/pi-kit && ~/Code/pi-kit/inst
 
 | Extension | What it does |
 |---|---|
-| `inbox/` + `lib/inbox-agents.ts` | Orchestrator mode (`pi --orchestrator`, `ctrl+q`): session inbox, background agents, attach/takeover. See [`extensions/inbox/README.md`](extensions/inbox.README.md) |
+| `inbox/` + `lib/inbox-agents.ts` | Orchestrator mode (`pi --orchestrator`, `ctrl+q`): session inbox, background agents, attach/takeover. ⚠️ [docs + internals](extensions/inbox/README.md) |
 | `plan-mode/` | Read-only plan mode (`/plan`, `ctrl+shift+r`, `/todos`) |
 | `voice/` | Local voice dictation via sox + whisper.cpp (`/voice`, `/voice check`). macOS |
 | `notify/` | Sound + macOS notification when a turn finishes (`/notify`, `~/.pi/agent/notify.json`) |
 | `rename-chat/` | `rename-chat` tool so the agent can title sessions |
 | `inline-skills/` | `$skill` inline skill references |
-| `snippet-copy/` | Copy code snippets from responses |
-| `tool-output-hide/` | Collapse noisy tool output |
+| `md-fence-render/` | Render ```` ```md ```` blocks as Markdown; `┌─ lang` / `└─` markers instead of ```` ``` ```` fences on code; copy-safe code block prompt rules. ⚠️ [internals](extensions/md-fence-render/README.md) |
+| `tool-output-hide/` | Collapse noisy tool output. ⚠️ [internals](extensions/tool-output-hide/README.md) |
 | `final-answer-divider/` | Visual divider before the final answer |
+| `compat-check/` | Warns on startup / `/reload` when a Pi upgrade breaks an extension that uses Pi internals (`/compat` for the full report) |
+
+### Pi upgrades
+
+Extensions marked ⚠️ patch or depend on Pi internals that can change in any
+release. Each has a README with a "Pi internals" table (what it depends on,
+what breaks, how to recover) whose probe ids match `compat-check`.
+
+After upgrading Pi, start it (or `/reload`): if a probe fails you get a
+warning naming the extension and its README. Silence means everything passed;
+the first clean run on a new version shows a one-line "all checks pass" note.
+
+When adding code that touches Pi internals (prototype patches, private/protected
+methods, undocumented file layout), add a probe to
+`extensions/compat-check/index.ts` and a row to that extension's README.
 
 ## Config
 
