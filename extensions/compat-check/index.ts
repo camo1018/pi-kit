@@ -286,6 +286,18 @@ const PROBES: Probe[] = [
 	},
 	{
 		ext: "inbox",
+		id: "visit-model-selectors",
+		check: () => need(
+			typeof A.ModelSelectorComponent === "function" &&
+			typeof A.ModelSelectorComponent.prototype.handleInput === "function" &&
+			typeof A.ModelSelectorComponent.prototype.dispose === "function" &&
+			typeof A.ThinkingSelectorComponent === "function" &&
+			typeof A.ThinkingSelectorComponent.prototype.handleInput === "function",
+			"Native model/thinking selectors changed (visited model controls)",
+		),
+	},
+	{
+		ext: "inbox",
 		id: "visit-chat-container",
 		check: () => {
 			// lib/visit-runtime.ts interposes the chat container's mutation methods

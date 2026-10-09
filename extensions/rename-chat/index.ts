@@ -19,7 +19,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { getAgent } from "../../lib/inbox-agents.ts";
@@ -122,7 +122,10 @@ export default function renameChatExtension(pi: ExtensionAPI) {
 		promptGuidelines: [
 			"After fetching PR metadata at the start of a PR review, rename the session via rename-chat before drafting comments.",
 		],
-		renderCall(args: { title?: string; session?: string }, theme: { fg: (c: string, s: string) => string; bold: (s: string) => string }): { render: (w: number) => string[]; invalidate: () => void } {
+		renderCall(
+			args: { title?: string; session?: string },
+			theme: Theme,
+		): { render: (w: number) => string[]; invalidate: () => void } {
 			// one-line display for the transcript
 			const target = args.session ? ` → ${args.session}` : "";
 			const line = theme.fg("toolTitle", theme.bold("rename-chat")) + theme.fg("muted", `${target} "${(args.title ?? "(auto)").slice(0, 60)}"`);
@@ -232,6 +235,16 @@ export default function renameChatExtension(pi: ExtensionAPI) {
 	pi.registerCommand("rename", {
 		description: "Rename this session (usage: /rename [title] — empty title auto-titles)",
 		handler: async (args, ctx) => {
+			// Interactive naming follows the viewed session. The model-facing
+			// tool above deliberately stays bound to its executing session.
+			const hook = (globalThis as any)[Symbol.for("pi.inbox.rename-target")];
+			const target = typeof hook === "function" ? hook(ctx) : undefined;
+			if (target) {
+				const name = args.replace(/[\r\n]+/g, " ").trim().slice(0, 200);
+				const message = target.apply(name);
+				if (message) ctx.ui.notify(message, "info");
+				return;
+			}
 			const title = args.trim();
 			if (title) {
 				pi.setSessionName(title);
@@ -240,7 +253,7 @@ export default function renameChatExtension(pi: ExtensionAPI) {
 			}
 			// Auto-title: reuse the tool logic in-process.
 			const file = ctx.sessionManager.getSessionFile();
-			const auto = titleFromFirstMessage(file);
+			const auto = file ? titleFromFirstMessage(file) : undefined;
 			if (!auto) {
 				ctx.ui.notify("No user message yet — pass a title: /rename <title>", "warning");
 				return;
@@ -255,7 +268,7 @@ export default function renameChatExtension(pi: ExtensionAPI) {
 	pi.registerShortcut("ctrl+r", {
 		description: "Rename current session",
 		handler: async (ctx) => {
-			// Inbox/orchestrator: on home or with a new-agent prompt pending, name that agent instead.
+			// Orchestrator: name the viewed session or a pending new agent.
 			const hook = (globalThis as any)[Symbol.for("pi.inbox.rename-target")];
 			const inbox = typeof hook === "function" ? hook(ctx) : undefined;
 			if (inbox) {

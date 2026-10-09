@@ -46,9 +46,18 @@ import {
 	getMarkdownTheme,
 	ToolExecutionComponent,
 	UserMessageComponent,
+	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, type TUI } from "@earendil-works/pi-tui";
-import { getAgent, isRunning, onAgentEvent, type BgAgent, type LiveMsg } from "./inbox-agents.ts";
+import {
+	getAgent,
+	isRunning,
+	nextSessionModel,
+	onAgentEvent,
+	parseAgentModel,
+	type BgAgent,
+	type LiveMsg,
+} from "./inbox-agents.ts";
 
 // ───────────────────────────── visit state ─────────────────────────────
 
@@ -57,6 +66,8 @@ export interface VisitInfo {
 	file: string;
 	cwd: string;
 	title: string;
+	/** Displayed model choice; may apply after the current background run. */
+	selectedModel?: string;
 	/** The container pi's chat area shows for the visit. */
 	view: VisitView;
 	/** A's stashed chat children (the live tree, restored on return). */
@@ -75,6 +86,7 @@ export interface VisitState {
 
 const VISIT_KEY = Symbol.for("pi.inbox.visitState");
 const VISIT_LISTENER_KEY = Symbol.for("pi.inbox.visitListener");
+const VISIT_VIEW_KEY = Symbol.for("pi.inbox.visitView");
 export function visitState(): VisitState {
 	const g = globalThis as any;
 	return (g[VISIT_KEY] ??= { mainId: "" }) as VisitState;
@@ -91,6 +103,20 @@ export function visitingId(): string | undefined {
 /** True while the chat area shows a visited session (the main keeps running). */
 export function isVisiting(): boolean {
 	return !!visitState().visit;
+}
+
+/** UI actions target the viewed session; execution still uses ctx's runtime. */
+export function viewedSession(
+	ctx: Pick<ExtensionContext, "sessionManager" | "cwd">,
+): { id: string; file: string | undefined; cwd: string } {
+	const v = visiting();
+	return v
+		? { id: v.id, file: v.file, cwd: v.cwd }
+		: {
+				id: ctx.sessionManager.getSessionId(),
+				file: ctx.sessionManager.getSessionFile(),
+				cwd: ctx.cwd,
+			};
 }
 
 // ───────────────────────────── layout access ─────────────────────────────
@@ -119,8 +145,8 @@ function footerComponentOf(tui: TUI): any | undefined {
 interface UserItem {
 	role: "user";
 	text: string;
-	/** Wire message id (absent on locally-seeded items), for transcript dedupe. */
-	id?: string;
+	/** Raw persisted message, including its wire timestamp. */
+	message: any;
 }
 interface AssistantItem {
 	role: "assistant";
@@ -160,7 +186,7 @@ class VisitMsgCache {
  * The in-flight run's persisted tail is trimmed: the live run replays the whole
  * run (seeded prompt + streamed turns), so once the child has flushed those
  * messages to the session file they would render twice. The tail is matched by
- * wire message id (see the trim below) so the live replay owns the run.
+ * role and wire timestamp so the live replay owns the overlapping tail.
  */
 function branchItems(file: string, liveMsgs: LiveMsg[]): VisitItem[] {
 	const items: VisitItem[] = [];
@@ -176,7 +202,7 @@ function branchItems(file: string, liveMsgs: LiveMsg[]): VisitItem[] {
 		const m = e.message;
 		if (!m) continue;
 		if (m.role === "user") {
-			items.push({ role: "user", text: userText(m), id: m.id });
+			items.push({ role: "user", text: userText(m), message: m });
 		} else if (m.role === "assistant") {
 			const tools = (Array.isArray(m.content) ? m.content : [])
 				.filter((c: any) => c?.type === "toolCall")
@@ -189,41 +215,22 @@ function branchItems(file: string, liveMsgs: LiveMsg[]): VisitItem[] {
 			if (t) t.result = m;
 		}
 	}
-	// The in-flight run's persisted tail is trimmed so the run renders once: the
-	// live replay owns the whole run (seeded prompt + streamed turns), and once
-	// the child flushes those messages to the session file they would render
-	// twice. Matching is by exact wire message ids — never by prompt text — so an
-	// identical re-prompt of a fresh run never trims the previous run's history.
-	//   • a user id match: the echo of the run prompt (or a steer) was persisted;
-	//   • an assistant id match: this run's turns are already in the file — trim
-	//     back to the user message that precedes them (also covers runs so long
-	//     the live trim dropped the seeded prompt).
-	const liveUserIds = new Set(
-		liveMsgs
-			.filter((m) => m.role === "user")
-			.map((m) => m.id)
-			.filter(Boolean),
+	// Entry ids exist only on disk, not on the wire message. Match the shared
+	// role/timestamp instead, never prompt text alone (e.g. repeated "continue").
+	// Trim from the FIRST overlap, not the newest user turn: a run may include
+	// steering messages, and a capped live buffer may have lost its prompt.
+	// Everything before the retained live tail must stay in saved history.
+	const liveKeys = new Set(
+		liveMsgs.map((m) => messageKey(m.message)).filter(Boolean),
 	);
-	const liveAssistantIds = new Set(
-		liveMsgs
-			.filter((m) => m.role === "assistant")
-			.map((m) => m.message?.id)
-			.filter(Boolean),
-	);
-	if (liveUserIds.size || liveAssistantIds.size) {
-		let matched = false; // a flushed assistant turn of this run was found
-		for (let i = items.length - 1; i >= 0; i--) {
-			const it = items[i]!;
-			if (it.role === "assistant") {
-				if (liveAssistantIds.has(it.message?.id)) matched = true;
-				continue;
-			}
-			// The branch's newest user message starts this run's persisted tail.
-			if (matched || liveUserIds.has(it.id)) items.length = i;
-			break;
-		}
-	}
+	const overlap = items.findIndex((m) => liveKeys.has(messageKey(m.message)));
+	if (overlap !== -1) items.length = overlap;
 	return items;
+}
+
+function messageKey(message: any): string | undefined {
+	if (typeof message?.timestamp !== "number") return undefined;
+	return `${message.role}:${message.timestamp}`;
 }
 
 function userText(m: any): string {
@@ -236,7 +243,7 @@ function userText(m: any): string {
 
 /** A visited session's chat: persisted branch + live run, same components as pi. */
 export class VisitView extends Container {
-	readonly [Symbol.for("pi.inbox.visitView")] = true;
+	readonly [VISIT_VIEW_KEY] = true;
 	readonly cacheVersion = 1;
 	private branchItems: VisitItem[] = [];
 	private branchCache: VisitMsgCache[] = [];
@@ -263,7 +270,8 @@ export class VisitView extends Container {
 		// Persisted history: rebuild when the file grew or the in-flight run's
 		// persisted tail appeared (trimming it changes the item list).
 		const branch = branchItems(st.file, msgs);
-		const branchKey = `${branch.length}:${(branch[branch.length - 1] as AssistantItem | undefined)?.message?.id ?? ""}`;
+		const lastMessage = branch[branch.length - 1]?.message;
+		const branchKey = `${branch.length}:${messageKey(lastMessage) ?? ""}`;
 		if (branchKey !== this.branchKey) {
 			this.branchKey = branchKey;
 			this.branchItems = branch;
@@ -323,18 +331,23 @@ function ensureListener(tui: TUI) {
  * the visited session's file (SessionManager) and recorded model; nothing can
  * mutate or claim the visited session.
  */
-function footerProxy(file: string, modelRegistry: any, recorded: string | undefined): any {
+function footerProxy(
+	file: string,
+	modelRegistry: any,
+	recorded: () => string | undefined,
+): any {
 	const sm = SessionManager.open(file);
-	const [provider, id, level] = (recorded ?? "").split(/[:/]/);
-	let model: any;
-	try {
-		model =
-			modelRegistry
-				?.getAvailable?.()
-				.find((m: any) => (!provider || m.provider === provider) && (!id || m.id === id)) ?? undefined;
-	} catch {
-		model = undefined;
-	}
+	const selection = () => {
+		const choice = parseAgentModel(recorded());
+		let model: any;
+		try {
+			model = choice && modelRegistry?.getAvailable?.().find((m: any) =>
+				m.provider === choice.provider && m.id === choice.id);
+		} catch {
+			// An unavailable catalog must not break the footer.
+		}
+		return { model, thinkingLevel: choice?.thinkingLevel };
+	};
 	// The footer reads state.model / state.thinkingLevel / sessionManager /
 	// getContextUsage / routedModel / modelRuntime.isUsingSubscription(). The
 	// registry the extension sees has no isUsingSubscription (that's
@@ -349,10 +362,10 @@ function footerProxy(file: string, modelRegistry: any, recorded: string | undefi
 			return sm;
 		},
 		get state() {
-			return { model, thinkingLevel: level || undefined };
+			return selection();
 		},
 		get model() {
-			return model;
+			return selection().model;
 		},
 		routedModel: undefined,
 		modelRuntime: modelRuntimeFacade,
@@ -431,15 +444,18 @@ function interposeChat(chat: Container, view: Container): () => void {
 
 /**
  * Start a visit: stash the main session's live chat tree and mount the visited
- * session's view. Call only when `isVisiting()` is false. Returns false if the
- * chat container can't be found (compat failure → callers refuse the visit;
- * sticky takeover must never fall through to a destructive real switch).
+ * session's view. Replaces an existing visit when the target changes; reopening
+ * the same target is a no-op. Returns false if the chat container can't be found
+ * (compat failure → callers refuse the visit; sticky takeover must never fall
+ * through to a destructive real switch).
  */
 export function openVisit(tui: TUI, ctx: { modelRegistry?: any }, o: OpenVisitOpts): boolean {
 	const st = visitState();
-	if (st.visit) return true;
+	if (st.visit?.id === o.id && st.visit.file === o.file) return true;
 	const chat = chatContainerOf(tui);
 	if (!chat) return false;
+	// Restore the main before stashing it again, never the previous visit.
+	if (st.visit) closeVisit(tui);
 	ensureListener(tui);
 	const view = new VisitView(tui, () => visitState().visit?.id ?? o.id);
 	const info: VisitInfo = {
@@ -447,6 +463,7 @@ export function openVisit(tui: TUI, ctx: { modelRegistry?: any }, o: OpenVisitOp
 		file: o.file,
 		cwd: o.cwd,
 		title: o.title,
+		selectedModel: nextSessionModel(o.id, o.file) ?? o.recordedModel,
 		view,
 		stashed: [],
 	};
@@ -455,7 +472,10 @@ export function openVisit(tui: TUI, ctx: { modelRegistry?: any }, o: OpenVisitOp
 		const footer = footerComponentOf(tui);
 		if (footer) {
 			info.footerSession = footer.session;
-			footer.setSession(footerProxy(o.file, o.modelRegistry ?? ctx.modelRegistry, o.recordedModel));
+			footer.setSession(footerProxy(
+				o.file, o.modelRegistry ?? ctx.modelRegistry,
+				() => info.selectedModel,
+			));
 		}
 	} catch {
 		// Footer keeps showing the main session; harmless.

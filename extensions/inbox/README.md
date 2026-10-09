@@ -81,6 +81,15 @@ What to expect:
 
 ## Orchestrator mode
 
+**Takeover is per-session execution state, not a different navigation mode.**
+The session on screen owns the inbox cursor/current-row marker, queue controls,
+model/thinking choices, interactive naming, pin/archive actions, and the directory
+for a new agent.
+The foreground runtime only owns execution, abort/handoff, and its agent's tool
+calls. In code, UI targets use `viewedSession(ctx)`; runtime lifecycle operations
+use `ctx.sessionManager`. Never use a row's `isCurrent` marker as proof that this
+process owns that session.
+
 Orchestrator mode turns the window you're in into a full-screen control panel for agents. The inbox takes the whole terminal, as if it were the program, and pi's chat view never shows while you're in it. No new window or tab is opened.
 
 - **Turn it on:** `/orchestrator` in any window, or start with `pi --orchestrator`. If you're in a session, it stays saved and listed, and the window moves to the orchestrator. `/orchestrator` again (or `/orchestrator off`, or `Q` in the orchestrator) turns it off.
@@ -92,6 +101,7 @@ Orchestrator mode turns the window you're in into a full-screen control panel fo
   - `/compact` and `/tree` are refused while the background run is going, because they would write to the session at the same time. They work normally once it's idle.
   - `/fork` and `/clone` work mid-run, because they only create a new session. `/clone` copies the session from disk up to the agent's last completed step, not the on-screen snapshot. The step in flight (an unanswered tool call or a prompt still being worked on) is left out. The background run carries on in the original session.
   - Model changes (`ctrl+p`, `ctrl+l`, `/model`, `shift+tab`) apply to the next background run.
+  - While visiting with a taken-over main, the normal model picker (`ctrl+l` / `/model`), model cycling (`ctrl+p` / `ctrl+shift+p`), and thinking controls (`shift+tab` / `/thinking`) target the visited session only. The footer reflects the choice immediately. If the agent is busy, the choice is saved for its next run without interrupting it or writing to its active transcript. The main's model and thinking level stay unchanged; cancelling a picker changes neither session.
 - **Take over:** `t` on a session (or `/takeover` from an attached session) makes it run here, like plain pi: streaming, esc to interrupt, steering, every command. Only a taken-over session gets a mode banner: `Orchestrator - taken over`. Attached and visited sessions use their normal UI without an orchestrator banner. If its background run is still going, it takes over automatically when that run finishes.
 - **Sticky takeover:** a taken-over session stays the window's *main* session while you look at others. `enter` on any other row *visits* it: its transcript + background run render in the chat area (same components, live streaming), your messages go to its background agent (queued if working), and the taken-over session keeps running behind it — nothing is aborted, nothing restarts. `esc` / `h` / `enter` on the main's row returns to it live, with everything it streamed while hidden. Taking over another session (or `h` from the main) is what actually hands the main back. Visits are view-only: the visited session is never claimed by this window (its background agent keeps running it), so `d`/`ctrl+w` moves and `/takeover` still act on the main while you visit. If the visit view can't mount (a Pi upgrade changed internals), navigation is refused so the taken-over session cannot be interrupted; `/compat` names the failed probe.
 - **Leaving a taken-over session** (`h` from it, or taking over another session) hands it back to the background: if it's mid-run, the run is stopped here and continued by a background agent with a "continue where you left off" message — only the in-flight step is redone, and messages queued in the editor are dropped. (Visiting other sessions does *not* hand it back; see sticky takeover above.)
@@ -167,7 +177,7 @@ A rule with no conditions, an unknown field, or an invalid regex is skipped and 
 | `⚠ stalled` | The run was cut off partway (process quit or crashed while working) |
 | `· empty` | No messages yet |
 
-Other markers: `★` = pinned, `◉` = open in some Pi process or run by a background agent, `•` (before the title) = unread, `»` (same slot) = the session you're in — gold when read, blue when you marked it unread on purpose.
+Other markers: `⚑` (before the status) = the session this window runs interactively (taken over; orchestrator mode only), `★` = pinned, `◉` = open in some Pi process or run by a background agent, `•` (before the title) = unread, `»` (same slot) = the session you're in — gold when read, blue when you marked it unread on purpose.
 
 **Unread (`•`):** a session that finished (`◆ your turn`) or failed (`✗ error`) after you last looked at it. Running sessions and the one you're in are never unread. Opening a session, peeking with `v`, watching it finish while attached, or leaving it marks it read (stored as `seenAt` in `~/.pi/agent/inbox.json`). History from before unread tracking started counts as read. Press `u` to toggle it by hand: marking read clears the dot (and a background agent's "needs you"); marking unread keeps a reminder dot on it, even while it runs, until you next open or peek at it (stored as `unreadAt`).
 
@@ -214,6 +224,7 @@ methods or undocumented file layout. Last verified on **Pi 0.99.1**.
 | `session-file-layout` | Sessions live at `~/.pi/agent/sessions/<cwd-slug>/<timestamp>_<id>.jsonl` | `findSessionFile()` here and in `rename-chat` | Background agents' sessions not found; rename by id fails |
 | `ui-custom` | `ctx.ui.custom()` overlays (public) | The inbox itself | Inbox can't open |
 | `json-mode-events` | `pi --mode json` emits `agent_start`, `tool_execution_start/end`, `message_update`, `message_end`, `auto_retry_start/end`, `compaction_start` (documented in `docs/json.md`) | Live status/transcript of background agents | Agent view goes blank or status sticks |
+| `visit-model-selectors` | Native `ModelSelectorComponent` / `ThinkingSelectorComponent` exports; model picker uses a read-only registry facade (`getAvailableSnapshot`, `getModel`, `getError`, `refresh`) | Model/thinking controls for visited sessions | Picker errors are reported without mutating the taken-over main |
 | `visit-chat-container` | pi-tui `Container` keeps plain-array `children` + `addChild/removeChild/clear` semantics | Sticky-takeover visits (`lib/visit-runtime.ts`): stash the main's live chat tree, mount the visit view, restore on return | Visiting is refused so the taken-over main cannot be interrupted; `/compat` names it |
 
 Other assumptions (not probed):

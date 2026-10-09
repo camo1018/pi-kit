@@ -28,6 +28,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
 	BACKGROUND_MCP_AUTO_APPROVE_ENV,
 } from "./background-mcp-approval.ts";
@@ -114,11 +115,10 @@ export interface LiveTool {
 
 export interface LiveMsg {
 	role: "user" | "assistant";
-	/** User text, or an assistant message in pi's wire shape (content blocks, stopReason, …). */
+	/** Raw wire message, including the timestamp shared with persisted history. */
 	message?: any;
+	/** Display text for users (the wire message may contain expanded skills). */
 	text?: string;
-	/** Wire message id (user echoes) — the id the child persisted, for transcript dedupe. */
-	id?: string;
 	/** Live tools (assistant messages render their calls; results update in place). */
 	tools?: LiveTool[];
 	/** Update counter, bumped whenever this message changed (for UI re-render diffing). */
@@ -243,10 +243,10 @@ function liveEndAssistant(a: BgAgent, ev: any) {
 }
 
 /** Wire user prompt (the run's prompt, or a steering prompt mid-run). */
-function liveUser(a: BgAgent, text: string | undefined, id?: string) {
+function liveUser(a: BgAgent, text: string | undefined, message?: any) {
 	const run = a.liveRun ??= newLiveRun();
 	if (!text) return;
-	run.msgs.push({ role: "user", text, id, rev: ++run.rev });
+	run.msgs.push({ role: "user", text, message, rev: ++run.rev });
 	trimLive(run);
 }
 
@@ -411,9 +411,10 @@ interface SavedAgent {
 	ownerBeat: number;
 }
 
-/** Worth keeping on disk: something is running or still has to be delivered. */
+/** Keep undelivered messages and model choices durable across restarts. */
 function needsPersist(a: BgAgent): boolean {
-	return !!a.proc || a.pending.length > 0 || a.state === "working" || a.state === "queued";
+	return !!a.proc || !!a.nextModel || a.pending.length > 0 ||
+		a.state === "working" || a.state === "queued";
 }
 
 function writeAtomic(file: string, data: string) {
@@ -914,6 +915,7 @@ function monitor(a: BgAgent, child?: ChildProcess) {
 function finishRun(a: BgAgent, code: number, signal?: string) {
 	a.proc = undefined;
 	a.pid = undefined;
+	flushPendingModel(a);
 	a.runPrompt = undefined;
 	a.runStartedAt = undefined;
 	if (!a.sessionFile) a.sessionFile = findSessionFile(a.id);
@@ -1022,20 +1024,21 @@ function handleEvent(a: BgAgent, ev: any, deltaGate: () => boolean) {
 			if (ev.message?.role === "assistant") liveStartAssistant(a, ev);
 			else if (ev.message?.role === "user") {
 				const t = textOf(ev.message.content).trim();
-				// The run's prompt is already seeded into the live view. The child
-				// may prepend an expanded skill block while preserving the original
-				// inline $skill mention, so compare only the user-authored portion.
-				// A later steering prompt still renders normally.
+				if (!t) break;
+				// Bind only the first echo to the locally seeded prompt. Later
+				// identical steering prompts are distinct messages. Keep the raw
+				// timestamp: Pi's wire messages have no session-entry id.
+				const first = a.liveRun?.msgs[0];
 				const seeded = comparableUserText(a.runPrompt ?? "");
-				if (t && comparableUserText(t) !== seeded) {
-					liveUser(a, cleanUserText(t), ev.message.id);
-				} else if (t && ev.message.id) {
-					// The run prompt's own echo: record its persisted wire id on the
-					// seeded message so transcript dedupe (visit view) can match it
-					// exactly — the seeded text is cleaned, which never equals a
-					// skill-expanded persist.
-					const first = a.liveRun?.msgs.find((m) => m.role === "user");
-					if (first && !first.id) first.id = ev.message.id;
+				if (
+					first?.role === "user" &&
+					!first.message &&
+					comparableUserText(t) === seeded
+				) {
+					first.message = ev.message;
+					liveTouch(a, first);
+				} else {
+					liveUser(a, cleanUserText(t), ev.message);
 				}
 			}
 			break;
@@ -1268,6 +1271,9 @@ export function releaseHold(id: string) {
 export function releaseAgent(id: string) {
 	const a = getAgent(id);
 	if (!a || a.proc) return;
+	if (!flushPendingModel(a)) {
+		throw new Error("Could not save the selected model before takeover.");
+	}
 	flushPendingName(a);
 	registry().agents.delete(id);
 	removeAgentFiles(id, true);
@@ -1330,6 +1336,78 @@ export function sessionModel(file: string | undefined): string | undefined {
 	}
 	const { model, level } = branchSettings(branch);
 	return model ? `${model}${level ? `:${level}` : ""}` : undefined;
+}
+
+/** Split provider/model[:thinking] without breaking slash/colon model IDs. */
+export function parseAgentModel(value: string | undefined): {
+	provider: string;
+	id: string;
+	thinkingLevel?: ThinkingLevel;
+} | undefined {
+	if (!value) return undefined;
+	const slash = value.indexOf("/");
+	if (slash <= 0 || slash === value.length - 1) return undefined;
+	const tail = value.slice(slash + 1);
+	const level = tail.match(/:(off|minimal|low|medium|high|xhigh|max)$/);
+	return {
+		provider: value.slice(0, slash),
+		id: level ? tail.slice(0, level.index) : tail,
+		thinkingLevel: level?.[1] as ThinkingLevel | undefined,
+	};
+}
+
+/** A pending choice wins over the model still used by the in-flight run. */
+export function nextSessionModel(id: string, file?: string): string | undefined {
+	const a = getAgent(id);
+	return a?.nextModel ?? sessionModel(file ?? a?.sessionFile) ?? a?.model;
+}
+
+function writeSessionModel(file: string, value: string): void {
+	const choice = parseAgentModel(value);
+	if (!choice) throw new Error(`Invalid model reference: ${value}`);
+	const sm = SessionManager.open(file);
+	const current = branchSettings(sm.getBranch());
+	if (current.model !== `${choice.provider}/${choice.id}`) {
+		sm.appendModelChange(choice.provider, choice.id);
+	}
+	if (choice.thinkingLevel && choice.thinkingLevel !== current.level) {
+		sm.appendThinkingLevelChange(choice.thinkingLevel);
+	}
+}
+
+/** Select a model without sending a prompt or touching a running transcript. */
+export function setAgentModel(id: string, file: string, value: string): void {
+	if (!parseAgentModel(value)) throw new Error("Invalid model reference");
+	const a = getAgent(id);
+	if (a && (a.proc || isRunning(a))) {
+		a.nextModel = value;
+		a.model = value;
+		persist(a);
+		touch(a);
+		return;
+	}
+	writeSessionModel(file, value);
+	if (a) {
+		a.model = value;
+		a.nextModel = undefined;
+		persist(a);
+		touch(a);
+	}
+}
+
+/** Apply a deferred choice only after the child has stopped writing. */
+function flushPendingModel(a: BgAgent): boolean {
+	if (!a.nextModel) return true;
+	const file = a.sessionFile ?? findSessionFile(a.id);
+	if (!file) return false;
+	try {
+		writeSessionModel(file, a.nextModel);
+		a.nextModel = undefined;
+		return true;
+	} catch {
+		// Keep nextModel in the durable agent record for the next run to use.
+		return false;
+	}
 }
 
 /**
