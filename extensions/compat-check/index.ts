@@ -284,6 +284,37 @@ const PROBES: Probe[] = [
 			return need(!missing.length, `json.md no longer documents: ${missing.join(", ")}`);
 		},
 	},
+	{
+		ext: "inbox",
+		id: "visit-chat-container",
+		check: () => {
+			// lib/visit-runtime.ts interposes the chat container's mutation methods
+			// while a visit is open, mirroring pi-tui Container's plain-array
+			// semantics (push / indexOf-splice / replace-all). Verify those
+			// semantics on a real Container; openVisit additionally falls back to a
+			// real session switch when the chat container can't be found.
+			try {
+				const { Container: C } = T;
+				const box = new C();
+				const a = { render: () => ["a"] as string[], invalidate: () => {} };
+				const b = { render: () => ["b"] as string[], invalidate: () => {} };
+				box.addChild(a);
+				box.addChild(b);
+				if (!Array.isArray(box.children) || box.children.length !== 2) {
+					return "Container.children is not a plain array (visit stash/restore breaks)";
+				}
+				box.removeChild(a);
+				if (box.children.length !== 1 || box.children[0] !== b) {
+					return "Container.removeChild no longer splices children";
+				}
+				box.clear();
+				if (box.children.length !== 0) return "Container.clear no longer empties children";
+				return true;
+			} catch (e) {
+				return `Container probe threw: ${(e as Error).message}`;
+			}
+		},
+	},
 ];
 
 interface Result {

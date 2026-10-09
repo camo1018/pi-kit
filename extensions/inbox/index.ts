@@ -61,6 +61,7 @@ import {
 	parseSkillBlock,
 	SessionManager,
 	SettingsManager,
+	SkillInvocationMessageComponent,
 	ToolExecutionComponent,
 	UserMessageComponent,
 } from "@earendil-works/pi-coding-agent";
@@ -109,6 +110,14 @@ import {
 	sessionModel,
 	spawnAgent,
 } from "../../lib/inbox-agents.ts";
+import {
+	closeVisit,
+	isVisiting,
+	openVisit,
+	visitAgent,
+	visitRunning,
+	visitState,
+} from "../../lib/visit-runtime.ts";
 
 // ───────────────────────────── storage ─────────────────────────────
 
@@ -2314,57 +2323,23 @@ function attachedBusy(ctx: ExtensionContext): boolean {
 	return isAttached(ctx) && isRunning(getAgent(ctx.sessionManager.getSessionId()));
 }
 
-/** Banner above the editor in orchestrator mode (home is never visible: the orchestrator covers it). */
+/** The only special mode banner: identify the main session as taken over. */
 function showModeWidget(ctx: ExtensionContext) {
 	if (!ctx.hasUI) return;
-	if (!orchestrating() || isHome(ctx)) return ctx.ui.setWidget("inbox-mode", undefined);
-	const th = ctx.ui.theme;
-	const k = (key: string, label: string) =>
-		`${th.fg("accent", key)} ${th.fg("dim", label)}`;
-	const sep = th.fg("dim", " · ");
 	const id = ctx.sessionManager.getSessionId();
-	const ms = modeState();
-	const agent = getAgent(id);
-	const queued = agent?.pending.length ?? 0;
-	const queueKey =
-		getKeybindings().getKeys("app.message.dequeue").join("/") ||
-		"alt+up";
-	const text = ms.takenOver.has(id)
-		? [
-				th.bold(
-					th.fg(
-						"warning",
-						"🎮 Orchestrator · taken over (runs here)",
-					),
-				),
-				k("ctrl+q", "orchestrator"),
-				k("ctrl+q → h", "hand back"),
-			]
-		: [
-				th.bold(
-					th.fg(
-						"accent",
-						"📡 Orchestrator · attached (runs in background)",
-					),
-				),
-				...(queued
-					? [
-							th.fg("warning", `⏳ ${queued} queued`),
-							k(queueKey, "manage queue"),
-						]
-					: []),
-				ms.takeoverWhenDone.has(id)
-					? th.fg(
-							"warning",
-							"⏳ takes over when this run finishes",
-						)
-					: k("/takeover", "run here"),
-				...(isRunning(agent)
-					? [k("ctrl+shift+s", "stop run")]
-					: []),
-				k("ctrl+q", "orchestrator"),
-			];
-	ctx.ui.setWidget("inbox-mode", [text.join(sep)]);
+	if (
+		!orchestrating() ||
+		isHome(ctx) ||
+		isVisiting() ||
+		!modeState().takenOver.has(id)
+	) {
+		return ctx.ui.setWidget("inbox-mode", undefined);
+	}
+	ctx.ui.setWidget("inbox-mode", [
+		ctx.ui.theme.bold(
+			ctx.ui.theme.fg("warning", "Orchestrator - taken over"),
+		),
+	]);
 }
 
 // ───────────────────── live streaming (attached runs) ─────────────────────
@@ -2439,7 +2414,7 @@ class LiveMsgCache {
 					t.id,
 					t.args,
 					{ showImages: false },
-					undefined,
+					{},
 					tui,
 					"",
 				);
@@ -2464,7 +2439,7 @@ class LiveMsgCache {
  * or the terminal scrollback (regular mode) does all of it, exactly like the transcript. */
 export class LiveStreamComponent extends Container {
 	readonly [LIVE_STREAM_COMPONENT_KEY] = true;
-	readonly cacheVersion = 3;
+	readonly cacheVersion = 5;
 	private cache: LiveMsgCache[] = [];
 	private syncedRun?: object;
 	private syncedKey = "";
@@ -2607,36 +2582,71 @@ function thinkingBlocksHidden(ctx: ExtensionContext): boolean {
 	return hidden;
 }
 
-/** Whether Pi's loaded transcript already rendered this run's prompt. */
-function snapshotHasRunPrompt(
-	ctx: ExtensionContext,
-	a: BgAgent,
-): boolean {
-	if (!a.runPrompt) return false;
-	let branch: readonly any[];
-	try {
-		branch = ctx.sessionManager.getBranch();
-	} catch {
-		return false;
-	}
+/**
+ * Remove the persisted prefix of the in-flight run from Pi's snapshot. The
+ * live component owns the whole current run so leaving and returning does not
+ * mix native snapshot components with reconstructed streaming components.
+ */
+function removeCurrentRunSnapshot(chat: any, a: BgAgent): void {
+	if (!a.runPrompt) return;
+	const named = (child: any, ctor: any, name: string) =>
+		child instanceof ctor || child?.constructor?.name === name;
+	const isUser = (child: any) =>
+		named(child, UserMessageComponent, "UserMessageComponent");
+	const isSkill = (child: any) =>
+		named(
+			child,
+			SkillInvocationMessageComponent,
+			"SkillInvocationMessageComponent",
+		);
 	const expected = cleanTitle(a.runPrompt);
-	for (let i = branch.length - 1; i >= 0; i--) {
-		const entry = branch[i];
-		const timestamp = Date.parse(entry?.timestamp ?? "");
-		if (
-			a.runStartedAt &&
-			Number.isFinite(timestamp) &&
-			timestamp < a.runStartedAt - 5_000
-		) {
+	let start = -1;
+	for (let i = chat.children.length - 1; i >= 0; i--) {
+		const child = chat.children[i] as any;
+		if (isUser(child) && cleanTitle(child.text ?? "") === expected) {
+			start = i;
 			break;
 		}
-		if (entry?.type !== "message") continue;
-		if (entry.message?.role !== "user") continue;
-		if (cleanTitle(messageText(entry.message.content)) === expected) {
-			return true;
+		if (isSkill(child)) {
+			const block = child.skillBlock;
+			const text = block?.userMessage || `⚡${block?.name ?? "skill"}`;
+			if (cleanTitle(text) === expected) {
+				start = i;
+				break;
+			}
 		}
 	}
-	return false;
+	if (start < 0) return;
+	for (let i = start - 1; i >= 0; i--) {
+		const child = chat.children[i] as any;
+		if (named(child, Spacer, "Spacer")) {
+			start = i;
+			continue;
+		}
+		if (isSkill(child)) start = i;
+		break;
+	}
+	for (let i = chat.children.length - 1; i >= start; i--) {
+		const child = chat.children[i] as any;
+		if (
+			named(child, Spacer, "Spacer") ||
+			isUser(child) ||
+			isSkill(child) ||
+			named(
+				child,
+				AssistantMessageComponent,
+				"AssistantMessageComponent",
+			) ||
+			named(
+				child,
+				ToolExecutionComponent,
+				"ToolExecutionComponent",
+			)
+		) {
+			chat.children.splice(i, 1);
+			child.dispose?.();
+		}
+	}
 }
 
 /** Remove live-stream mounts left behind by this or an older extension load. */
@@ -2672,6 +2682,39 @@ function showStartingPrompt(
 /** Live stream for an attached session while its background run is going. */
 function showLiveStream(ctx: ExtensionContext) {
 	if (!ctx.hasUI) return;
+	// While a visit is mounted, the chat container's methods are interposed and its
+	// children are the VisitView — the visit renders the visited session's live run
+	// itself. Mounting a stream here would target the hidden main's stash.
+	if (isVisiting()) {
+		const G = globalThis as any;
+		unmountLiveStream(ctx, G);
+		const a = visitAgent();
+		if (!isRunning(a)) return;
+		// Same compact status the normal attached view uses — no visit-specific UI.
+		const th = ctx.ui.theme;
+		const status: string[] = [
+			th.fg(
+				"accent",
+				a.proc
+					? "⟳ working in the background"
+					: a.hold
+						? "↻ loading the last turn…"
+						: "⏸ queued (waiting for a free agent slot)",
+			),
+		];
+		if (a.pending.length) {
+			const queueKey =
+				getKeybindings().getKeys("app.message.dequeue").join("/") ||
+				"alt+up";
+			status.push(
+				th.fg(
+					"warning",
+					`⏳ ${a.pending.length} message(s) queued · ${queueKey} or /queue to manage`,
+				),
+			);
+		}
+		return ctx.ui.setWidget("inbox-live", status);
+	}
 	const a = isAttached(ctx)
 		? getAgent(ctx.sessionManager.getSessionId())
 		: undefined;
@@ -2681,7 +2724,8 @@ function showLiveStream(ctx: ExtensionContext) {
 	const chat = tui ? chatContainer(tui) : undefined;
 	if (!a || !isRunning(a) || !chat) return unmountLiveStream(ctx, G);
 	const hideThinkingBlock = thinkingBlocksHidden(ctx);
-	const promptInSnapshot = isAttached(ctx) && snapshotHasRunPrompt(ctx, a);
+	removeCurrentRunSnapshot(chat, a);
+	const promptInSnapshot = false;
 	// The stream is one child of the chat container, appended after the snapshot. One stable
 	// instance per agent: its per-message cache survives re-mounts, which happen whenever pi
 	// rebuilds the chat (session switch, compaction) — detect a lost mount and re-append.
@@ -2690,7 +2734,7 @@ function showLiveStream(ctx: ExtensionContext) {
 		!stream ||
 		stream.agentId() !== a.id ||
 		typeof stream.setViewOptions !== "function" ||
-		stream.cacheVersion !== 3
+		stream.cacheVersion !== 5
 	) {
 		stream = new LiveStreamComponent(
 			tui,
@@ -2873,6 +2917,13 @@ export default function (pi: ExtensionAPI) {
 			ms.flagApplied = true;
 			if (pi.getFlag("orchestrator") === true && ctx.mode === "tui") ms.on = true;
 		}
+		// A real session switch while a visit was mounted (e.g. /resume used directly): the new
+		// session's render writes through the chat container, so the visit's interposition must
+		// go now. The visited session keeps running as a background agent, unaffected.
+		if (isVisiting()) {
+			const tui = activeInboxTui(ctx);
+			if (tui) closeVisit(tui);
+		}
 		showModeWidget(ctx);
 		// Orchestrator: whenever the window lands on a blank session (startup, hand-back, /new,
 		// reload) the full-screen orchestrator comes back up, so pi's chat view never shows at home.
@@ -2964,7 +3015,7 @@ export default function (pi: ExtensionAPI) {
 	}
 	// Replace (not keep) a listener left by a previous load, so /reload picks up new listener code.
 	// Keyed by a version so per-session re-instantiation doesn't churn it.
-	const LISTENER_VERSION = 9;
+	const LISTENER_VERSION = 11;
 	if (G.__piInboxAgentsListenerVersion !== LISTENER_VERSION) {
 		if (typeof G.__piInboxAgentsListener === "function") G.__piInboxAgentsListener();
 		G.__piInboxAgentsListenerVersion = LISTENER_VERSION;
@@ -3082,7 +3133,11 @@ export default function (pi: ExtensionAPI) {
 			: undefined;
 		const id =
 			explicitId ??
-			(isAttached(ctx) ? ctx.sessionManager.getSessionId() : homeId);
+			(isVisiting()
+				? visitState().visit!.id
+				: isAttached(ctx)
+					? ctx.sessionManager.getSessionId()
+					: homeId);
 		const agent = id ? getAgent(id) : undefined;
 		if (!agent) {
 			ctx.ui.notify(
@@ -3185,6 +3240,12 @@ export default function (pi: ExtensionAPI) {
 		const wasTakenOver = ms.takenOver.delete(id);
 		ms.takeoverWhenDone.delete(id);
 		ms.stale.delete(id);
+		// Sticky takeover: ending the main's takeover while a visit is open — restore the main's
+		// chat first so the abort/handoff below acts on the real foreground tree, not the visit view.
+		if (wasTakenOver && isVisiting()) {
+			const tui = activeInboxTui(ctx);
+			if (tui) closeVisit(tui);
+		}
 		if (!orchestrating() || !wasTakenOver || isHome(ctx) || (ctx.isIdle() && !ctx.hasPendingMessages())) return undefined;
 		const file = ctx.sessionManager.getSessionFile();
 		const cwd = ctx.cwd;
@@ -3220,6 +3281,9 @@ export default function (pi: ExtensionAPI) {
 		const between = ms.betweenRuns.delete(id) && !getAgent(id)?.proc;
 		try {
 			if (!orchestrating() || isHome(ctx) || !file || ms.takenOver.has(id)) return;
+			// Never reload-switch while a visit is mounted: the chat area shows the visit;
+			// the main's transcript is stashed and its runs keep going.
+			if (isVisiting()) return;
 			if (isRunning(getAgent(id)) && !between) {
 				ms.wasRunning.add(id); // reloads when it finishes
 				return;
@@ -3366,6 +3430,14 @@ export default function (pi: ExtensionAPI) {
 		const id = ctx.sessionManager.getSessionId();
 		if (!orchestrating()) return ctx.ui.notify("/takeover is for orchestrator mode (/orchestrator).", "info");
 		if (isHome(ctx)) return ctx.ui.notify("Pick a session first (ctrl+q, then t on it).", "info");
+		// While visiting, the current foreground session IS the taken-over main: /takeover
+		// would target the visited view. Close the visit instead — the main is already taken over.
+		if (isVisiting()) {
+			const tui = activeInboxTui(ctx);
+			if (tui) closeVisit(tui);
+			showModeWidget(ctx);
+			return ctx.ui.notify("Already taken over — you're back on it. The visited session keeps running in the background.", "info");
+		}
 		if (ms.takenOver.has(id)) return ctx.ui.notify("Already taken over: this session runs here.", "info");
 		ms.takeoverWhenDone.add(id);
 		if (isRunning(getAgent(id))) {
@@ -3379,6 +3451,12 @@ export default function (pi: ExtensionAPI) {
 	async function goHome(ctx: ExtensionCommandContext, opts: { reopen?: boolean } = {}): Promise<boolean> {
 		if (isHome(ctx)) return true;
 		const ms = modeState();
+		// End a visit first: the visited session goes back to being a pure background
+		// agent; the main (taken-over) session's tree is restored live.
+		if (isVisiting()) {
+			const tui = activeInboxTui(ctx);
+			if (tui) closeVisit(tui);
+		}
 		const resume = await prepareLeave(ctx);
 		// session_start on the new blank session reopens the orchestrator (unless reopen: false).
 		ms.skipReopen = opts.reopen === false;
@@ -3481,6 +3559,16 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (result.action === "home") {
+				// Visiting: h means "back to the main (taken-over) session", not to the blank home —
+				// the main is the window's foreground session; end the visit and show it live.
+				if (isVisiting()) {
+					const tui = activeInboxTui(ctx);
+					if (tui) {
+						closeVisit(tui);
+					showModeWidget(ctx);
+					}
+					return;
+				}
 				await goHome(ctx);
 				return;
 			}
@@ -3645,6 +3733,15 @@ export default function (pi: ExtensionAPI) {
 				if (row.isCurrent || (currentFile && row.info.path === currentFile)) {
 					if (isHome(ctx)) continue;
 					markRead(id); // going back into it from the inbox: a manual unread (blue ») clears
+					// Opening the main's own row while a visit is showing: end the visit, show the main live.
+					if (isVisiting()) {
+						const tui = activeInboxTui(ctx);
+						if (tui) {
+							closeVisit(tui);
+							showModeWidget(ctx);
+						}
+						return;
+					}
 					if (result.takeover) return takeOverCurrent(ctx);
 					if (ms.stale.has(id) || ms.takeoverWhenDone.has(id)) await refreshCurrent(ctx);
 					return;
@@ -3653,6 +3750,29 @@ export default function (pi: ExtensionAPI) {
 				if (!file) {
 					ctx.ui.notify("That agent hasn't written its session yet. Try again in a moment.", "warning");
 					continue;
+				}
+				// Sticky takeover: a taken-over session is the window's main session. Opening any
+				// OTHER session visits it (a view over its file + background agent) — the main keeps
+				// running untouched, nothing is aborted, and no prepareLeave handoff happens.
+				const sticky = ms.takenOver.size > 0 || ms.takeoverWhenDone.size > 0
+					? (ms.takenOver.values().next().value ?? ms.takeoverWhenDone.values().next().value)
+					: undefined;
+				if (sticky && sticky !== id && !result.takeover) {
+					const tui = activeInboxTui(ctx);
+					if (tui && openVisit(tui, ctx, {
+						mainId: String(sticky),
+						id,
+						file,
+						cwd: row.info.cwd,
+						title: row.title,
+						modelRegistry: (ctx as any).modelRegistry,
+						recordedModel: sessionModel(file),
+					})) {
+						markRead(id); // visiting counts as looking
+						showModeWidget(ctx);
+						return; // stay in orchestrator: the visit replaced the chat view
+					}
+					// compat fallback (chat container not found): fall through to a real switch
 				}
 				const live = readLive().get(id);
 				const ours = live && (live.pid === process.pid || live.pid === getAgent(id)?.pid || live.bgParent === process.pid);
@@ -3808,6 +3928,13 @@ export default function (pi: ExtensionAPI) {
 	// Attached session with a background run going: pi's on-screen copy is a snapshot, and these
 	// would write to the session file at the same time as the agent. Fine once the run finishes.
 	const busyGuard = (what: string) => async (_e: any, ctx: ExtensionContext) => {
+		// A visited session is never this window's session; compaction/tree here act on the
+		// main, which is exactly why they're guarded: /compact and /tree target the hidden
+		// main while you look at the visit. Guard them so nothing writes behind your back.
+		if (isVisiting()) {
+			if (ctx.hasUI) ctx.ui.notify(`Can't ${what} while visiting another session. esc returns to your taken-over session first.`, "warning");
+			return { cancel: true };
+		}
 		if (!attachedBusy(ctx)) return undefined;
 		if (ctx.hasUI) ctx.ui.notify(`Can't ${what} while this session is working in the background. Wait for it (or ctrl+shift+s to stop it).`, "warning");
 		return { cancel: true };
@@ -3861,6 +3988,15 @@ export default function (pi: ExtensionAPI) {
 
 	/** Orchestrator: stop the attached session's background run (completed steps stay saved). */
 	function stopCurrent(ctx: ExtensionContext) {
+		// Visiting: stop the visited session's background run (the main keeps going).
+		if (isVisiting()) {
+			const vid = visitState().visit!.id;
+			if (!isRunning(getAgent(vid)))
+				return ctx.ui.notify("Nothing running in the background for the visited session.", "info");
+			cancelAgent(vid);
+			showModeWidget(ctx);
+			return ctx.ui.notify("■ Stopped the visited session's background run. Completed steps are saved; send a message to continue.", "info");
+		}
 		const id = ctx.sessionManager.getSessionId();
 		if (!isAttached(ctx) || !isRunning(getAgent(id)))
 			return ctx.ui.notify(isAttached(ctx) ? "Nothing running in the background for this session." : "Use esc to interrupt a session running here.", "info");
@@ -3955,6 +4091,16 @@ export default function (pi: ExtensionAPI) {
 		// Orchestrator home (normally covered by the orchestrator): every message starts a background
 		// agent, so home never gets a conversation.
 		const text = String(event.text ?? "").trim();
+		// Visiting a session (sticky takeover active): the prompt goes to the visited session's
+		// background agent — queued if it's working, a new background run if it's idle — never to
+		// the hidden main session.
+		if (!t && text && isVisiting()) {
+			const v = visitState().visit!;
+			if (event.images?.length) ctx.ui.notify("Images can't be sent to background agents yet: sent the text only.", "warning");
+			sendToAgent({ id: v.id, cwd: v.cwd, sessionFile: v.file, title: v.title, text, model: currentModel(ctx) });
+			showModeWidget(ctx); // queued count / running state may have changed
+			return { action: "handled" };
+		}
 		// Orchestrator home, waiting for a just-started agent to open: more messages queue for it.
 		const pendingId = orchestrating() && isHome(ctx) ? modeState().openWhenReady : undefined;
 		const pending = pendingId ? getAgent(pendingId) : undefined;
@@ -4122,6 +4268,21 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 				return undefined;
+			}
+			if (matchesKey(data, "escape")) {
+				const c =
+					(G.__piInboxAgentsCtx as ExtensionContext | undefined) ?? ctx;
+				// Visiting a session: esc returns to the main (taken-over) session. The
+				// visited one keeps running as a background agent. Don't consume when a
+				// dialog/overlay is up (esc closes that first) or the orchestrator list is open.
+				if (isVisiting() && editorFocused() && !modeState().inLoop) {
+					const tui = activeInboxTui(c);
+					if (tui) {
+						closeVisit(tui);
+						showModeWidget(c);
+						return { consume: true };
+					}
+				}
 			}
 			if (!getReplyTarget() || !matchesKey(data, "escape")) return undefined;
 			const c = (G.__piInboxAgentsCtx as ExtensionContext | undefined) ?? ctx;
