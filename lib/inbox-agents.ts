@@ -29,7 +29,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { getAgentDir, getMarkdownTheme, SessionManager, type Theme } from "@earendil-works/pi-coding-agent";
-import { type KeybindingsManager, Markdown, matchesKey, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { type KeybindingsManager, Markdown, matchesKey, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 // ───────────────────────────── registry ─────────────────────────────
 
@@ -71,6 +71,8 @@ export interface BgAgent {
 	liveText: string;
 	/** Structured transcript of the current run (prompt, tool calls, finished replies), for the live panel. */
 	items?: RunItem[];
+	/** Reconstructed live transcript of the in-flight run (drives the streaming chat view). */
+	liveRun?: LiveRun;
 	/** Don't start the next queued run yet (the UI is reloading the transcript between runs). */
 	hold?: boolean;
 }
@@ -86,6 +88,163 @@ const ITEMS_MAX = 60;
 function addItem(a: BgAgent, item: RunItem) {
 	(a.items ??= []).push(item);
 	if (a.items.length > ITEMS_MAX) a.items.splice(0, a.items.length - ITEMS_MAX);
+}
+
+// ─────────────────── live run (streaming transcript state) ───────────────────
+//
+// Reconstructs the in-flight run as the same shapes pi's interactive chat view uses,
+// from the child's JSON event stream: the user prompt, then assistant messages with
+// thinking/text/toolCall blocks (streamed block by block), then tool results. The UI
+// renders this with pi's own message components, so the streaming transcript looks
+// exactly like a foreground one. Kept bounded: only the last LIVE_MSGS_MAX messages
+// are retained (older ones are dropped once rendered; the session file has them).
+
+export interface LiveTool {
+	id: string;
+	name: string;
+	args: any;
+	/** Partial or final result content (what ToolExecutionComponent.updateResult takes). */
+	result?: { content: any[]; isError: boolean };
+}
+
+export interface LiveMsg {
+	role: "user" | "assistant";
+	/** User text, or an assistant message in pi's wire shape (content blocks, stopReason, …). */
+	message?: any;
+	text?: string;
+	/** Live tools (assistant messages render their calls; results update in place). */
+	tools?: LiveTool[];
+	/** Update counter, bumped whenever this message changed (for UI re-render diffing). */
+	rev: number;
+}
+
+export interface LiveRun {
+	/** prompt + finished messages, oldest first; last may be the streaming one. */
+	msgs: LiveMsg[];
+	/** Monotonic counter for rev bumps. */
+	rev: number;
+}
+
+const LIVE_MSGS_MAX = 150;
+/** Cap on retained tool-result text per call (results render collapsed by default anyway). */
+const LIVE_RESULT_MAX = 24_000;
+
+const newLiveRun = (): LiveRun => ({ msgs: [], rev: 0 });
+
+function liveMsg(a: BgAgent): LiveMsg | undefined {
+	const run = a.liveRun;
+	if (!run) return undefined;
+	const last = run.msgs[run.msgs.length - 1];
+	return last?.role === "assistant" ? last : undefined;
+}
+
+/** Clamp a tool result so a huge read/output can't balloon the retained run. */
+function clampResult(result: { content: any[]; isError: boolean }) {
+	const content = result.content.map((b: any) => {
+		if (typeof b?.text === "string" && b.text.length > LIVE_RESULT_MAX) {
+			const cut = b.text.length - LIVE_RESULT_MAX;
+			return { ...b, text: `${b.text.slice(0, LIVE_RESULT_MAX)}\n… (${cut} more bytes; full output is in the transcript after the run)` };
+		}
+		return b;
+	});
+	return { content, isError: result.isError };
+}
+
+/** Wire assistant message start: begin a new streaming assistant message. */
+function liveStartAssistant(a: BgAgent, ev: any) {
+	const run = a.liveRun ??= newLiveRun();
+	run.msgs.push({ role: "assistant", message: { ...ev.message, content: [] }, tools: [], rev: ++run.rev });
+	trimLive(run);
+}
+
+function trimLive(run: LiveRun) {
+	if (run.msgs.length <= LIVE_MSGS_MAX) return;
+	// Never drop the streaming message at the tail.
+	run.msgs.splice(0, run.msgs.length - LIVE_MSGS_MAX);
+}
+
+/** Apply one streamed content block delta to the live message (thinking/text deltas). */
+function liveDelta(a: BgAgent, d: any) {
+	const m = liveMsg(a);
+	if (!m || !m.message) return;
+	if (d.type === "text_delta" && typeof d.delta === "string") {
+		const blocks = (m.message.content ??= []);
+		let block = blocks.find((b: any) => b.type === "text" && b._live);
+		if (!block) {
+			block = { type: "text", text: "", _live: true };
+			blocks.push(block);
+		}
+		block.text = (block.text + d.delta).slice(-32000);
+	} else if (d.type === "thinking_delta" && typeof d.delta === "string") {
+		const blocks = (m.message.content ??= []);
+		let block = blocks.find((b: any) => b.type === "thinking" && b._live);
+		if (!block) {
+			block = { type: "thinking", thinking: "", _live: true };
+			blocks.push(block);
+		}
+		block.thinking = (block.thinking + d.delta).slice(-32000);
+	}
+	m.rev = (a.liveRun!.rev += 1);
+}
+
+/** A tool call's arguments finished streaming (toolcall_end): pin the call into the live message. */
+function liveToolCallEnd(a: BgAgent, d: any) {
+	const m = liveMsg(a);
+	const tc = d?.toolCall;
+	if (!m || !tc?.id) return;
+	const tools = (m.tools ??= []);
+	let t = tools.find((x) => x.id === tc.id);
+	if (!t) tools.push((t = { id: tc.id, name: tc.name ?? "tool", args: tc.arguments ?? {} }));
+	else {
+		t.args = tc.arguments ?? t.args;
+		t.name = tc.name ?? t.name;
+	}
+	const blocks = (m.message.content ??= []);
+	let block = blocks.find((b: any) => b.type === "toolCall" && b.id === tc.id);
+	if (block) block.arguments = tc.arguments ?? block.arguments;
+	else blocks.push({ type: "toolCall", id: tc.id, name: tc.name ?? "tool", arguments: tc.arguments ?? {} });
+	m.rev = (a.liveRun!.rev += 1);
+}
+
+/** Tool execution started: make sure the tool exists in the live message (and sync its args). */
+function liveToolStart(a: BgAgent, ev: any) {
+	const m = liveMsg(a);
+	if (!m || !ev.toolCallId) return;
+	if (!m.message) m.message = { role: "assistant", content: [] };
+	const blocks = (m.message.content ??= []);
+	let block = blocks.find((b: any) => b.type === "toolCall" && b.id === ev.toolCallId);
+	// Normal flow pins the call at toolcall_end; if execution started before that (e.g. replay of
+	// an adopted run where we missed the deltas), synthesize the block so it still renders.
+	if (!block) {
+		block = { type: "toolCall", id: ev.toolCallId, name: ev.toolName ?? "tool", arguments: ev.args ?? {} };
+		blocks.push(block);
+	}
+	let t = (m.tools ??= []).find((x) => x.id === ev.toolCallId);
+	if (!t) (m.tools ??= []).push((t = { id: ev.toolCallId, name: ev.toolName ?? block.name, args: ev.args ?? block.arguments ?? {} }));
+	t.args = ev.args ?? t.args;
+	t.name = ev.toolName ?? t.name;
+	m.rev = (a.liveRun!.rev += 1);
+}
+
+/** The streamed assistant message is final: adopt the authoritative message shape. */
+function liveEndAssistant(a: BgAgent, ev: any) {
+	const run = a.liveRun;
+	const m = run && liveMsg(a);
+	if (!m) return;
+	if (ev.message?.role === "assistant") m.message = ev.message; // final content + stopReason
+	m.rev = (run!.rev += 1);
+}
+
+/** Wire user prompt (the run's prompt, or a steering prompt mid-run). */
+function liveUser(a: BgAgent, text: string | undefined) {
+	const run = a.liveRun ??= newLiveRun();
+	if (!text) return;
+	run.msgs.push({ role: "user", text, rev: ++run.rev });
+	trimLive(run);
+}
+
+function liveTouch(a: BgAgent, m: LiveMsg | undefined) {
+	if (m && a.liveRun) m.rev = (a.liveRun.rev += 1);
 }
 
 const LOG_MAX = 40;
@@ -549,9 +708,11 @@ function adopt(s: SavedAgent) {
 		a.runPrompt = s.runPrompt;
 		a.runStartedAt = s.runStartedAt;
 		a.outOffset = 0; // replay the run so far
+		a.liveRun = newLiveRun();
 		if (s.runPrompt) {
 			a.items = [{ kind: "prompt", text: s.runPrompt }];
 			logLine(a, `› ${s.runPrompt}`);
+			liveUser(a, cleanUserText(s.runPrompt));
 		}
 		const id = a.id;
 		a.proc = { pid: s.pid, kill: () => requestStop(id) };
@@ -570,6 +731,8 @@ function run(a: BgAgent) {
 	a.liveText = "";
 	a.items = [{ kind: "prompt", text: message }];
 	logLine(a, `› ${message}`);
+	a.liveRun = newLiveRun();
+	liveUser(a, cleanUserText(message));
 	const { cmd, pre } = piCommand();
 	const args = [...pre, "--mode", "json", "--session-id", a.id, ...extensionArgs()];
 	// --model wins over the model the session would restore, and is saved in the session.
@@ -749,6 +912,11 @@ function finishRun(a: BgAgent, code: number, signal?: string) {
 	pump();
 }
 
+/** Apply one JSON wire event to the agent (public for tests; monitor() drives it). */
+export function applyEvent(a: BgAgent, ev: any, deltaGate: () => boolean = () => true) {
+	handleEvent(a, ev, deltaGate);
+}
+
 function handleEvent(a: BgAgent, ev: any, deltaGate: () => boolean) {
 	switch (ev.type) {
 		case "session":
@@ -760,20 +928,53 @@ function handleEvent(a: BgAgent, ev: any, deltaGate: () => boolean) {
 			a.state = "working";
 			touch(a);
 			break;
+		case "turn_start":
+			// A steering prompt may arrive mid-run; the run's own prompt is added in run().
+			touch(a);
+			break;
 		case "tool_execution_start":
 			a.activity = `${ev.toolName ?? "tool"}${ev.args ? `: ${summarizeArgs(ev.toolName, ev.args)}` : ""}`;
 			logLine(a, `▸ ${a.activity}`);
 			addItem(a, { kind: "tool", text: a.activity });
+			liveToolStart(a, ev);
 			touch(a);
 			break;
+		case "tool_execution_update":
+			if (ev.partialResult) {
+				const m = liveMsg(a);
+				const t = m?.tools?.find((x) => x.id === ev.toolCallId);
+				if (t && m) {
+					t.result = clampResult({ content: ev.partialResult.content ?? [], isError: false });
+					liveTouch(a, m);
+				}
+			}
+			break;
 		case "tool_execution_end":
+			{
+				const m = liveMsg(a);
+				const t = m?.tools?.find((x) => x.id === ev.toolCallId);
+				if (t && m && ev.result) {
+					t.result = clampResult({ content: ev.result.content ?? [], isError: !!ev.isError });
+					liveTouch(a, m);
+				}
+			}
 			if (ev.isError) {
 				logLine(a, `  ✗ ${ev.toolName ?? "tool"} failed`);
 				addItem(a, { kind: "error", text: `${ev.toolName ?? "tool"} failed` });
 			}
 			break;
+		case "message_start":
+			if (ev.message?.role === "assistant") liveStartAssistant(a, ev);
+			else if (ev.message?.role === "user") {
+				const t = textOf(ev.message.content).trim();
+				// The run's own prompt is recorded in run(); skip its duplicate message_start.
+				if (t && t !== a.runPrompt) liveUser(a, t);
+			}
+			break;
 		case "message_update": {
 			const d = ev.assistantMessageEvent;
+			if (d?.type === "text_delta" || d?.type === "thinking_delta") liveDelta(a, d);
+			if (d?.type === "toolcall_end") liveToolCallEnd(a, d);
 			if (d?.type !== "text_delta" || typeof d.delta !== "string") break;
 			a.liveText = (a.liveText + d.delta).slice(-8000);
 			if (deltaGate()) {
@@ -787,6 +988,7 @@ function handleEvent(a: BgAgent, ev: any, deltaGate: () => boolean) {
 			if (m?.role !== "assistant") break;
 			const text = textOf(m.content).trim();
 			a.liveText = "";
+			liveEndAssistant(a, ev);
 			if (text) {
 				a.lastText = text;
 				logLine(a, `💬 ${text}`);
@@ -794,7 +996,7 @@ function handleEvent(a: BgAgent, ev: any, deltaGate: () => boolean) {
 			}
 			if (m.stopReason === "error") {
 				a.error = m.errorMessage || "provider error";
-				addItem(a, { kind: "error", text: a.error });
+				addItem(a, { kind: "error", text: a.error! });
 			}
 			touch(a);
 			break;
@@ -1178,16 +1380,28 @@ export class AgentViewComponent {
 			this.linesWidth = innerW;
 		}
 		const a = getAgent(this.target.id);
-		// The session file only gets whole messages; append the reply that's streaming right now.
-		const live = a?.proc && a.liveText.trim() ? a.liveText.trimEnd() : "";
-		const all = live
-			? [
-					...this.lines,
-					"",
-					th.fg("dim", " writing…"),
-					...live.split("\n").flatMap((l) => (l.trim() ? wrapTextWithAnsi(l, Math.max(10, innerW - 2)).map((x) => ` ${x}`) : [""])),
-				]
-			: this.lines;
+		// The session file only gets whole messages; show what the run is doing right now.
+		// With a live run (our child or an adopted one we replayed), render its messages: tool
+		// calls as one-liners, assistant text (streamed or finished) as markdown.
+		let live: string[] = [];
+		if (a?.liveRun?.msgs.length) {
+			const th2 = this.theme;
+			for (const m of a.liveRun.msgs) {
+				if (m.role === "user") {
+					live.push(th2.fg("accent", `› ${((m.text ?? "").split("\n")[0] ?? "").slice(0, 160)}`), "");
+				} else {
+					for (const t of m.tools ?? []) {
+						const arg = summarizeArgs(t.name, t.args);
+						live.push(th2.fg("dim", `  ▸ ${t.name}${arg ? ` ${arg}` : ""}${t.result ? (t.result.isError ? " ✗" : "") : " …"}`));
+					}
+					const text = textOf(m.message?.content).trim();
+					if (text) live.push(th2.fg("dim", "  ") + text.split("\n")[0]!.slice(0, 160), "");
+				}
+			}
+		} else if (a?.proc && a.liveText.trim()) {
+			live = [th.fg("dim", " writing…"), ...a.liveText.trimEnd().split("\n").slice(-10)];
+		}
+		const all = live.length ? [...this.lines, "", ...live] : this.lines;
 		const H = this.viewH();
 		const max = Math.max(0, all.length - H);
 		if (this.follow) this.scroll = max;

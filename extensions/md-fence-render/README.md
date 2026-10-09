@@ -8,8 +8,11 @@ Display-only changes to how fenced blocks render in the transcript:
 - Every other code block keeps Pi's highlight.js syntax highlighting, but the
   literal ```` ```lang ```` / ```` ``` ```` fence lines are replaced by
   `┌─ lang` / `└─` markers (`┌─ code` when untagged).
-- Adds copy-safe code block rules to the system prompt (lines under 80
-  columns, comments on their own line, no leading indent).
+- Adds copy-safe code block rules to the system prompt: code lines under 80
+  columns, comments on their own line, no leading indent. Prose blocks
+  (```text drafts like Slack messages) are exempt — one sentence/bullet per
+  line, no hard wrapping; they're copied with `/cc` (snippet-copy) instead
+  of mouse selection.
 
 The session file and model context keep the raw fences; `/copy` copies them.
 
