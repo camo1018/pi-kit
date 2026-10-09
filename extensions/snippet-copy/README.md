@@ -9,12 +9,11 @@ no mouse selection, no wrap or padding artifacts.
 /cc text       copy the most recent block tagged ```text
                (e.g. the latest Slack draft)
 ctrl+shift+y   copy the most recent code block
-click block    copy that block (fullscreen TUI mode only)
 ```
 
-The click path requires Pi's actual `tuiMode: "fullscreen"` renderer. A
-full-width orchestrator overlay in regular mode is not the fullscreen renderer;
-regular mode leaves mouse input with the terminal for text selection.
+Click-to-copy used to live here; it now lives in the separate
+**click-copy** extension (the two share nothing — a click copies without
+touching the numbering here, and `/cc` works without the click hook).
 
 - Every fenced block in an assistant message gets a display-only label under
   it (`⧉ #3 · /cc 3`). Labels appear in the transcript only; the session file
@@ -46,9 +45,7 @@ it here.
 
 ## Pi internals this depends on
 
-The command and clipboard paths use public APIs. Fullscreen click routing is
-provided by `md-fence-render`'s private `Markdown` patch and is covered by its
-compat probes.
+All public APIs:
 
 - `pi.registerCommand("cc", …)` with `getArgumentCompletions`
 - `pi.registerShortcut("ctrl+shift+y", …)`

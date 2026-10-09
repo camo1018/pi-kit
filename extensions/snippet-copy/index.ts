@@ -14,11 +14,16 @@
  *   - /cc <lang>     copy the most recent block with that language,
  *                    e.g. /cc text for the latest Slack draft
  *   - ctrl+shift+y   copy the most recent block
- *   - click a block  copy it in Pi's fullscreen TUI mode
+ *
+ * Click-to-copy lives in click-copy; when both are loaded, a click
+ * copies without touching the numbering here.
  *
  * Copying uses Pi's copyToClipboard(): native pbcopy on macOS, OSC 52
  * over SSH — the exact original text, one block, no padding, no
  * wrap-induced line breaks.
+ *
+ * Click-to-copy lives in the separate click-copy extension; when both
+ * are loaded, a click copies without touching the numbering here.
  *
  * Load order: registered before md-fence-render (transformers chain in
  * package order), so labels attach to the raw markdown and survive
@@ -39,13 +44,6 @@ interface Block {
 	lang: string;
 	code: string;
 }
-
-interface ClickedBlock {
-	lang: string;
-	code: string;
-}
-
-const CLICK_COPY = Symbol.for("pi-kit:snippet-copy:click");
 
 /** All code blocks seen in assistant messages on the current branch, in order. */
 let blocks: Block[] = [];
@@ -202,14 +200,8 @@ async function copyBlock(b: Block | undefined, ctx: any) {
 
 export default function snippetCopy(pi: ExtensionAPI) {
 	registerLoadedExtension("snippet-copy");
-	let activeCtx: any;
-	(globalThis as any)[CLICK_COPY] = (block: ClickedBlock) => {
-		const id = idByCode.get(block.code);
-		void copyCode(block.code, block.lang, activeCtx, id);
-	};
 
 	pi.on("session_start", (_event, ctx?: any) => {
-		activeCtx = ctx;
 		reset();
 		try {
 			for (const entry of ctx?.sessionManager?.getBranch?.() ?? []) {

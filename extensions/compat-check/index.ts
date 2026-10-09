@@ -99,7 +99,7 @@ const PROBES: Probe[] = [
 			if (!hasMethod(T.Markdown, "handleMouse")) {
 				return "Markdown.handleMouse click patch is missing";
 			}
-			const key = Symbol.for("pi-kit:snippet-copy:click");
+			const key = Symbol.for("pi-kit:click-copy:click");
 			const previous = (globalThis as any)[key];
 			let copied: any;
 			(globalThis as any)[key] = (block: any) => {
