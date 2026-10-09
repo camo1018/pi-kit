@@ -117,6 +117,8 @@ export interface LiveMsg {
 	/** User text, or an assistant message in pi's wire shape (content blocks, stopReason, …). */
 	message?: any;
 	text?: string;
+	/** Wire message id (user echoes) — the id the child persisted, for transcript dedupe. */
+	id?: string;
 	/** Live tools (assistant messages render their calls; results update in place). */
 	tools?: LiveTool[];
 	/** Update counter, bumped whenever this message changed (for UI re-render diffing). */
@@ -241,10 +243,10 @@ function liveEndAssistant(a: BgAgent, ev: any) {
 }
 
 /** Wire user prompt (the run's prompt, or a steering prompt mid-run). */
-function liveUser(a: BgAgent, text: string | undefined) {
+function liveUser(a: BgAgent, text: string | undefined, id?: string) {
 	const run = a.liveRun ??= newLiveRun();
 	if (!text) return;
-	run.msgs.push({ role: "user", text, rev: ++run.rev });
+	run.msgs.push({ role: "user", text, id, rev: ++run.rev });
 	trimLive(run);
 }
 
@@ -851,7 +853,15 @@ function monitor(a: BgAgent, child?: ChildProcess) {
 			fs.closeSync(fd);
 		}
 		let nl: number;
-		// split on LF only (JSON strings may contain U+2028/9)
+		let pendingDelta: any;
+		const flushDelta = () => {
+			if (!pendingDelta) return;
+			handleEvent(a, pendingDelta, gate);
+			pendingDelta = undefined;
+		};
+		// Split on LF only (JSON strings may contain U+2028/9). Coalesce
+		// consecutive text/reasoning deltas so one poll performs one string
+		// append and revision bump instead of hundreds.
 		while ((nl = buf.indexOf("\n")) >= 0) {
 			const line = buf.slice(0, nl).replace(/\r$/, "");
 			buf = buf.slice(nl + 1);
@@ -862,8 +872,26 @@ function monitor(a: BgAgent, child?: ChildProcess) {
 			} catch {
 				continue;
 			}
+			const delta = ev?.assistantMessageEvent;
+			const streamDelta =
+				ev?.type === "message_update" &&
+				(delta?.type === "text_delta" ||
+					delta?.type === "thinking_delta") &&
+				typeof delta.delta === "string";
+			if (streamDelta) {
+				const previous = pendingDelta?.assistantMessageEvent;
+				if (previous?.type === delta.type) {
+					previous.delta += delta.delta;
+				} else {
+					flushDelta();
+					pendingDelta = ev;
+				}
+				continue;
+			}
+			flushDelta();
 			handleEvent(a, ev, gate);
 		}
+		flushDelta();
 	};
 	const timer = setInterval(() => {
 		if (getAgent(a.id) !== a) return clearInterval(timer); // forgotten / replaced
@@ -1000,7 +1028,14 @@ function handleEvent(a: BgAgent, ev: any, deltaGate: () => boolean) {
 				// A later steering prompt still renders normally.
 				const seeded = comparableUserText(a.runPrompt ?? "");
 				if (t && comparableUserText(t) !== seeded) {
-					liveUser(a, cleanUserText(t));
+					liveUser(a, cleanUserText(t), ev.message.id);
+				} else if (t && ev.message.id) {
+					// The run prompt's own echo: record its persisted wire id on the
+					// seeded message so transcript dedupe (visit view) can match it
+					// exactly — the seeded text is cleaned, which never equals a
+					// skill-expanded persist.
+					const first = a.liveRun?.msgs.find((m) => m.role === "user");
+					if (first && !first.id) first.id = ev.message.id;
 				}
 			}
 			break;
@@ -1331,7 +1366,7 @@ function cleanUserText(s: string): string {
  * original `$skill` token in the message, so those metadata blocks must be
  * removed rather than converted into an additional visible skill marker.
  */
-function comparableUserText(s: string): string {
+export function comparableUserText(s: string): string {
 	let text = s;
 	for (;;) {
 		const withoutBlock = text.replace(

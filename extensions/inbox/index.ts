@@ -2373,6 +2373,11 @@ class LiveMsgCache {
 		rev: number;
 		hideThinkingBlock: boolean;
 		parts: any[];
+		tools: Array<{
+			id: string;
+			args: any;
+			result: any;
+		}>;
 	};
 
 	get(
@@ -2385,15 +2390,36 @@ class LiveMsgCache {
 		if (
 			this.entry &&
 			this.entry.source === m &&
-			this.entry.rev === m.rev &&
 			this.entry.hideThinkingBlock === hideThinkingBlock
 		) {
-			// Streaming continues on the same message: update it in place.
-			const first = this.entry.parts[0];
-			if (first?.updateContent && m.role === "assistant") {
-				first.updateContent(m.message, true);
+			const tools = m.tools ?? [];
+			const sameTools =
+				this.entry.tools.length === tools.length &&
+				this.entry.tools.every((t, i) => t.id === tools[i]?.id);
+			if (sameTools) {
+				if (this.entry.rev !== m.rev && m.role === "assistant") {
+					const first = this.entry.parts[0];
+					first?.updateContent?.(m.message, true);
+					for (let i = 0; i < tools.length; i++) {
+						const tool = tools[i];
+						const previous = this.entry.tools[i];
+						const component = this.entry.parts[i + 1];
+						if (tool.args !== previous.args) {
+							component?.updateArgs?.(tool.args);
+						}
+						if (tool.result !== previous.result && tool.result) {
+							component?.updateResult?.(tool.result);
+						}
+					}
+					this.entry.rev = m.rev;
+					this.entry.tools = tools.map((t: any) => ({
+						id: t.id,
+						args: t.args,
+						result: t.result,
+					}));
+				}
+				return this.entry.parts;
 			}
-			return this.entry.parts;
 		}
 		const parts: any[] = [];
 		if (m.role === "user") {
@@ -2432,6 +2458,11 @@ class LiveMsgCache {
 			rev: m.rev,
 			hideThinkingBlock,
 			parts,
+			tools: (m.tools ?? []).map((t: any) => ({
+				id: t.id,
+				args: t.args,
+				result: t.result,
+			})),
 		};
 		return parts;
 	}
@@ -2444,7 +2475,7 @@ class LiveMsgCache {
  * or the terminal scrollback (regular mode) does all of it, exactly like the transcript. */
 export class LiveStreamComponent extends Container {
 	readonly [LIVE_STREAM_COMPONENT_KEY] = true;
-	readonly cacheVersion = 5;
+	readonly cacheVersion = 6;
 	private cache: LiveMsgCache[] = [];
 	private syncedRun?: object;
 	private syncedKey = "";
@@ -2739,7 +2770,7 @@ function showLiveStream(ctx: ExtensionContext) {
 		!stream ||
 		stream.agentId() !== a.id ||
 		typeof stream.setViewOptions !== "function" ||
-		stream.cacheVersion !== 5
+		stream.cacheVersion !== 6
 	) {
 		stream = new LiveStreamComponent(
 			tui,
@@ -3020,7 +3051,7 @@ export default function (pi: ExtensionAPI) {
 	}
 	// Replace (not keep) a listener left by a previous load, so /reload picks up new listener code.
 	// Keyed by a version so per-session re-instantiation doesn't churn it.
-	const LISTENER_VERSION = 11;
+	const LISTENER_VERSION = 12;
 	if (G.__piInboxAgentsListenerVersion !== LISTENER_VERSION) {
 		if (typeof G.__piInboxAgentsListener === "function") G.__piInboxAgentsListener();
 		G.__piInboxAgentsListenerVersion = LISTENER_VERSION;

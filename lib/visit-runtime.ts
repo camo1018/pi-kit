@@ -48,7 +48,7 @@ import {
 	UserMessageComponent,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, type TUI } from "@earendil-works/pi-tui";
-import { getAgent, isRunning, onAgentEvent, type BgAgent } from "./inbox-agents.ts";
+import { getAgent, isRunning, onAgentEvent, type BgAgent, type LiveMsg } from "./inbox-agents.ts";
 
 // ───────────────────────────── visit state ─────────────────────────────
 
@@ -119,6 +119,8 @@ function footerComponentOf(tui: TUI): any | undefined {
 interface UserItem {
 	role: "user";
 	text: string;
+	/** Wire message id (absent on locally-seeded items), for transcript dedupe. */
+	id?: string;
 }
 interface AssistantItem {
 	role: "assistant";
@@ -131,7 +133,7 @@ type VisitItem = UserItem | AssistantItem;
 class VisitMsgCache {
 	entry?: { source: any; parts: any[] };
 
-	get(m: VisitItem, md: any, tui: TUI): any[] {
+	get(m: UserItem | AssistantItem | LiveMsg, md: any, tui: TUI): any[] {
 		if (this.entry && this.entry.source === m) {
 			const first = this.entry.parts[0];
 			if (first?.updateContent && m.role === "assistant") first.updateContent(m.message, true);
@@ -139,10 +141,10 @@ class VisitMsgCache {
 		}
 		const parts: any[] = [];
 		if (m.role === "user") {
-			parts.push(new UserMessageComponent(m.text, md, 0));
+			parts.push(new UserMessageComponent((m as UserItem).text ?? "", md, 0));
 		} else {
-			parts.push(new AssistantMessageComponent(m.message, true, md, "Thinking…", 0));
-			for (const t of m.tools) {
+			parts.push(new AssistantMessageComponent((m as AssistantItem | LiveMsg).message, true, md, "Thinking…", 0));
+			for (const t of (m as AssistantItem | LiveMsg).tools ?? []) {
 				const tc = new ToolExecutionComponent(t.name, t.id, t.args, { showImages: false }, undefined, tui, "");
 				if (t.result) tc.updateResult(t.result);
 				parts.push(tc);
@@ -153,8 +155,14 @@ class VisitMsgCache {
 	}
 }
 
-/** The visited session's active branch as render items, with tool results attached. */
-function branchItems(file: string): VisitItem[] {
+/**
+ * The visited session's active branch as render items, with tool results attached.
+ * The in-flight run's persisted tail is trimmed: the live run replays the whole
+ * run (seeded prompt + streamed turns), so once the child has flushed those
+ * messages to the session file they would render twice. The tail is matched by
+ * wire message id (see the trim below) so the live replay owns the run.
+ */
+function branchItems(file: string, liveMsgs: LiveMsg[]): VisitItem[] {
 	const items: VisitItem[] = [];
 	const toolById = new Map<string, AssistantItem["tools"][number]>();
 	let branch: any[] = [];
@@ -168,7 +176,7 @@ function branchItems(file: string): VisitItem[] {
 		const m = e.message;
 		if (!m) continue;
 		if (m.role === "user") {
-			items.push({ role: "user", text: userText(m) });
+			items.push({ role: "user", text: userText(m), id: m.id });
 		} else if (m.role === "assistant") {
 			const tools = (Array.isArray(m.content) ? m.content : [])
 				.filter((c: any) => c?.type === "toolCall")
@@ -179,6 +187,40 @@ function branchItems(file: string): VisitItem[] {
 		} else if (m.role === "toolResult") {
 			const t = toolById.get(m.toolCallId);
 			if (t) t.result = m;
+		}
+	}
+	// The in-flight run's persisted tail is trimmed so the run renders once: the
+	// live replay owns the whole run (seeded prompt + streamed turns), and once
+	// the child flushes those messages to the session file they would render
+	// twice. Matching is by exact wire message ids — never by prompt text — so an
+	// identical re-prompt of a fresh run never trims the previous run's history.
+	//   • a user id match: the echo of the run prompt (or a steer) was persisted;
+	//   • an assistant id match: this run's turns are already in the file — trim
+	//     back to the user message that precedes them (also covers runs so long
+	//     the live trim dropped the seeded prompt).
+	const liveUserIds = new Set(
+		liveMsgs
+			.filter((m) => m.role === "user")
+			.map((m) => m.id)
+			.filter(Boolean),
+	);
+	const liveAssistantIds = new Set(
+		liveMsgs
+			.filter((m) => m.role === "assistant")
+			.map((m) => m.message?.id)
+			.filter(Boolean),
+	);
+	if (liveUserIds.size || liveAssistantIds.size) {
+		let matched = false; // a flushed assistant turn of this run was found
+		for (let i = items.length - 1; i >= 0; i--) {
+			const it = items[i]!;
+			if (it.role === "assistant") {
+				if (liveAssistantIds.has(it.message?.id)) matched = true;
+				continue;
+			}
+			// The branch's newest user message starts this run's persisted tail.
+			if (matched || liveUserIds.has(it.id)) items.length = i;
+			break;
 		}
 	}
 	return items;
@@ -216,16 +258,18 @@ export class VisitView extends Container {
 	private sync(): void {
 		const st = visitState().visit;
 		if (!st) return;
-		// Persisted history: rebuild only when the file grew.
-		const branch = branchItems(st.file);
-		const branchKey = `${branch.length}:${branch[branch.length - 1]?.message?.id ?? ""}`;
+		// Live run (the background agent's stream for this session).
+		const msgs: LiveMsg[] = getAgent(st.id)?.liveRun?.msgs ?? [];
+		// Persisted history: rebuild when the file grew or the in-flight run's
+		// persisted tail appeared (trimming it changes the item list).
+		const branch = branchItems(st.file, msgs);
+		const branchKey = `${branch.length}:${(branch[branch.length - 1] as AssistantItem | undefined)?.message?.id ?? ""}`;
 		if (branchKey !== this.branchKey) {
 			this.branchKey = branchKey;
 			this.branchItems = branch;
 			this.branchCache = branch.map(() => new VisitMsgCache());
 		}
-		// Live run (the background agent's stream for this session).
-		const msgs = getAgent(st.id)?.liveRun?.msgs ?? [];
+		// Live run cache: rebuild when the run's message list changes.
 		const liveKey = msgs.length ? `${msgs.length}:${msgs[msgs.length - 1]?.rev ?? 0}` : "0";
 		if (liveKey !== this.liveKey) {
 			this.liveKey = liveKey;
