@@ -26,12 +26,18 @@ const MD_OPEN = [`${OPEN} *rendered markdown*`, ""];
 const MD_CLOSE = ["", CLOSE];
 
 /**
- * Pi hard-wraps long lines (each visual row is emitted with \r\n), so mouse
- * selection of a wrapped code line pastes as two lines. Nothing in the
- * renderer can avoid that, so steer the model toward copy-safe snippets.
+ * Copy-safe code block guidelines injected into the system prompt.
+ *
+ * pi-tui hard-wraps long lines into physical terminal rows, so mouse
+ * selection of a wrapped line pastes as several lines. For commands and
+ * code, keep lines under 80 columns. For prose meant to be pasted
+ * elsewhere (```text drafts like Slack messages), wrapping is actively
+ * harmful — the breaks end up in the paste — so keep one sentence or
+ * bullet per line and copy via /cc (snippet-copy) instead of selection.
  */
 const COPY_GUIDELINES = [
-	"Code blocks must be copy-paste safe from a narrow terminal: keep every line under 80 characters. Break long shell commands with trailing ` \\` continuations (or one flag per line); break long code expressions across lines.",
+	"In shell and code blocks, keep every line under 80 characters. Break long shell commands with trailing ` \\` continuations (or one flag per line); break long code expressions across lines.",
+	"In prose code blocks (```text, e.g. Slack drafts or emails), do NOT hard-wrap at 80 columns — write each sentence, bullet, or paragraph as one long line. Those breaks would end up in the pasted message; the user copies prose blocks with /cc, so long lines are safe.",
 	"In shell code blocks, put comments on their own line above the command — never trailing `# ...` after a command on the same line. Don't include prompts like `$ ` or output in runnable blocks.",
 	"Don't indent top-level lines of a code block (no leading spaces unless the language syntax requires them).",
 ];

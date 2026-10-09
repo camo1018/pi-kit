@@ -50,7 +50,16 @@ import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, SessionInfo, Theme } from "@earendil-works/pi-coding-agent";
-import { getAgentDir, getMarkdownTheme, getSelectListTheme, SessionManager } from "@earendil-works/pi-coding-agent";
+import {
+	AssistantMessageComponent,
+	getAgentDir,
+	getMarkdownTheme,
+	getSelectListTheme,
+	parseSkillBlock,
+	SessionManager,
+	ToolExecutionComponent,
+	UserMessageComponent,
+} from "@earendil-works/pi-coding-agent";
 import {
 	decodeKittyPrintable,
 	Editor,
@@ -66,6 +75,8 @@ import {
 	type TUI,
 	truncateToWidth,
 	visibleWidth,
+	Container,
+	Spacer,
 } from "@earendil-works/pi-tui";
 import {
 	AgentViewComponent,
@@ -1971,11 +1982,17 @@ function showReplyWidget(ctx: ExtensionContext) {
 		return new Text(text + cancel, 1, 0);
 	});
 }
-/** True when pi's main editor has focus (no dialog, selector, or overlay open) and isn't showing autocomplete. */
+/** The focused component if it's pi's main editor (no dialog, picker, or overlay up). */
+function focusedEditor(): any {
+	const f = ((globalThis as any).__piInboxTui as any)?.getFocusedComponent?.() as any;
+	if (!f || typeof f.getText !== "function" || typeof f.insertTextAtCursor !== "function") return undefined;
+	if (typeof f.isShowingAutocomplete === "function" && f.isShowingAutocomplete()) return undefined;
+	return f;
+}
+
+/** True when pi's main editor has focus (no dialog, selector, or overlay open). */
 function editorFocused(): boolean {
-	const f = ((globalThis as any).__piInboxTui as TUI | undefined)?.getFocusedComponent?.() as any;
-	if (!f || typeof f.getText !== "function" || typeof f.insertTextAtCursor !== "function") return false;
-	return !(typeof f.isShowingAutocomplete === "function" && f.isShowingAutocomplete());
+	return !!focusedEditor();
 }
 
 // ───────────────────────────── orchestrator mode ─────────────────────────────
@@ -2112,49 +2129,202 @@ function showModeWidget(ctx: ExtensionContext) {
 	ctx.ui.setWidget("inbox-mode", [text.join(sep)]);
 }
 
-/** Live panel for an attached session while its background run is going (the chat view reloads when it ends). */
-function showLivePanel(ctx: ExtensionContext) {
+// ───────────────────── live streaming (attached runs) ─────────────────────
+//
+// While a background run is going on the attached session, its transcript streams INTO the
+// chat container itself — appended after the snapshot pi loaded from disk, inside the scrollable
+// document (fullscreen ScrollView / terminal scrollback in regular mode), NOT in the widget dock
+// (which sits fixed at the bottom of the screen and would eat the transcript as it grew).
+// The stream renders with pi's own message components (UserMessageComponent,
+// AssistantMessageComponent, ToolExecutionComponent), so a running agent looks exactly like a
+// foreground one: content grows downward, and scrolling is pi's own. When the run ends,
+// refreshCurrent() reloads the real transcript from the session file and the stream is removed —
+// same content, no duplicates.
+
+/** A cached message rendering: rebuilt only when its message's rev changes (a rev is bumped on
+ * every delta), so each streamed token rebuilds exactly one assistant component — the rest render
+ * from their own caches. Tool rows live inside the same cached entry: a ToolExecutionComponent
+ * per call, updated in place for partial results. */
+class LiveMsgCache {
+	entry?: { rev: number; parts: any[] };
+
+	get(m: any, md: any, th: Theme, tui: TUI): any[] {
+		if (this.entry && this.entry.rev === m.rev) {
+			// Streaming continues on the same message: update it in place (cheap re-render of one
+			// component). Finished messages keep rendering from their cache untouched.
+			const first = this.entry.parts[0];
+			if (first?.updateContent && m.role === "assistant") first.updateContent(m.message, true);
+			return this.entry.parts;
+		}
+		const parts: any[] = [];
+		if (m.role === "user") {
+			const sb = parseSkillBlock(m.text ?? "");
+			parts.push(sb ? new SkillLine(th, sb.name ?? "skill", sb.userMessage) : new UserMessageComponent(m.text ?? "", md, 0));
+		} else {
+			parts.push(new AssistantMessageComponent(m.message, true, md, "Thinking…", 0));
+			for (const t of m.tools ?? []) {
+				const tc = new ToolExecutionComponent(t.name, t.id, t.args, { showImages: false }, undefined, tui, "");
+				if (t.result) tc.updateResult(t.result);
+				parts.push(tc);
+			}
+		}
+		this.entry = { rev: m.rev, parts };
+		return parts;
+	}
+}
+
+/** The live stream (exported for tests). One container per message, appended to the chat
+ * container after the loaded snapshot. Self-syncing — render() diffs the agent's liveRun by
+ * message rev and only rebuilds the message that moved (its tools update in place). No scroll
+ * logic here: the stream lives in the scrollable document, so pi's own ScrollView (fullscreen)
+ * or the terminal scrollback (regular mode) does all of it, exactly like the transcript. */
+export class LiveStreamComponent {
+	private children: any[] = [];
+	private cache: LiveMsgCache[] = [];
+	private syncedKey = "";
+
+	constructor(
+		private tui: TUI,
+		private theme: Theme,
+		private target: () => string,
+	) {}
+
+	agentId(): string {
+		return this.target();
+	}
+
+	/** Rebuild the child list when anything changed. Unchanged messages reuse their components. */
+	private sync(): boolean {
+		const a = getAgent(this.target());
+		const msgs = a?.liveRun?.msgs ?? [];
+		const lastRev = msgs.length ? `${msgs.length}:${msgs[msgs.length - 1].rev}` : "0";
+		const queued = a?.pending ?? [];
+		const key = `${lastRev}:${queued.length}`;
+		if (key === this.syncedKey) return false;
+		this.syncedKey = key;
+
+		while (this.cache.length < msgs.length) this.cache.push(new LiveMsgCache());
+		this.cache.length = msgs.length;
+		const md = getMarkdownTheme();
+		const th = this.theme;
+		const next: any[] = [];
+		for (let i = 0; i < msgs.length; i++) {
+			if (i > 0 && msgs[i].role === "user") next.push(new Spacer(1));
+			next.push(...this.cache[i].get(msgs[i], md, th, this.tui));
+		}
+		for (const p of queued) next.push(new QueuedLine(th, p));
+		this.children = next;
+		return true;
+	}
+
+	render(width: number): string[] {
+		this.sync();
+		const out: string[] = [];
+		for (const c of this.children) out.push(...c.render(width));
+		return out;
+	}
+
+	invalidate(): void {
+		this.syncedKey = ""; // force re-sync; parts re-render via their own components
+	}
+	dispose(): void {}
+}
+
+/** One-line skill invocation hint (collapsible rendering isn't needed mid-run). */
+class SkillLine {
+	constructor(
+		private theme: Theme,
+		private skill: string,
+		private rest?: string,
+	) {}
+	invalidate(): void {}
+	render(_width: number): string[] {
+		const th = this.theme;
+		const rest = (this.rest ?? "").replace(/\s+/g, " ").slice(0, 100);
+		return [th.fg("accent", `⚡ ${this.skill}${rest ? ` · ${rest}` : ""}`)];
+	}
+}
+
+/** Queued-message line, like pi's own "Follow-up:" rows. */
+class QueuedLine {
+	constructor(
+		private theme: Theme,
+		private text: string,
+	) {}
+	invalidate(): void {}
+	render(_width: number): string[] {
+		const t = this.text.replace(/\s+/g, " ").slice(0, 160);
+		return [this.theme.fg("warning", `⏳ queued: ${t}`)];
+	}
+}
+
+/**
+ * The chat container the stream appends to: the transcript document pi scrolls. Children of the
+ * TUI are the mount roots; in both modes the document container is first and its chat container
+ * is its last child (interactive-mode mounts documentContainer with header + resources + chat).
+ */
+function chatContainer(tui: TUI): any | undefined {
+	const doc = tui?.children?.[0] as any;
+	const chat = doc?.children?.[doc.children.length - 1];
+	return Array.isArray(chat?.children) ? chat : undefined;
+}
+
+/** Live stream for an attached session while its background run is going (the chat view reloads when it ends). */
+function showLiveStream(ctx: ExtensionContext) {
 	if (!ctx.hasUI) return;
 	const pendingId = orchestrating() && isHome(ctx) ? modeState().openWhenReady : undefined;
 	const a = isAttached(ctx) ? getAgent(ctx.sessionManager.getSessionId()) : pendingId ? getAgent(pendingId) : undefined;
-	if (!a || !isRunning(a)) return ctx.ui.setWidget("inbox-live", undefined);
-	const th = ctx.ui.theme;
-	const w = Math.max(20, (process.stdout.columns || 100) - 2);
-	const cut = (s: string) => truncateToWidth(s, w);
-	const wrap = (s: string, indent = "  ") =>
-		s
-			.split("\n")
-			.flatMap((l) => (l.trim() ? wrapTextWithAnsi(l, Math.max(10, w - indent.length)) : [""]))
-			.map((l) => indent + l);
-	const status = a.proc
-		? "⟳ working in the background"
-		: a.hold
-			? "↻ loading the last turn…"
-			: "⏸ queued (waiting for a free agent slot)";
-	const head = th.fg("accent", status) + th.fg("dim", a.proc && a.activity ? ` · ${a.activity}` : "");
-
-	// Streaming transcript of the current run: prompt, tool calls, finished replies, then the reply in progress.
-	const body: string[] = [];
-	if (a.proc) {
-		for (const it of a.items ?? []) {
-			if (it.kind === "prompt") body.push(...wrap(it.text, "› ").map((l) => th.fg("accent", l)));
-			else if (it.kind === "tool") body.push(th.fg("dim", `  ▸ ${it.text}`));
-			else if (it.kind === "error") body.push(th.fg("error", `  ✗ ${it.text}`));
-			else body.push(...wrap(it.text));
-		}
-		if (a.liveText.trim()) body.push(...wrap(`${a.liveText.trimEnd()} ▌`));
+	const G = globalThis as any;
+	const tui = (G.__piInboxTui as TUI) ?? ((ctx.ui as any).tui as TUI);
+	const chat = tui ? chatContainer(tui) : undefined;
+	if (!a || !isRunning(a) || !chat) return unmountLiveStream(ctx, G);
+	// The stream is one child of the chat container, appended after the snapshot. One stable
+	// instance per agent: its per-message cache survives re-mounts, which happen whenever pi
+	// rebuilds the chat (session switch, compaction) — detect a lost mount and re-append.
+	let stream = G[LIVE_STREAM_KEY] as LiveStreamComponent | undefined;
+	if (!stream || stream.agentId() !== a.id) {
+		stream = new LiveStreamComponent(tui, ctx.ui.theme, () => a.id);
+		G[LIVE_STREAM_KEY] = stream;
 	}
-	const rows = process.stdout.rows || 40;
-	const maxBody = Math.max(6, Math.floor(rows * 0.45));
-	const hidden = Math.max(0, body.length - maxBody);
-	const lines = [cut(head)];
-	if (hidden) lines.push(cut(th.fg("dim", `  … ${hidden} earlier line(s)`)));
-	for (const l of body.slice(hidden)) lines.push(cut(l));
-	// Queued messages, like pi's own "Follow-up:" lines; they disappear once a run picks them up.
-	for (const p of a.pending) lines.push(cut(th.fg("warning", `⏳ queued: ${p.replace(/\s+/g, " ")}`)));
-	lines.push(cut(th.fg("dim", "  (full transcript loads above when this run ends)")));
-	ctx.ui.setWidget("inbox-live", lines);
+	if (stream !== chat.children[chat.children.length - 1]) {
+		// Drop a previous run's stream (a different agent's) before appending this one.
+		const i = chat.children.indexOf(stream);
+		if (i !== -1) chat.children.splice(i, 1);
+		chat.addChild(stream);
+	}
+	// The dock keeps only small status lines — never the growing stream (it's fixed at the
+	// bottom; the transcript area holds the stream). pi caps string widgets at 10 lines; this is 1–3.
+	const th = ctx.ui.theme;
+	const status: string[] = [
+		th.fg("accent", a.proc ? "⟳ working in the background" : a.hold ? "↻ loading the last turn…" : "⏸ queued (waiting for a free agent slot)") +
+			th.fg("dim", a.proc && a.activity ? ` · ${a.activity}` : ""),
+	];
+	for (const p of a.pending) status.push(th.fg("warning", `⏳ queued: ${p.replace(/\s+/g, " ").slice(0, 120)}`));
+	ctx.ui.setWidget("inbox-live", status);
+	// Re-render on agent updates; render()'s sync() detects what changed via its key and rebuilds
+	// only the message whose rev moved (the per-message cache makes deltas cheap).
+	if (!G[LIVE_STREAM_LISTENER]) {
+		G[LIVE_STREAM_LISTENER] = onAgentEvent(() => {
+			((globalThis as any).__piInboxTui as TUI | undefined)?.requestRender?.();
+		});
+	}
 }
+
+function unmountLiveStream(ctx: ExtensionContext, G: any) {
+	const stream = G[LIVE_STREAM_KEY] as LiveStreamComponent | undefined;
+	const tui = (G.__piInboxTui as TUI) ?? ((ctx.ui as any).tui as TUI);
+	if (stream && tui) {
+		const chat = chatContainer(tui);
+		const i = chat ? chat.children.indexOf(stream) : -1;
+		if (i !== -1) chat.children.splice(i, 1);
+	}
+	G[LIVE_STREAM_KEY] = undefined;
+	G[LIVE_STREAM_LISTENER]?.();
+	G[LIVE_STREAM_LISTENER] = undefined;
+	ctx.ui.setWidget("inbox-live", undefined);
+}
+const LIVE_STREAM_KEY = Symbol.for("pi.inbox.liveStream");
+const LIVE_STREAM_LISTENER = Symbol.for("pi.inbox.liveStreamListener");
 
 /** Why a reply can't be sent to this session in the background (undefined = OK). */
 function sendBlockedReason(id: string, file: string | undefined, ctx: ExtensionContext): string | undefined {
@@ -2212,7 +2382,7 @@ export default function (pi: ExtensionAPI) {
 				apply: (name: string) => {
 					if (!name) return undefined;
 					renameAgent(pending.id, name);
-					showLivePanel(ctx);
+					showLiveStream(ctx);
 					return `New agent renamed: ${name}`;
 				},
 			};
@@ -2337,7 +2507,7 @@ export default function (pi: ExtensionAPI) {
 		if (attachedBusy(ctx)) ms.wasRunning.add(id);
 		else ms.wasRunning.delete(id);
 		ms.stale.delete(id); // just loaded from disk
-		showLivePanel(ctx);
+		showLiveStream(ctx);
 	});
 	/** Orchestrator: reload the attached session's transcript (or finish a pending takeover). */
 	function scheduleRefresh(id: string) {
@@ -2389,10 +2559,10 @@ export default function (pi: ExtensionAPI) {
 						if (!manuallyUnread(cur)) markRead(cur);
 						scheduleRefresh(cur);
 					}
-					showLivePanel(ctx);
+					showLiveStream(ctx);
 					showModeWidget(ctx);
 				} else if (ms.openWhenReady && isHome(ctx)) {
-					showLivePanel(ctx); // new agent started from home, not on disk yet
+					showLiveStream(ctx); // new agent started from home, not on disk yet
 				}
 				if (ev.type === "finished" && ev.agent.id === cur && isAttached(ctx)) {
 					playSound(ev.agent.state === "error"); // the reload is the notification; still ping
@@ -2575,7 +2745,7 @@ export default function (pi: ExtensionAPI) {
 	function watchStarted(id: string, ctx: ExtensionContext) {
 		const ms = modeState();
 		ms.openWhenReady = id;
-		showLivePanel(ctx);
+		showLiveStream(ctx);
 		const until = Date.now() + 10 * 60_000;
 		const timer = setInterval(() => {
 			if (ms.openWhenReady !== id) return clearInterval(timer);
@@ -2593,7 +2763,7 @@ export default function (pi: ExtensionAPI) {
 				clearInterval(timer);
 				ms.openWhenReady = undefined;
 				const c = G.__piInboxAgentsCtx as ExtensionContext | undefined;
-				if (c?.hasUI) showLivePanel(c);
+				if (c?.hasUI) showLiveStream(c);
 				if (orchestrating() && !ms.inLoop) reopenInbox((s, o) => p.sendUserMessage(s, o));
 			}
 		}, 750);
@@ -2604,7 +2774,7 @@ export default function (pi: ExtensionAPI) {
 		const ms = modeState();
 		if (ms.openWhenReady !== id) return;
 		ms.openWhenReady = undefined;
-		showLivePanel(ctx);
+		showLiveStream(ctx);
 		if (!orchestrating() || !isHome(ctx)) return;
 		const file = getAgent(id)?.sessionFile ?? findSessionFile(id);
 		if (!file) return;
@@ -2724,7 +2894,7 @@ export default function (pi: ExtensionAPI) {
 		if (ms.inLoop) return;
 		ms.inLoop = true;
 		ms.openWhenReady = undefined; // you came back to the list: don't yank you into a just-started agent
-		showLivePanel(ctx);
+		showLiveStream(ctx);
 		try {
 			await inboxLoop(ctx);
 		} finally {
@@ -3249,7 +3419,7 @@ export default function (pi: ExtensionAPI) {
 		if (!t && text && pending) {
 			if (event.images?.length) ctx.ui.notify("Images can't be sent to background agents yet: sent the text only.", "warning");
 			sendToAgent({ id: pending.id, cwd: pending.cwd, title: pending.title, text });
-			showLivePanel(ctx);
+			showLiveStream(ctx);
 			return { action: "handled" };
 		}
 		if (!t && orchestrating() && isHome(ctx)) t = { kind: "new", cwd: ctx.cwd, model: currentModel(ctx) };
@@ -3268,7 +3438,7 @@ export default function (pi: ExtensionAPI) {
 			// No notify() here: in pi that's a permanent chat line, so "Queued" outlived the delivery.
 			// The live panel lists queued messages instead and drops them once a run picks them up.
 			void wasRunning;
-			showLivePanel(ctx);
+			showLiveStream(ctx);
 			showModeWidget(ctx);
 			return { action: "handled" };
 		}
@@ -3356,7 +3526,7 @@ export default function (pi: ExtensionAPI) {
 		// grabs later prompts typed at home nor auto-opens over what you're looking at.
 		if (orchestrating() && !isHome(ctx) && modeState().openWhenReady) {
 			modeState().openWhenReady = undefined;
-			showLivePanel(ctx);
+			showLiveStream(ctx);
 		}
 		G.__piInboxEscUnsub?.();
 		G.__piInboxEscUnsub = ctx.ui.onTerminalInput((data) => {
