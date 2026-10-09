@@ -45,7 +45,7 @@ export interface BgAgent {
 	nextModel?: string;
 	sessionFile?: string;
 	state: AgentState;
-	/** Messages waiting to be delivered (joined into the next run). */
+	/** Messages waiting to be delivered, one per subsequent run. */
 	pending: string[];
 	/** Set while a run is in flight (our own child, or an adopted orphan). */
 	proc?: AgentProc;
@@ -75,6 +75,8 @@ export interface BgAgent {
 	liveRun?: LiveRun;
 	/** Don't start the next queued run yet (the UI is reloading the transcript between runs). */
 	hold?: boolean;
+	/** This run is stopping so a selected queued message can run next. */
+	restartAfterInterrupt?: boolean;
 }
 
 /** Handle to a running agent. kill() always also drops a stop file (works across sandboxes). */
@@ -399,6 +401,7 @@ interface SavedAgent {
 	error?: string;
 	lastText?: string;
 	needsYou: boolean;
+	restartAfterInterrupt?: boolean;
 	owner: number;
 	ownerBeat: number;
 }
@@ -456,6 +459,7 @@ function persist(a: BgAgent) {
 		error: a.error,
 		lastText: a.lastText,
 		needsYou: a.needsYou,
+		restartAfterInterrupt: a.restartAfterInterrupt,
 		owner: process.pid,
 		ownerBeat: Date.now(),
 	};
@@ -700,6 +704,7 @@ function adopt(s: SavedAgent) {
 		log: [],
 		liveText: "",
 		items: [],
+		restartAfterInterrupt: s.restartAfterInterrupt,
 	};
 	registry().agents.set(a.id, a);
 	const inFlight = s.pid && (s.state === "working" || s.state === "cancelled");
@@ -726,7 +731,7 @@ function adopt(s: SavedAgent) {
 }
 
 function run(a: BgAgent) {
-	const message = a.pending.splice(0).join("\n\n");
+	const message = a.pending.shift()!;
 	a.log = [];
 	a.liveText = "";
 	a.items = [{ kind: "prompt", text: message }];
@@ -877,7 +882,21 @@ function finishRun(a: BgAgent, code: number, signal?: string) {
 	a.runStartedAt = undefined;
 	if (!a.sessionFile) a.sessionFile = findSessionFile(a.id);
 	flushPendingName(a);
-	if (a.state === "cancelled") {
+	if (a.restartAfterInterrupt) {
+		a.restartAfterInterrupt = undefined;
+		a.error = undefined;
+		a.activity = undefined;
+		if (a.pending.length) {
+			a.state = "queued";
+			persist(a);
+			// Let the UI reload the interrupted run before the selected message.
+			emit({ type: "run_end", agent: a });
+		} else {
+			a.state = "idle";
+			a.needsYou = true;
+			persist(a);
+		}
+	} else if (a.state === "cancelled") {
 		a.activity = "cancelled";
 		persist(a);
 	} else if (code !== 0 || a.error) {
@@ -967,8 +986,11 @@ function handleEvent(a: BgAgent, ev: any, deltaGate: () => boolean) {
 			if (ev.message?.role === "assistant") liveStartAssistant(a, ev);
 			else if (ev.message?.role === "user") {
 				const t = textOf(ev.message.content).trim();
-				// The run's own prompt is recorded in run(); skip its duplicate message_start.
-				if (t && t !== a.runPrompt) liveUser(a, t);
+				// The run's own prompt is already in the live run (run() seeds it), and pi may have
+				// expanded $skill/prompt templates in the child — normalize (strips skill blocks,
+				// collapses whitespace) so the echo never duplicates it. Steering prompts always differ.
+				const seeded = cleanUserText(a.runPrompt ?? "");
+				if (t && cleanUserText(t) !== seeded) liveUser(a, cleanUserText(t));
 			}
 			break;
 		case "message_update": {
@@ -1092,6 +1114,7 @@ export function cancelAgent(id: string) {
 	const a = getAgent(id);
 	if (!a) return;
 	a.pending = [];
+	a.restartAfterInterrupt = undefined;
 	a.state = "cancelled";
 	const p = a.proc;
 	if (p) {
@@ -1102,6 +1125,78 @@ export function cancelAgent(id: string) {
 	}
 	persist(a);
 	touch(a);
+}
+
+function findQueuedIndex(
+	a: BgAgent,
+	index: number,
+	expected?: string,
+): number {
+	if (index >= 0 && index < a.pending.length) {
+		if (expected === undefined || a.pending[index] === expected) return index;
+	}
+	return expected === undefined ? -1 : a.pending.indexOf(expected);
+}
+
+/** Remove one queued message without affecting the run in flight. */
+export function removeQueuedMessage(
+	id: string,
+	index: number,
+	expected?: string,
+): string | undefined {
+	const a = getAgent(id);
+	if (!a) return undefined;
+	const found = findQueuedIndex(a, index, expected);
+	if (found < 0) return undefined;
+	const [removed] = a.pending.splice(found, 1);
+	if (!a.proc && a.pending.length === 0) {
+		a.hold = false;
+		a.state = "idle";
+		a.activity = undefined;
+	}
+	persist(a);
+	touch(a);
+	pump();
+	return removed;
+}
+
+/**
+ * Move one queued message to the front. If a run is in flight, stop it at
+ * the next safe process boundary, then run the selected message and resume
+ * from the completed session history.
+ */
+export function sendQueuedMessageNow(
+	id: string,
+	index: number,
+	expected?: string,
+): { message: string; interrupted: boolean } | undefined {
+	const a = getAgent(id);
+	if (!a) return undefined;
+	const found = findQueuedIndex(a, index, expected);
+	if (found < 0) return undefined;
+	const [message] = a.pending.splice(found, 1);
+	a.pending.unshift(message!);
+	a.needsYou = false;
+	const p = a.proc;
+	if (!p) {
+		a.state = "queued";
+		persist(a);
+		touch(a);
+		pump();
+		return { message: message!, interrupted: false };
+	}
+	const firstInterrupt = !a.restartAfterInterrupt;
+	a.restartAfterInterrupt = true;
+	a.activity = "interrupting…";
+	persist(a);
+	touch(a);
+	if (firstInterrupt) {
+		p.kill("SIGTERM");
+		setTimeout(() => {
+			if (a.proc === p) p.kill("SIGKILL");
+		}, 3000).unref?.();
+	}
+	return { message: message!, interrupted: true };
 }
 
 /**
@@ -1212,8 +1307,13 @@ export function recordActualThinkingLevel(sessionManager: any, actual: string | 
 // ───────────────────────────── transcript ─────────────────────────────
 
 /** `<skill name="x" ...>...</skill> rest` → `⚡x rest`. */
+/** Display text for a user prompt: skill blocks (expanded by pi) and `$skill` tokens both
+ *  collapse to `⚡name`, so a prompt and its child-side echo canonicalize the same way. */
 function cleanUserText(s: string): string {
-	return s.replace(/<skill\s+name="([^"]+)"[\s\S]*?<\/skill>\s*/g, (_m, n) => `⚡${n} `).trim();
+	return s
+		.replace(/<skill\s+name="([^"]+)"[\s\S]*?<\/skill>\s*/g, (_m, n) => `⚡${n} `)
+		.replace(/(^|\s)\$([\w-]+)/g, (_m, pre, n) => `${pre}⚡${n}`)
+		.trim();
 }
 
 /** Render a session's active branch as markdown for the agent view. */
