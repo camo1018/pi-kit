@@ -2318,6 +2318,11 @@ function isAttached(ctx: ExtensionContext): boolean {
 	return orchestrating() && !isHome(ctx) && !modeState().takenOver.has(ctx.sessionManager.getSessionId());
 }
 
+/** The window's real foreground session is the sticky taken-over main. */
+function isStickyMain(ctx: ExtensionContext): boolean {
+	return orchestrating() && modeState().takenOver.has(ctx.sessionManager.getSessionId());
+}
+
 /** Attached and its background run is still going (the on-screen transcript is a snapshot). */
 function attachedBusy(ctx: ExtensionContext): boolean {
 	return isAttached(ctx) && isRunning(getAgent(ctx.sessionManager.getSessionId()));
@@ -3128,9 +3133,10 @@ export default function (pi: ExtensionAPI) {
 		explicitTitle?: string,
 	): Promise<QueueManagerResult | undefined> {
 		if (ctx.mode !== "tui" || !ctx.hasUI) return undefined;
-		const homeId = orchestrating() && isHome(ctx)
-			? modeState().openWhenReady
-			: undefined;
+		const homeId =
+			orchestrating() && (isHome(ctx) || isStickyMain(ctx))
+				? modeState().openWhenReady
+				: undefined;
 		const id =
 			explicitId ??
 			(isVisiting()
@@ -3340,6 +3346,40 @@ export default function (pi: ExtensionAPI) {
 			const p = (G.__piInboxPi ?? pi) as ExtensionAPI;
 			if (file && sessionReadyToOpen(file)) {
 				clearInterval(timer);
+				const c =
+					(G.__piInboxAgentsCtx as ExtensionContext | undefined) ?? ctx;
+				// A taken-over main remains the real foreground session. The new agent is
+				// already a background process; mount it as a visit directly instead of
+				// sending /orchestrator open (which historically switched sessions).
+				if (isStickyMain(c)) {
+					ms.openWhenReady = undefined;
+					const tui = activeInboxTui(c);
+					const live = getAgent(id);
+					if (
+						tui &&
+						live &&
+						openVisit(tui, c, {
+							mainId: c.sessionManager.getSessionId(),
+							id,
+							file,
+							cwd: live.cwd,
+							title: live.title,
+							modelRegistry: (c as any).modelRegistry,
+							recordedModel: sessionModel(file),
+						})
+					) {
+						uiState.selectedId = id;
+						markRead(id);
+						showModeWidget(c);
+						showLiveStream(c);
+					} else if (c.hasUI) {
+						c.ui.notify(
+							"The new agent is running in the background, but its visit view couldn't open. The taken-over main was left untouched.",
+							"error",
+						);
+					}
+					return;
+				}
 				void Promise.resolve(
 					p.sendUserMessage(`/orchestrator open ${id}`, {
 						expandPromptTemplates: true,
@@ -3364,10 +3404,35 @@ export default function (pi: ExtensionAPI) {
 		if (ms.openWhenReady !== id) return;
 		ms.openWhenReady = undefined;
 		showLiveStream(ctx);
-		if (!orchestrating() || !isHome(ctx)) return;
-		const file = getAgent(id)?.sessionFile ?? findSessionFile(id);
+		if (!orchestrating()) return;
+		const a = getAgent(id);
+		const file = a?.sessionFile ?? findSessionFile(id);
 		if (!file) return;
 		uiState.selectedId = id;
+		// Safety fallback for a delayed /orchestrator open command: a sticky main
+		// visits the new background agent and never switches/prepareLeaves.
+		if (isStickyMain(ctx)) {
+			const tui = activeInboxTui(ctx);
+			if (
+				tui &&
+				a &&
+				openVisit(tui, ctx, {
+					mainId: ctx.sessionManager.getSessionId(),
+					id,
+					file,
+					cwd: a.cwd,
+					title: a.title,
+					modelRegistry: (ctx as any).modelRegistry,
+					recordedModel: sessionModel(file),
+				})
+			) {
+				markRead(id);
+				showModeWidget(ctx);
+				showLiveStream(ctx);
+			}
+			return;
+		}
+		if (!isHome(ctx)) return;
 		const draft = ctx.ui.getEditorText();
 		await ctx.switchSession(file, {
 			withSession: async (c) => {
@@ -3595,8 +3660,18 @@ export default function (pi: ExtensionAPI) {
 					if (!picked) continue;
 					model = picked;
 				}
-				// The prompt is typed in pi's own editor (same keys, $skill autocomplete, @files…).
-				// Orchestrator: from home, so the new agent then opens attached in pi's chat view.
+				// Sticky main: composing/starting a new background agent is NOT a handback.
+				// Keep the foreground AgentSession untouched, type in its editor under a one-shot
+				// new-agent target, then visit the new session when its file appears.
+				if (isStickyMain(ctx)) {
+					if (isVisiting()) {
+						const tui = activeInboxTui(ctx);
+						if (tui) closeVisit(tui);
+					}
+					setReplyTarget({ kind: "new", cwd: ctx.cwd, model }, ctx);
+					return;
+				}
+				// No sticky main: retain the existing blank-home compose flow.
 				setReplyTarget({ kind: "new", cwd: ctx.cwd, model }, ctx);
 				if (orchestrating() && !isHome(ctx) && !(await goHome(ctx, { reopen: false }))) {
 					setReplyTarget(undefined, ctx);
@@ -4164,9 +4239,16 @@ export default function (pi: ExtensionAPI) {
 	pi.on("input", async (event: any, ctx) => {
 		let t = getReplyTarget();
 		if (event.source !== "interactive") return { action: "continue" };
-		// Orchestrator: what's on screen is what gets your prompt. A session open (attached or taken
-		// over) never sends elsewhere; home only ever starts a new agent. Stale targets are dropped.
-		if (t && orchestrating() && (!isHome(ctx) || t.kind !== "new")) {
+		// A one-shot new-agent target is valid at blank home OR over the sticky main.
+		// Every other stale target is dropped when a real session is on screen.
+		const composingNewOverMain =
+			t?.kind === "new" && isStickyMain(ctx);
+		if (
+			t &&
+			orchestrating() &&
+			!composingNewOverMain &&
+			(!isHome(ctx) || t.kind !== "new")
+		) {
 			setReplyTarget(undefined, ctx);
 			t = undefined;
 		}
@@ -4183,8 +4265,12 @@ export default function (pi: ExtensionAPI) {
 			showModeWidget(ctx); // queued count / running state may have changed
 			return { action: "handled" };
 		}
-		// Orchestrator home, waiting for a just-started agent to open: more messages queue for it.
-		const pendingId = orchestrating() && isHome(ctx) ? modeState().openWhenReady : undefined;
+		// Waiting for a just-started agent to open: more messages queue for it. A sticky main
+		// stays foreground throughout, so it has the same pending-agent routing as blank home.
+		const pendingId =
+			orchestrating() && (isHome(ctx) || isStickyMain(ctx))
+				? modeState().openWhenReady
+				: undefined;
 		const pending = pendingId ? getAgent(pendingId) : undefined;
 		if (!t && text && pending) {
 			if (event.images?.length) ctx.ui.notify("Images can't be sent to background agents yet: sent the text only.", "warning");
@@ -4253,10 +4339,15 @@ export default function (pi: ExtensionAPI) {
 				"info",
 			);
 		}
-		// Orchestrator: stay in pi's chat view; a new agent opens attached as soon as its session is on disk.
-		if (orchestrating() && isHome(ctx)) {
+		// Stay in pi's chat view. At blank home, or over a sticky main, the new agent
+		// opens as soon as its session file is ready. Sticky mode opens a visit; it
+		// never switches or interrupts the main.
+		if (
+			orchestrating() &&
+			(isHome(ctx) || isStickyMain(ctx))
+		) {
 			if (t.kind === "new") watchStarted(uiState.selectedId!, ctx);
-			else reopenInbox((s, o) => pi.sendUserMessage(s, o));
+			else if (isHome(ctx)) reopenInbox((s, o) => pi.sendUserMessage(s, o));
 		}
 		return { action: "handled" };
 	});
@@ -4288,18 +4379,31 @@ export default function (pi: ExtensionAPI) {
 	// and this session is idle, so esc still closes dialogs/autocomplete and interrupts a run.
 	pi.on("session_start", async (_e, ctx) => {
 		if (!ctx.hasUI) return;
-		// Orchestrator: a reply target never survives into an open session (see the input hook).
+		// A new-agent compose/wait target is valid at blank home OR over the sticky main.
+		// Other targets do not survive a real session start/switch.
 		const rt = getReplyTarget();
-		if (rt && orchestrating() && (!isHome(ctx) || rt.kind !== "new")) setReplyTarget(undefined, ctx);
-		// A new-agent pre-name / pre-dir never follows you into another session.
-		if (!isHome(ctx) && (getNextAgentName() || getNextAgentDir())) {
+		const sticky = isStickyMain(ctx);
+		if (
+			rt &&
+			orchestrating() &&
+			!(rt.kind === "new" && (isHome(ctx) || sticky))
+		) {
+			setReplyTarget(undefined, ctx);
+		}
+		// A new-agent pre-name / pre-dir never follows a real switch, but /reload on
+		// the sticky main must not cancel an in-progress compose.
+		if (!isHome(ctx) && !sticky && (getNextAgentName() || getNextAgentDir())) {
 			setNextAgentName(undefined);
 			setNextAgentDir(undefined);
 			showReplyWidget(ctx);
 		}
-		// Started a new agent, then switched to another session: stop waiting for it, so it neither
-		// grabs later prompts typed at home nor auto-opens over what you're looking at.
-		if (orchestrating() && !isHome(ctx) && modeState().openWhenReady) {
+		// A real switch away cancels auto-open. Remaining on the sticky main does not.
+		if (
+			orchestrating() &&
+			!isHome(ctx) &&
+			!sticky &&
+			modeState().openWhenReady
+		) {
 			modeState().openWhenReady = undefined;
 			showLiveStream(ctx);
 		}
@@ -4310,9 +4414,10 @@ export default function (pi: ExtensionAPI) {
 			if (getKeybindings().matches(data, "app.message.dequeue")) {
 				const c =
 					(G.__piInboxAgentsCtx as ExtensionContext | undefined) ?? ctx;
-				const homeId = orchestrating() && isHome(c)
-					? modeState().openWhenReady
-					: undefined;
+				const homeId =
+					orchestrating() && (isHome(c) || isStickyMain(c))
+						? modeState().openWhenReady
+						: undefined;
 				const id = isAttached(c)
 					? c.sessionManager.getSessionId()
 					: homeId;
@@ -4337,7 +4442,13 @@ export default function (pi: ExtensionAPI) {
 				const c = (G.__piInboxAgentsCtx as ExtensionContext | undefined) ?? ctx;
 				const t = getReplyTarget();
 				const home = orchestrating() && isHome(c);
-				if (editorFocused() && c.isIdle() && !modeState().inLoop) {
+				const composingNewOverMain =
+					t?.kind === "new" && isStickyMain(c);
+				if (
+					editorFocused() &&
+					(c.isIdle() || composingNewOverMain) &&
+					!modeState().inLoop
+				) {
 					if (t?.kind === "new" || home) {
 						// New agent pending (or about to type one at home): pick its directory.
 						void pickNewAgentDir(c);
@@ -4366,9 +4477,12 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 			}
-			if (!getReplyTarget() || !matchesKey(data, "escape")) return undefined;
+			const target = getReplyTarget();
+			if (!target || !matchesKey(data, "escape")) return undefined;
 			const c = (G.__piInboxAgentsCtx as ExtensionContext | undefined) ?? ctx;
-			if (!editorFocused() || !c.isIdle()) return undefined;
+			const composingNewOverMain =
+				target.kind === "new" && isStickyMain(c);
+			if (!editorFocused() || (!c.isIdle() && !composingNewOverMain)) return undefined;
 			setReplyTarget(undefined, c);
 			// Orchestrator home: cancelling a new agent goes back to the list.
 			if (orchestrating() && isHome(c)) reopenInbox((s, o) => ((G.__piInboxPi ?? pi) as ExtensionAPI).sendUserMessage(s, o));
