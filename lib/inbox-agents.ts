@@ -28,6 +28,9 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import {
+	BACKGROUND_MCP_AUTO_APPROVE_ENV,
+} from "./background-mcp-approval.ts";
 import { getAgentDir, getMarkdownTheme, SessionManager, type Theme } from "@earendil-works/pi-coding-agent";
 import { type KeybindingsManager, Markdown, matchesKey, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
@@ -758,7 +761,12 @@ function run(a: BgAgent) {
 		// and not in pi's process group. Output goes to files, so nothing breaks when we're gone.
 		child = spawn(cmd, args, {
 			cwd: a.cwd,
-			env: { ...process.env, PI_INBOX_BG_PARENT: String(process.pid), PI_INBOX_BG_AGENT: a.id },
+			env: {
+				...process.env,
+				PI_INBOX_BG_PARENT: String(process.pid),
+				PI_INBOX_BG_AGENT: a.id,
+				[BACKGROUND_MCP_AUTO_APPROVE_ENV]: "1",
+			},
 			stdio: ["ignore", outFd, errFd],
 			detached: true,
 		});
