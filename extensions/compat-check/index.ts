@@ -291,8 +291,8 @@ const PROBES: Probe[] = [
 			// lib/visit-runtime.ts interposes the chat container's mutation methods
 			// while a visit is open, mirroring pi-tui Container's plain-array
 			// semantics (push / indexOf-splice / replace-all). Verify those
-			// semantics on a real Container; openVisit additionally falls back to a
-			// real session switch when the chat container can't be found.
+			// semantics on a real Container; openVisit additionally refuses the
+			// navigation when the chat container can't be found, preserving the main.
 			try {
 				const { Container: C } = T;
 				const box = new C();
