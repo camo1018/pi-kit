@@ -78,6 +78,7 @@ For a cloned install, `git pull` is equivalent to `pi update --extension`.
 | `rename-chat/` | `rename-chat` tool so the agent can title sessions |
 | `inline-skills/` | `$skill` inline skill references |
 | `md-fence-render/` | Render ```` ```md ```` blocks as Markdown; `┌─ lang` / `└─` markers instead of ```` ``` ```` fences on code; copy-safe code block prompt rules. ⚠️ [internals](extensions/md-fence-render/README.md) |
+| `snippet-copy/` | `/cc [n|lang]`, `ctrl+shift+y`, or a fullscreen click copies a fenced block exactly (pbcopy / OSC 52). [internals](extensions/snippet-copy/README.md) |
 | `tool-output-hide/` | Collapse noisy tool output. ⚠️ [internals](extensions/tool-output-hide/README.md) |
 | `final-answer-divider/` | Visual divider before the final answer |
 | `compat-check/` | Warns on startup / `/reload` when a Pi upgrade breaks an extension that uses Pi internals (`/compat` for the full report) |
