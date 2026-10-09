@@ -16,7 +16,8 @@
       "extensions/md-fence-render/index.ts",
       "extensions/tool-output-hide/index.ts",
       "extensions/voice/index.ts",
-      "extensions/compat-check/index.ts"
+      "extensions/compat-check/index.ts",
+      "extensions/session-mention/index.ts"
     ]
   },
   "peerDependencies": {
