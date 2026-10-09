@@ -46,6 +46,9 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import {
+	installBackgroundMcpAutoApproval,
+} from "../../lib/background-mcp-approval.ts";
 import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -2786,6 +2789,8 @@ function playSound(failed: boolean) {
 
 export default function (pi: ExtensionAPI) {
 	registerLoadedExtension("inbox");
+	// Register before installAgentChildHooks removes the child marker.
+	installBackgroundMcpAutoApproval(pi);
 	// no-op unless this pi IS a background agent; applies renames requested from a pi window
 	installAgentChildHooks((name) => pi.setSessionName(name));
 
