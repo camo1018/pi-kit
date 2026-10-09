@@ -2198,8 +2198,7 @@ export class LiveStreamComponent {
 		const a = getAgent(this.target());
 		const msgs = a?.liveRun?.msgs ?? [];
 		const lastRev = msgs.length ? `${msgs.length}:${msgs[msgs.length - 1].rev}` : "0";
-		const queued = a?.pending ?? [];
-		const key = `${lastRev}:${queued.length}`;
+		const key = lastRev;
 		if (key === this.syncedKey) return false;
 		this.syncedKey = key;
 
@@ -2212,7 +2211,6 @@ export class LiveStreamComponent {
 			if (i > 0 && msgs[i].role === "user") next.push(new Spacer(1));
 			next.push(...this.cache[i].get(msgs[i], md, th, this.tui));
 		}
-		for (const p of queued) next.push(new QueuedLine(th, p));
 		this.children = next;
 		return true;
 	}
@@ -2242,19 +2240,6 @@ class SkillLine {
 		const th = this.theme;
 		const rest = (this.rest ?? "").replace(/\s+/g, " ").slice(0, 100);
 		return [th.fg("accent", `⚡ ${this.skill}${rest ? ` · ${rest}` : ""}`)];
-	}
-}
-
-/** Queued-message line, like pi's own "Follow-up:" rows. */
-class QueuedLine {
-	constructor(
-		private theme: Theme,
-		private text: string,
-	) {}
-	invalidate(): void {}
-	render(_width: number): string[] {
-		const t = this.text.replace(/\s+/g, " ").slice(0, 160);
-		return [this.theme.fg("warning", `⏳ queued: ${t}`)];
 	}
 }
 
@@ -2292,14 +2277,15 @@ function showLiveStream(ctx: ExtensionContext) {
 		if (i !== -1) chat.children.splice(i, 1);
 		chat.addChild(stream);
 	}
-	// The dock keeps only small status lines — never the growing stream (it's fixed at the
-	// bottom; the transcript area holds the stream). pi caps string widgets at 10 lines; this is 1–3.
+	// The dock carries only what the transcript stream can't: the run's state and your queued
+	// input. No activity echo (the stream shows the work itself), no duplicated content. pi caps
+	// string widgets at 10 lines; this is 1–2.
 	const th = ctx.ui.theme;
 	const status: string[] = [
-		th.fg("accent", a.proc ? "⟳ working in the background" : a.hold ? "↻ loading the last turn…" : "⏸ queued (waiting for a free agent slot)") +
-			th.fg("dim", a.proc && a.activity ? ` · ${a.activity}` : ""),
+		th.fg("accent", a.proc ? "⟳ working in the background" : a.hold ? "↻ loading the last turn…" : "⏸ queued (waiting for a free agent slot)"),
 	];
-	for (const p of a.pending) status.push(th.fg("warning", `⏳ queued: ${p.replace(/\s+/g, " ").slice(0, 120)}`));
+	if (a.pending.length)
+		status.push(th.fg("warning", `⏳ ${a.pending.length} message(s) queued — delivered when this run ends`));
 	ctx.ui.setWidget("inbox-live", status);
 	// Re-render on agent updates; render()'s sync() detects what changed via its key and rebuilds
 	// only the message whose rev moved (the per-message cache makes deltas cheap).
