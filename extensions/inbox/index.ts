@@ -50,6 +50,7 @@ import {
 	installBackgroundMcpAutoApproval,
 } from "../../lib/background-mcp-approval.ts";
 import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
+import { handleVisitModelInput } from "./visit-models.ts";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, SessionInfo, Theme } from "@earendil-works/pi-coding-agent";
@@ -98,6 +99,7 @@ import {
 	installAgentChildHooks,
 	isAgentChild,
 	markSeen,
+	nextSessionModel,
 	recordActualThinkingLevel,
 	setAgentDir,
 	startAgentSupervisor,
@@ -117,6 +119,7 @@ import {
 	visitAgent,
 	visitRunning,
 	visitState,
+	viewedSession,
 } from "../../lib/visit-runtime.ts";
 
 // ───────────────────────────── storage ─────────────────────────────
@@ -644,8 +647,11 @@ interface Row {
 	info: SessionInfo;
 	meta: SessionMeta;
 	tail: TailInfo;
+	/** Live indicator: open in some Pi process or run by a background agent. */
 	live?: LiveRecord;
 	isCurrent: boolean;
+	/** True when this window runs the session interactively (sticky takeover). */
+	takenOver: boolean;
 	title: string;
 	searchText: string;
 	/** First filter rule matching this session (it may still be shown if overridden with `x`). */
@@ -675,6 +681,7 @@ async function loadRows(currentId: string | undefined): Promise<Row[]> {
 			tail: readTail(info.path),
 			live: live.get(info.id),
 			isCurrent,
+			takenOver: modeState().takenOver.has(info.id),
 			title,
 			searchText: `${info.name ?? ""}\n${info.cwd}\n${info.allMessagesText}`.toLowerCase(),
 			bg: getAgent(info.id),
@@ -701,7 +708,8 @@ async function loadRows(currentId: string | undefined): Promise<Row[]> {
 			filtered: false,
 			tail: { status: "empty", lastText: a.lastText ?? "", lastSaid: { role: "user", text: a.title } },
 			live: live.get(a.id),
-			isCurrent: false,
+			isCurrent: a.id === currentId,
+			takenOver: modeState().takenOver.has(a.id),
 			title: a.title,
 			searchText: `${a.title}\n${a.cwd}`.toLowerCase(),
 			bg: a,
@@ -1323,10 +1331,24 @@ class InboxComponent {
 
 		// columns
 		const wStatus = 12;
+		// The ⚑ slot only exists while takeover is possible (orchestrator mode).
+		const wTake = orchestrating() ? 2 : 0;
 		const wProj = Math.min(22, Math.max(10, Math.floor(innerW * 0.18)));
 		const wAge = 5;
 		const wMsgs = 5;
-		const wFixed = 2 + 2 + 2 + wStatus + 1 + wProj + 1 + wAge + 1 + wMsgs + 1;
+		const wFixed =
+			2 +
+			2 +
+			2 +
+			wTake +
+			wStatus +
+			1 +
+			wProj +
+			1 +
+			wAge +
+			1 +
+			wMsgs +
+			1;
 		const wText = Math.max(10, innerW - wFixed);
 		// split the text area into first message (title) + latest reply line, when there's room
 		const wLast = wText >= 60 ? Math.floor(wText * 0.5) : 0;
@@ -1359,6 +1381,11 @@ class InboxComponent {
 				const sel = d.idx === this.selected;
 				const cursor = sel ? th.fg("accent", "▶ ") : "  ";
 				const pin = r.meta.pinnedAt ? th.fg("warning", "★ ") : "  ";
+				// ⚑ marks the session this window runs interactively (sticky takeover) —
+				// independent of which row is the current one (`»`). Orchestrator-only:
+				// the slot disappears with the mode so non-orchestrator layout is unchanged.
+				const takeoverDot =
+					orchestrating() && r.takenOver ? th.fg("warning", "⚑ ") : "  ";
 				const liveDot = r.isCurrent || r.live || r.bg ? th.fg("success", "◉ ") : "  ";
 				// fixed 2-col slot before the title so titles stay aligned whether or not a row is unread,
 				// shared with the current-session marker: gold `»` (warning) is the session you're in and
@@ -1386,6 +1413,7 @@ class InboxComponent {
 				let content =
 					cursor +
 					pin +
+					takeoverDot +
 					liveDot +
 					fit(this.statusCell(r), wStatus) +
 					" " +
@@ -2189,8 +2217,8 @@ function activeInboxTui(ctx?: ExtensionContext): TUI | undefined {
 }
 
 /** The focused component if it's pi's main editor (no dialog or overlay). */
-function focusedEditor(): any {
-	const f = activeInboxTui()?.getFocusedComponent?.() as any;
+function focusedEditor(allowAutocomplete = false): any {
+	const f = (activeInboxTui() as any)?.getFocusedComponent?.();
 	if (
 		!f ||
 		typeof f.getText !== "function" ||
@@ -2198,7 +2226,11 @@ function focusedEditor(): any {
 	) {
 		return undefined;
 	}
-	if (typeof f.isShowingAutocomplete === "function" && f.isShowingAutocomplete()) return undefined;
+	if (
+		!allowAutocomplete &&
+		typeof f.isShowingAutocomplete === "function" &&
+		f.isShowingAutocomplete()
+	) return undefined;
 	return f;
 }
 
@@ -2321,6 +2353,16 @@ function isAttached(ctx: ExtensionContext): boolean {
 /** The window's real foreground session is the sticky taken-over main. */
 function isStickyMain(ctx: ExtensionContext): boolean {
 	return orchestrating() && modeState().takenOver.has(ctx.sessionManager.getSessionId());
+}
+
+/** Shared queue target for /queue and the native dequeue-key interceptor. */
+function queueTargetId(ctx: ExtensionContext): string | undefined {
+	if (isVisiting()) return visitState().visit!.id;
+	if (isAttached(ctx)) return ctx.sessionManager.getSessionId();
+	if (orchestrating() && (isHome(ctx) || isStickyMain(ctx))) {
+		return modeState().openWhenReady;
+	}
+	return undefined;
 }
 
 /** Attached and its background run is still going (the on-screen transcript is a snapshot). */
@@ -2725,7 +2767,7 @@ function showLiveStream(ctx: ExtensionContext) {
 		const G = globalThis as any;
 		unmountLiveStream(ctx, G);
 		const a = visitAgent();
-		if (!isRunning(a)) return;
+		if (!a || !isRunning(a)) return;
 		// Same compact status the normal attached view uses — no visit-specific UI.
 		const th = ctx.ui.theme;
 		const status: string[] = [
@@ -2758,7 +2800,9 @@ function showLiveStream(ctx: ExtensionContext) {
 	const tui = activeInboxTui(ctx);
 	if (tui) G.__piInboxTui = tui;
 	const chat = tui ? chatContainer(tui) : undefined;
-	if (!a || !isRunning(a) || !chat) return unmountLiveStream(ctx, G);
+	if (!a || !isRunning(a) || !tui || !chat) {
+		return unmountLiveStream(ctx, G);
+	}
 	const hideThinkingBlock = thinkingBlocksHidden(ctx);
 	removeCurrentRunSnapshot(chat, a);
 	const promptInSnapshot = false;
@@ -2879,6 +2923,27 @@ export default function (pi: ExtensionAPI) {
 	(globalThis as any)[Symbol.for("pi.inbox.rename-target")] = (ctx: ExtensionContext) => {
 		const t = getReplyTarget();
 		if (t?.kind === "agent") return undefined;
+		const visit = visitState().visit;
+		if (t?.kind !== "new" && visit) {
+			return {
+				label: "Rename session (empty = auto-title)",
+				current: getAgent(visit.id)?.title ?? visit.title,
+				apply: (name: string) => {
+					const sm = SessionManager.open(visit.file);
+					const first = sm.getBranch().find(
+						(e: any) => e.type === "message" && e.message?.role === "user",
+					) as any;
+					const title = name || cleanTitle(
+						messageText(first?.message?.content) || "",
+					).slice(0, 200);
+					if (!title) return "No user message yet — pass a title.";
+					if (getAgent(visit.id)) renameAgent(visit.id, title);
+					else sm.appendSessionInfo(title);
+					visit.title = title;
+					return `Session renamed: ${title}`;
+				},
+			};
+		}
 		const home = orchestrating() && isHome(ctx);
 		const pendingId = home ? modeState().openWhenReady : undefined;
 		const pending = pendingId ? getAgent(pendingId) : undefined;
@@ -2912,7 +2977,7 @@ export default function (pi: ExtensionAPI) {
 
 	const refreshFooter = (ctx: ExtensionContext) => {
 		if (!ctx.hasUI) return;
-		const id = ctx.sessionManager.getSessionId();
+		const id = viewedSession(ctx).id;
 		const meta = loadStore().sessions[id] ?? {};
 		const parts: string[] = [];
 		if (meta.pinnedAt) parts.push(ctx.ui.theme.fg("warning", "★ pinned"));
@@ -2991,7 +3056,12 @@ export default function (pi: ExtensionAPI) {
 		writeLive(ctx, "idle");
 		// it finished in front of you — but a manual unread (blue ») stays until you open it from the
 		// inbox or leave it; it wouldn't be intentional to clear it just because it ran.
-		if (ctx.mode === "tui" && !manuallyUnread(ctx.sessionManager.getSessionId())) markRead(ctx.sessionManager.getSessionId());
+		const id = ctx.sessionManager.getSessionId();
+		if (
+			ctx.mode === "tui" &&
+			viewedSession(ctx).id === id &&
+			!manuallyUnread(id)
+		) markRead(id);
 	});
 	pi.on("session_shutdown", async (e: any) => {
 		// Leaving a session you were looking at: it's read — except a manual unread (`u`), which is
@@ -3051,7 +3121,7 @@ export default function (pi: ExtensionAPI) {
 	}
 	// Replace (not keep) a listener left by a previous load, so /reload picks up new listener code.
 	// Keyed by a version so per-session re-instantiation doesn't churn it.
-	const LISTENER_VERSION = 12;
+	const LISTENER_VERSION = 14;
 	if (G.__piInboxAgentsListenerVersion !== LISTENER_VERSION) {
 		if (typeof G.__piInboxAgentsListener === "function") G.__piInboxAgentsListener();
 		G.__piInboxAgentsListenerVersion = LISTENER_VERSION;
@@ -3061,6 +3131,7 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const ms = modeState();
 				const cur = ctx.sessionManager.getSessionId();
+				const shown = viewedSession(ctx).id;
 				if (getAgent(cur)?.proc) ms.betweenRuns.delete(cur); // the next run started (reload done or hold timed out)
 				// A run on the session you're looking at ended, but you queued more: hold the next run and
 				// reload the chat first, so the turn you just watched is in the transcript before the next one.
@@ -3080,8 +3151,18 @@ export default function (pi: ExtensionAPI) {
 				}
 				ctx.ui.setStatus("inbox-agents", agentsSummary());
 				showReplyWidget(ctx); // "queued" vs "runs in the background" hint follows the agent's state
-				// Orchestrator: the attached session on screen just stopped running in the background.
-				if (isAttached(ctx)) {
+				// Visits share the main's context, so isAttached(ctx) is false.
+				// Refresh their queue/status without reloading the hidden main.
+				if (isVisiting()) {
+					if (
+						ev.type === "finished" &&
+						ev.agent.id === shown &&
+						!ms.inLoop &&
+						!manuallyUnread(shown)
+					) markRead(shown);
+					showLiveStream(ctx);
+					showModeWidget(ctx);
+				} else if (isAttached(ctx)) {
 					const running = isRunning(getAgent(cur));
 					if (running) ms.wasRunning.add(cur);
 					else if (ms.wasRunning.delete(cur)) {
@@ -3096,7 +3177,11 @@ export default function (pi: ExtensionAPI) {
 					// Assistant output starts after the automatic session switch.
 					showStartingPrompt(ctx, getAgent(ms.openWhenReady));
 				}
-				if (ev.type === "finished" && ev.agent.id === cur && isAttached(ctx)) {
+				if (
+					ev.type === "finished" &&
+					ev.agent.id === shown &&
+					(isAttached(ctx) || isVisiting())
+				) {
 					playSound(ev.agent.state === "error"); // the reload is the notification; still ping
 					return;
 				}
@@ -3164,17 +3249,7 @@ export default function (pi: ExtensionAPI) {
 		explicitTitle?: string,
 	): Promise<QueueManagerResult | undefined> {
 		if (ctx.mode !== "tui" || !ctx.hasUI) return undefined;
-		const homeId =
-			orchestrating() && (isHome(ctx) || isStickyMain(ctx))
-				? modeState().openWhenReady
-				: undefined;
-		const id =
-			explicitId ??
-			(isVisiting()
-				? visitState().visit!.id
-				: isAttached(ctx)
-					? ctx.sessionManager.getSessionId()
-					: homeId);
+		const id = explicitId ?? queueTargetId(ctx);
 		const agent = id ? getAgent(id) : undefined;
 		if (!agent) {
 			ctx.ui.notify(
@@ -3532,6 +3607,7 @@ export default function (pi: ExtensionAPI) {
 			const tui = activeInboxTui(ctx);
 			if (tui) closeVisit(tui);
 			showModeWidget(ctx);
+			showLiveStream(ctx);
 			return ctx.ui.notify("Already taken over — you're back on it. The visited session keeps running in the background.", "info");
 		}
 		if (ms.takenOver.has(id)) return ctx.ui.notify("Already taken over: this session runs here.", "info");
@@ -3579,7 +3655,7 @@ export default function (pi: ExtensionAPI) {
 	async function openInbox(ctx: ExtensionCommandContext) {
 		if (ctx.mode !== "tui") {
 			// Plain-text fallback for non-interactive modes.
-			const rows = await loadRows(ctx.sessionManager.getSessionId());
+			const rows = await loadRows(viewedSession(ctx).id);
 			const lines = rows
 				.filter((r) => !r.meta.archivedAt && !r.filtered)
 				.sort((a, b) => Number(!!b.meta.pinnedAt) - Number(!!a.meta.pinnedAt) || b.info.modified.getTime() - a.info.modified.getTime())
@@ -3605,13 +3681,20 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function inboxLoop(ctx: ExtensionCommandContext) {
-		const currentId = ctx.sessionManager.getSessionId();
-		const currentFile = ctx.sessionManager.getSessionFile();
-		// Orchestrator: coming back from a session puts the cursor on it (so `t` takes it over).
-		if (orchestrating() && !isHome(ctx)) uiState.selectedId = currentId;
-		// Reload when the cache predates the session we want selected (e.g. a just-started agent).
-		if (rowCache.length === 0 || (uiState.selectedId && !rowCache.some((r) => r.info.id === uiState.selectedId))) {
-			rowCache = await loadRows(currentId);
+		const foregroundId = ctx.sessionManager.getSessionId();
+		const foregroundFile = ctx.sessionManager.getSessionFile();
+		const viewed = viewedSession(ctx);
+		// Selection and the current-row marker follow the screen, not the
+		// foreground runtime kept alive behind a sticky-takeover visit.
+		if (orchestrating() && !isHome(ctx)) uiState.selectedId = viewed.id;
+		// Refresh stale row identity before the first paint, not on the timer.
+		if (
+			rowCache.length === 0 ||
+			(uiState.selectedId &&
+				!rowCache.some((r) => r.info.id === uiState.selectedId)) ||
+			rowCache.some((r) => r.isCurrent !== (r.info.id === viewed.id))
+		) {
+			rowCache = await loadRows(viewed.id);
 			(globalThis as any)[ROWS_KEY] = rowCache;
 		}
 
@@ -3627,7 +3710,7 @@ export default function (pi: ExtensionAPI) {
 						kb,
 						done,
 						uiState,
-						currentId,
+						viewed.id,
 						rowCache,
 						(rows) => {
 							rowCache = rows;
@@ -3637,7 +3720,7 @@ export default function (pi: ExtensionAPI) {
 						(row, name) => {
 							// Working (or not saved yet) background agent: its process applies the name itself.
 							if (row.bg && (isRunning(row.bg) || !row.info.path)) renameAgent(row.bg.id, name);
-							else if (row.isCurrent) pi.setSessionName(name);
+							else if (row.info.id === foregroundId) pi.setSessionName(name);
 							else if (!row.info.path) throw new Error("session isn't saved yet, try again in a moment");
 							else SessionManager.open(row.info.path).appendSessionInfo(name);
 						},
@@ -3650,7 +3733,11 @@ export default function (pi: ExtensionAPI) {
 			if (!result || result.action === "close") {
 				// Back to an attached session whose run ended while the orchestrator was up: reload it.
 				const ms = modeState();
-				if (orchestrating() && (ms.stale.has(currentId) || ms.takeoverWhenDone.has(currentId))) await refreshCurrent(ctx);
+				if (
+					orchestrating() &&
+					(ms.stale.has(foregroundId) ||
+						ms.takeoverWhenDone.has(foregroundId))
+				) await refreshCurrent(ctx);
 				return;
 			}
 
@@ -3661,7 +3748,8 @@ export default function (pi: ExtensionAPI) {
 					const tui = activeInboxTui(ctx);
 					if (tui) {
 						closeVisit(tui);
-					showModeWidget(ctx);
+						showModeWidget(ctx);
+						showLiveStream(ctx);
 					}
 					return;
 				}
@@ -3685,7 +3773,9 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (result.action === "new") {
-				let model = currentModel(ctx);
+				let model = isVisiting()
+					? nextSessionModel(viewed.id, viewed.file)
+					: currentModel(ctx);
 				if (result.pickModel) {
 					const picked = await pickModel(ctx, model);
 					if (!picked) continue;
@@ -3698,12 +3788,13 @@ export default function (pi: ExtensionAPI) {
 					if (isVisiting()) {
 						const tui = activeInboxTui(ctx);
 						if (tui) closeVisit(tui);
+						showLiveStream(ctx);
 					}
-					setReplyTarget({ kind: "new", cwd: ctx.cwd, model }, ctx);
+					setReplyTarget({ kind: "new", cwd: viewed.cwd, model }, ctx);
 					return;
 				}
 				// No sticky main: retain the existing blank-home compose flow.
-				setReplyTarget({ kind: "new", cwd: ctx.cwd, model }, ctx);
+				setReplyTarget({ kind: "new", cwd: viewed.cwd, model }, ctx);
 				if (orchestrating() && !isHome(ctx) && !(await goHome(ctx, { reopen: false }))) {
 					setReplyTarget(undefined, ctx);
 					continue;
@@ -3724,7 +3815,7 @@ export default function (pi: ExtensionAPI) {
 					result.row.info.id,
 					result.row.title,
 				);
-				rowCache = await loadRows(currentId);
+				rowCache = await loadRows(viewed.id);
 				(globalThis as any)[ROWS_KEY] = rowCache;
 				continue;
 			}
@@ -3762,10 +3853,9 @@ export default function (pi: ExtensionAPI) {
 					const moved = moveSessionDir(row.info.path, pick);
 					const a = getAgent(row.info.id);
 					if (a) setAgentDir(a.id, pick, moved);
-					if (row.isCurrent && !isHome(ctx)) {
-						// This window holds the session: reopen it at its new path so the live record and
-						// session id stay consistent. (isCurrent here can only be a taken-over session in
-						// the odd case where the inbox lists home itself — safe no-op otherwise.)
+					if (row.info.id === foregroundId && !isHome(ctx)) {
+						// Only the real foreground runtime needs a native reopen.
+						// The viewed-row marker does not imply foreground ownership.
 						await ctx.switchSession(moved, {
 							withSession: async (c) => {
 								c.ui.notify(`📁 Session moved to ${prettyDir(pick)} — it now runs there.`, "info");
@@ -3797,7 +3887,7 @@ export default function (pi: ExtensionAPI) {
 						}),
 					{ overlay: true, overlayOptions: overlayOpts() },
 				);
-				rowCache = await loadRows(currentId);
+				rowCache = await loadRows(viewed.id);
 				(globalThis as any)[ROWS_KEY] = rowCache;
 				if (r?.action === "cancel") cancelAgent(row.info.id);
 				if (r?.action === "reply") {
@@ -3817,7 +3907,7 @@ export default function (pi: ExtensionAPI) {
 						if (!text) continue;
 						sendToAgent({ id: row.info.id, cwd: row.info.cwd, sessionFile: file, title: row.title, text });
 						uiState.selectedId = row.info.id;
-						rowCache = await loadRows(currentId);
+						rowCache = await loadRows(viewed.id);
 						continue;
 					}
 					setReplyTarget(
@@ -3836,7 +3926,10 @@ export default function (pi: ExtensionAPI) {
 				const row = result.row;
 				const id = row.info.id;
 				const ms = modeState();
-				if (row.isCurrent || (currentFile && row.info.path === currentFile)) {
+				if (
+					id === foregroundId ||
+					(foregroundFile && row.info.path === foregroundFile)
+				) {
 					if (isHome(ctx)) continue;
 					markRead(id); // going back into it from the inbox: a manual unread (blue ») clears
 					// Opening the main's own row while a visit is showing: end the visit, show the main live.
@@ -3845,6 +3938,7 @@ export default function (pi: ExtensionAPI) {
 						if (tui) {
 							closeVisit(tui);
 							showModeWidget(ctx);
+							showLiveStream(ctx);
 						}
 						return;
 					}
@@ -3876,6 +3970,7 @@ export default function (pi: ExtensionAPI) {
 					})) {
 						markRead(id); // visiting counts as looking
 						showModeWidget(ctx);
+						showLiveStream(ctx);
 						return; // stay in orchestrator: the visit replaced the chat view
 					}
 					// Sticky means sticky: never fall through to the real switch, because that
@@ -3920,7 +4015,10 @@ export default function (pi: ExtensionAPI) {
 
 			if (result.action === "open") {
 				const row = result.row;
-				if (row.isCurrent || (currentFile && row.info.path === currentFile)) {
+				if (
+					row.info.id === foregroundId ||
+					(foregroundFile && row.info.path === foregroundFile)
+				) {
 					if (orchestrating() && isHome(ctx)) continue; // home itself isn't listed, but be safe
 					markRead(row.info.id); // going back into it from the inbox: a manual unread (blue ») clears
 					ctx.ui.notify("Already in this session", "info");
@@ -3998,8 +4096,10 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const a = args.trim().toLowerCase();
 			if (["help", "?", "docs", "readme"].includes(a)) return showHelp(ctx);
-			if (["filters", "filter", "blocklist"].includes(a))
-				return showHelp(ctx, filtersReport(await loadRows(ctx.sessionManager.getSessionId())), "filters");
+			if (["filters", "filter", "blocklist"].includes(a)) {
+				const rows = await loadRows(viewedSession(ctx).id);
+				return showHelp(ctx, filtersReport(rows), "filters");
+			}
 			return openInbox(ctx);
 		},
 	});
@@ -4073,6 +4173,8 @@ export default function (pi: ExtensionAPI) {
 			if (isVisiting()) {
 				const tui = activeInboxTui(ctx);
 				if (tui) closeVisit(tui);
+				showModeWidget(ctx);
+				showLiveStream(ctx);
 			}
 			if (file === ctx.sessionManager.getSessionFile()) return { cancel: true };
 			if (!ctx.isIdle()) {
@@ -4292,8 +4394,13 @@ export default function (pi: ExtensionAPI) {
 		if (!t && text && isVisiting()) {
 			const v = visitState().visit!;
 			if (event.images?.length) ctx.ui.notify("Images can't be sent to background agents yet: sent the text only.", "warning");
-			sendToAgent({ id: v.id, cwd: v.cwd, sessionFile: v.file, title: v.title, text, model: currentModel(ctx) });
-			showModeWidget(ctx); // queued count / running state may have changed
+			// The visit's model comes from its own saved/pending choice, never
+			// from the hidden foreground runtime used to host this view.
+			sendToAgent({
+				id: v.id, cwd: v.cwd, sessionFile: v.file, title: v.title, text,
+			});
+			showModeWidget(ctx);
+			showLiveStream(ctx); // queued count / running state may have changed
 			return { action: "handled" };
 		}
 		// Waiting for a just-started agent to open: more messages queue for it. A sticky main
@@ -4440,23 +4547,26 @@ export default function (pi: ExtensionAPI) {
 		}
 		G.__piInboxEscUnsub?.();
 		G.__piInboxEscUnsub = ctx.ui.onTerminalInput((data) => {
+			const current =
+				(G.__piInboxAgentsCtx as ExtensionContext | undefined) ?? ctx;
+			const visit = visitState().visit;
+			const tui = activeInboxTui(current);
+			if (
+				visit && tui && !modeState().inLoop && focusedEditor(true) &&
+				handleVisitModelInput(data, current, tui,
+					() => sendBlockedReason(visit.id, visit.file, current))
+			) return { consume: true };
 			// Pi's dequeue key opens our queue manager for an attached
 			// background agent. Everywhere else it keeps its built-in meaning.
 			if (getKeybindings().matches(data, "app.message.dequeue")) {
 				const c =
 					(G.__piInboxAgentsCtx as ExtensionContext | undefined) ?? ctx;
-				const homeId =
-					orchestrating() && (isHome(c) || isStickyMain(c))
-						? modeState().openWhenReady
-						: undefined;
-				const id = isAttached(c)
-					? c.sessionManager.getSessionId()
-					: homeId;
+				const id = queueTargetId(c);
 				if (
 					editorFocused() &&
 					!modeState().inLoop &&
 					!!id &&
-					!!getAgent(id)
+					(isVisiting() || !!getAgent(id))
 				) {
 					void manageQueue(c);
 					return { consume: true };
@@ -4504,6 +4614,7 @@ export default function (pi: ExtensionAPI) {
 					if (tui) {
 						closeVisit(tui);
 						showModeWidget(c);
+						showLiveStream(c);
 						return { consume: true };
 					}
 				}
@@ -4525,7 +4636,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("pin", {
 		description: "Toggle pin on the current session",
 		handler: async (_args, ctx) => {
-			const meta = updateMeta(ctx.sessionManager.getSessionId(), (m) => {
+				const meta = updateMeta(viewedSession(ctx).id, (m) => {
 				m.pinnedAt = m.pinnedAt ? undefined : Date.now();
 			});
 			ctx.ui.notify(meta.pinnedAt ? "★ Session pinned" : "Session unpinned", "info");
@@ -4536,7 +4647,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("archive", {
 		description: "Toggle archive (done) on the current session",
 		handler: async (_args, ctx) => {
-			const meta = updateMeta(ctx.sessionManager.getSessionId(), (m) => {
+			const meta = updateMeta(viewedSession(ctx).id, (m) => {
 				m.archivedAt = m.archivedAt ? undefined : Date.now();
 			});
 			ctx.ui.notify(meta.archivedAt ? "✓ Session archived — find it under /inbox → Archived" : "↩ Session moved back to inbox", "info");
