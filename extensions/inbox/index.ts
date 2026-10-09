@@ -12,8 +12,11 @@
  *   ↑/↓ PgUp/PgDn  move          enter       agent view: live transcript (r there = reply)
  *   o              open (switch to) session in this window
  *   n / N          new background agent (N: pick its model); you type its prompt in pi's editor
+ *   ctrl+w   pick a working directory: for a new agent (while typing its prompt / at home), and
+ *            inside an attached/taken-over session: move that session to another directory
+ *   d              move the selected session to another directory (orchestrator mode)
  *   c              cancel a running background agent
- *   p              pin / unpin   a / d       archive / unarchive (done)
+ *   p              pin / unpin   a           archive / unarchive (done)
  *   tab / 1 2 3 4  Inbox · Archived · All · Filtered    /  search (full-text)
  *   x              filter out / back in (overrides the rules in ~/.pi/agent/inbox-filters.json)
  *   r              rename        R / ctrl+r  refresh       esc / q  close
@@ -80,6 +83,7 @@ import {
 	isAgentChild,
 	markSeen,
 	recordActualThinkingLevel,
+	setAgentDir,
 	startAgentSupervisor,
 	releaseAgent,
 	releaseHold,
@@ -840,6 +844,7 @@ type InboxResult =
 	| { action: "view"; row: Row }
 	| { action: "new"; pickModel: boolean }
 	| { action: "cancel"; row: Row }
+	| { action: "movedir"; row: Row }
 	| { action: "home" }
 	| { action: "exitMode" }
 	| { action: "quit" }
@@ -1172,7 +1177,7 @@ class InboxComponent {
 			this.searching = true;
 		} else if (ch === "p" || ch === "*") {
 			if (row) this.togglePin(row);
-		} else if (ch === "a" || ch === "d" || ch === "e") {
+		} else if (ch === "a") {
 			if (row) this.toggleArchive(row);
 		} else if (ch === "x") {
 			if (row) this.toggleFilter(row);
@@ -1180,6 +1185,11 @@ class InboxComponent {
 			if (row) this.toggleUnread(row);
 		} else if (ch === "r") {
 			if (row) this.startRename(row);
+		} else if (ch === "d") {
+			// "d" = move to another directory (was a third archive spelling; D is gone).
+			if (row && !isRunning(row.bg) && orchestrating()) this.done({ action: "movedir", row });
+			else if (row && !isRunning(row.bg)) this.say("moving a session's directory is an orchestrator-mode action");
+			else if (row) this.say("wait for the agent to finish (or cancel it with c) before moving it");
 		} else if (ch === "?") {
 			this.done({ action: "help" });
 		} else if (ch === "R" || matchesKey(data, "ctrl+r")) {
@@ -1406,25 +1416,26 @@ class InboxComponent {
 			: this.searching
 			? [k("type", "to filter"), k("enter", "keep"), k("esc", "clear")].join(th.fg("dim", " · "))
 			: orchestrating()
-				? [
-						k("↑↓", "move"),
-						k("enter", "open"),
-						k("t", "take over"),
-						k("n", "new agent"),
-						k("N", "new (pick model)"),
-						k("v", "peek"),
-						...(isRunning(r?.bg) ? [k("c", "cancel")] : []),
-						...(this.atHome ? [] : [k("h", "hand back"), k("esc", "back to session")]),
-						k("p", r?.meta.pinnedAt ? "unpin" : "pin"),
-						k("a", archLabel),
-						k("u", r?.unread ? "mark read" : "mark unread"),
-						k("x", r?.filtered ? "unfilter" : "filter"),
-						k("tab", "view"),
-						k("/", "search"),
-						k("r", "rename"),
-						k("?", "help"),
-						k("Q", "leave orchestrator"),
-					].join(th.fg("dim", " · "))
+			? [
+					k("↑↓", "move"),
+					k("enter", "open"),
+					k("t", "take over"),
+					k("n", "new agent"),
+					k("N", "new (pick model)"),
+					k("v", "peek"),
+					...(isRunning(r?.bg) ? [k("c", "cancel")] : []),
+					...(r && !isRunning(r?.bg) ? [k("d", "move dir")] : []),
+					...(this.atHome ? [] : [k("h", "hand back"), k("esc", "back to session")]),
+					k("p", r?.meta.pinnedAt ? "unpin" : "pin"),
+					k("a", archLabel),
+					k("u", r?.unread ? "mark read" : "mark unread"),
+					k("x", r?.filtered ? "unfilter" : "filter"),
+					k("tab", "view"),
+					k("/", "search"),
+					k("r", "rename"),
+					k("?", "help"),
+					k("Q", "leave orchestrator"),
+				].join(th.fg("dim", " · "))
 				: [
 						k("↑↓", "move"),
 						k("enter", "view/reply"),
@@ -1521,6 +1532,147 @@ class NewAgentPromptComponent implements Focusable {
 	}
 }
 
+// ───────────────────────────── directory picker overlay ─────────────────────────────
+
+/**
+ * Full-screen directory picker used in orchestrator mode (new agent's dir, or moving a session):
+ * a single-line Input whose suggestions rebuild on every keystroke — what the typed text means so
+ * far, its parent, home, child directories of the prefix (shell-like filtering on the
+ * un-resolved remainder), and working dirs of other sessions matching the text.
+ * ↑/↓ pick a suggestion, tab/enter accept it (enter on the input itself = accept as typed),
+ * esc cancels. Focusable so the hardware cursor follows the Input.
+ */
+class DirPickerComponent implements Focusable {
+	private input: Input;
+	private _focused = false;
+	private suggestions: DirSuggestion[] = [];
+	private selected = 0;
+	private scroll = 0;
+	private error?: string;
+
+	get focused() {
+		return this._focused;
+	}
+	set focused(v: boolean) {
+		this._focused = v;
+		this.input.focused = v;
+	}
+
+	constructor(
+		private tui: TUI,
+		private theme: Theme,
+		private done: (dir: string | undefined) => void,
+		private opts: { title: string; base: string; initial?: string; hint?: string },
+	) {
+		this.input = new Input({ prompt: theme.fg("accent", "📁 ") });
+		this.input.setValue(prettyDir(opts.initial ?? opts.base));
+		this.rebuild();
+	}
+
+	private rebuild() {
+		this.suggestions = dirSuggestions(this.input.getValue(), this.opts.base);
+		this.selected = 0;
+		this.scroll = 0;
+		this.error = undefined;
+	}
+
+	private accept(s: DirSuggestion) {
+		this.done(s.value);
+	}
+
+	private acceptTyped() {
+		const v = expandDir(this.input.getValue(), this.opts.base);
+		if (!v) {
+			this.error = "not a directory (try ↑↓ to pick a suggestion)";
+			this.tui.requestRender();
+			return;
+		}
+		this.done(v);
+	}
+
+	invalidate() {}
+
+	handleInput(data: string) {
+		if (matchesKey(data, "escape")) return this.done(undefined);
+		if (matchesKey(data, "up") || matchesKey(data, "down")) {
+			if (!this.suggestions.length) return;
+			const d = matchesKey(data, "up") ? -1 : 1;
+			this.selected = (this.selected + d + this.suggestions.length) % this.suggestions.length;
+			this.moved = true;
+			this.tui.requestRender();
+			return;
+		}
+		if (matchesKey(data, "enter") || matchesKey(data, "return") || data === "\n") {
+			// An explicitly highlighted suggestion accepts that; enter on untouched input accepts as typed.
+			if (this.moved && this.suggestions.length) this.accept(this.suggestions[this.selected]!);
+			else this.acceptTyped();
+			return;
+		}
+		if (matchesKey(data, "tab")) {
+			const s = this.suggestions[this.selected] ?? this.suggestions[0];
+			if (s) {
+				// tab fills the suggestion into the input (like shell completion) instead of committing
+				this.input.setValue(prettyDir(s.value));
+				this.rebuild();
+				this.tui.requestRender();
+			}
+			return;
+		}
+		this.moved = true;
+		this.input.handleInput(data);
+		this.rebuild();
+		this.tui.requestRender();
+	}
+	private moved = false;
+
+	render(width: number): string[] {
+		const th = this.theme;
+		const innerW = Math.max(30, width - 2);
+		const b = (s: string) => th.fg("borderMuted", s);
+		const line = (s: string) => b("│") + fit(s, innerW) + b("│");
+		const rows = Math.max(14, this.tui.terminal?.rows ?? 30);
+		const title = ` ${th.bold(th.fg("accent", `📥 Pi Inbox · orchestrator · ${this.opts.title}`))} `;
+		const out = [b("╭─") + title + b("─".repeat(Math.max(0, innerW - 1 - visibleWidth(title)))) + b("╮")];
+		if (this.opts.hint) out.push(line(` ${th.fg("dim", this.opts.hint)}`));
+		out.push(line(""));
+		this.input.focused = this._focused;
+		out.push(line(` ${this.input.render(Math.max(10, innerW - 2))[0] ?? ""}`));
+		out.push(line(""));
+
+		const LIST_H = Math.max(4, rows - 9);
+		if (this.selected < this.scroll) this.scroll = this.selected;
+		if (this.selected >= this.scroll + LIST_H) this.scroll = this.selected - LIST_H + 1;
+		if (!this.suggestions.length) out.push(line(` ${th.fg("dim", "(no suggestions — type a path)")}`));
+		for (let i = 0; i < LIST_H; i++) {
+			const s = this.suggestions[this.scroll + i];
+			if (!s) {
+				out.push(line(""));
+				continue;
+			}
+			const sel = this.scroll + i === this.selected;
+			const marker = sel ? th.fg("accent", "▶ ") : "  ";
+			const hint = s.hint ? th.fg("dim", `  · ${s.hint}`) : "";
+			let row = ` ${marker}${s.label}${hint}`;
+			// file-browser feel: for child entries show the parent path dimly on the right
+			if (s.kind === "child") {
+				const parent = prettyDir(path.dirname(s.value));
+				const used = visibleWidth(row);
+				if (parent && used + visibleWidth(parent) + 2 < innerW)
+					row += th.fg("dim", `  ${"·".repeat(Math.max(1, innerW - used - visibleWidth(parent) - 3))} ${parent}`);
+			}
+			out.push(line(sel ? th.bg("selectedBg", row) : row));
+		}
+		while (out.length < rows - 2) out.push(line(""));
+		const k = (key: string, label: string) => `${th.fg("accent", key)} ${th.fg("dim", label)}`;
+		const foot = this.error
+			? th.fg("error", ` ✗ ${this.error}`)
+			: [k("↑↓", "pick"), k("tab", "fill"), k("enter", "accept"), k("esc", "cancel"), k("typing", "filters the list")].join(th.fg("dim", " · "));
+		out.push(line(` ${foot}`));
+		out.push(b(`╰${"─".repeat(innerW)}╯`));
+		return out.slice(0, rows).map((l) => truncateToWidth(l, width));
+	}
+}
+
 /** Full-screen yes/no for orchestrator mode (ctx.ui.confirm would reveal pi's chat view). */
 class ConfirmComponent {
 	private yes = true;
@@ -1568,6 +1720,172 @@ class ConfirmComponent {
 	}
 }
 
+// ───────────────────────────── directory picker ─────────────────────────────
+
+/** Directory for the next new background agent, set with ctrl+w before sending its first prompt. */
+const NEXT_DIR_KEY = Symbol.for("pi.inbox.next-agent-dir");
+function getNextAgentDir(): string | undefined {
+	return (globalThis as any)[NEXT_DIR_KEY];
+}
+function setNextAgentDir(dir: string | undefined) {
+	(globalThis as any)[NEXT_DIR_KEY] = dir || undefined;
+}
+
+/** Expand a typed path (~, relative) into an absolute directory. undefined = not resolvable. */
+function expandDir(input: string, base: string): string | undefined {
+	let s = (input ?? "").trim();
+	if (!s) return undefined;
+	if (s === "~" || s.startsWith("~/")) {
+		const home = os.homedir();
+		s = s === "~" ? home : path.join(home, s.slice(2));
+	}
+	try {
+		const abs = path.resolve(base, s);
+		const st = fs.statSync(abs);
+		if (!st.isDirectory()) return undefined;
+		return abs;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Display form of a directory, with ~ for home. */
+function prettyDir(p: string): string {
+	const home = os.homedir();
+	return p === home || p.startsWith(home + path.sep) ? "~" + p.slice(home.length) : p;
+}
+
+/**
+ * Deepest existing directory along a typed path, plus the un-resolved remainder:
+ * "~/Code/gam" -> { dir: ~/Code, rest: "gam" }, "" -> base itself.
+ */
+function resolvePrefix(input: string, base: string): { dir: string; rest: string } {
+	let s = (input ?? "").trim();
+	if (s === "~" || s.startsWith("~/")) s = path.join(os.homedir(), s.slice(1));
+	if (!s) return { dir: base, rest: "" };
+	let p = path.resolve(base, s);
+	const rest: string[] = [];
+	for (;;) {
+		try {
+			if (fs.statSync(p).isDirectory()) return { dir: p, rest: rest.join("/") };
+		} catch {
+			// doesn't exist (or isn't a dir): walk up
+		}
+		const parent = path.dirname(p);
+		if (parent === p) return { dir: base, rest: s };
+		rest.unshift(path.basename(p));
+		p = parent;
+	}
+}
+
+interface DirSuggestion {
+	/** Absolute path this suggestion selects. */
+	value: string;
+	/** Display text; children show just their name (like a file browser). */
+	label: string;
+	hint?: string;
+	kind: "as-typed" | "up" | "home" | "child" | "recent";
+}
+
+/**
+ * Suggestions while typing in the directory picker. Cheap and synchronous:
+ *  - what the input means so far (the resolved prefix), then its parent and home
+ *  - child directories of that prefix, filtered by the un-resolved remainder (shell-like)
+ *  - working directories of other sessions that match the typed text ("recent")
+ */
+function dirSuggestions(input: string, base: string): DirSuggestion[] {
+	const out: DirSuggestion[] = [];
+	const seen = new Set<string>();
+	const push = (s: DirSuggestion) => {
+		if (seen.has(s.value)) return;
+		seen.add(s.value);
+		out.push(s);
+	};
+	const typed = !!input.trim();
+	const { dir, rest } = resolvePrefix(input, base);
+	push({ value: dir, label: prettyDir(dir), hint: typed ? (rest ? undefined : "as typed") : "current", kind: "as-typed" });
+	const parent = path.dirname(dir);
+	if (parent && parent !== dir) push({ value: parent, label: "..", hint: "parent", kind: "up" });
+	const home = os.homedir();
+	if (home !== dir) push({ value: home, label: "~", hint: "home", kind: "home" });
+
+	let names: string[] = [];
+	try {
+		names = fs
+			.readdirSync(dir)
+			.filter((n) => {
+				try {
+					return fs.statSync(path.join(dir, n)).isDirectory() && !n.startsWith(".");
+				} catch {
+					return false;
+				}
+			})
+			.sort((a, b) => a.localeCompare(b));
+	} catch {
+		// unreadable -> no children
+	}
+	const last = (rest || "").toLowerCase();
+	for (const n of names) {
+		if (last && !n.toLowerCase().startsWith(last)) continue;
+		push({ value: path.join(dir, n), label: `${n}/`, kind: "child" });
+	}
+
+	if (typed) {
+		const q = input.trim().toLowerCase();
+		for (const c of recentSessionDirs()) {
+			if (c === dir || !prettyDir(c).toLowerCase().includes(q)) continue;
+			push({ value: c, label: prettyDir(c), hint: "recent", kind: "recent" });
+		}
+	}
+	return out.slice(0, 14);
+}
+
+/** Working directories of known sessions (for the picker's "recent" suggestions). Set by loadRows. */
+const ROWS_KEY = Symbol.for("pi.inbox.rowCache");
+function recentSessionDirs(): string[] {
+	const rows = (globalThis as any)[ROWS_KEY] as Row[] | undefined;
+	const dirs: string[] = [];
+	for (const r of rows ?? []) if (r.info.cwd && !dirs.includes(r.info.cwd)) dirs.push(r.info.cwd);
+	return dirs;
+}
+
+/**
+ * Move a saved session to another working directory:
+ *  - rewrite the session header's `cwd` (first line) so pi restores it under the new dir,
+ *  - move the file into the new dir's session-dir slug (`--<slug>--`), matching pi's layout.
+ * The caller re-points any registered background agent (setAgentDir).
+ * Returns the new absolute path. Throws on failure (no partial state on the common paths).
+ */
+function moveSessionDir(file: string, newCwd: string): string {
+	const raw = fs.readFileSync(file, "utf-8");
+	const nl = raw.includes("\r\n") ? "\r\n" : "\n";
+	const firstNl = raw.indexOf(nl);
+	const first = firstNl >= 0 ? raw.slice(0, firstNl) : raw;
+	if (!firstNl) throw new Error("session file has no header line");
+	const header = JSON.parse(first);
+	if (header?.type !== "session") throw new Error("not a pi session file");
+	header.cwd = newCwd;
+	const rewritten = `${JSON.stringify(header)}${nl}${firstNl >= 0 ? raw.slice(firstNl + nl.length) : ""}`;
+	const tmp = `${file}.move-${process.pid}.tmp`;
+	fs.writeFileSync(tmp, rewritten, "utf-8");
+	const slug = `--${newCwd.replace(/^[\\/]+/, "").replace(/[\\/:]/g, "-")}--`;
+	const dir = path.join(AGENT_DIR, "sessions", slug);
+	fs.mkdirSync(dir, { recursive: true });
+	const target = path.join(dir, path.basename(file));
+	const same = path.resolve(target) === path.resolve(file);
+	if (!same && fs.existsSync(target)) {
+		fs.rmSync(tmp, { force: true });
+		throw new Error(`a session file already exists at ${target}`);
+	}
+	fs.renameSync(tmp, target);
+	try {
+		if (!same) fs.rmSync(file);
+	} catch {
+		// best effort; the rename above already produced the new copy
+	}
+	return target;
+}
+
 // ───────────────────────────── background-agent helpers ─────────────────────────────
 
 /** Where the next message typed in the main editor goes, when it isn't the foreground session. */
@@ -1582,8 +1900,11 @@ function getReplyTarget(): ReplyTarget | undefined {
 }
 function setReplyTarget(t: ReplyTarget | undefined, ctx?: ExtensionContext) {
 	(globalThis as any)[REPLY_KEY] = t;
-	// A pre-name only ever belongs to the new agent being typed; dropping the target drops it.
-	if (!t) setNextAgentName(undefined);
+	// A pre-name / pre-dir only ever belong to the new agent being typed; dropping the target drops them.
+	if (!t) {
+		setNextAgentName(undefined);
+		setNextAgentDir(undefined);
+	}
 	if (ctx) showReplyWidget(ctx);
 }
 
@@ -1624,15 +1945,22 @@ function showReplyWidget(ctx: ExtensionContext) {
 	}
 	if (!t) return ctx.ui.setWidget("inbox-reply", undefined);
 	const cancel = th.fg("dim", " · esc to cancel");
+	const nextDir = getNextAgentDir();
 	const named =
 		t.kind === "new"
 			? nextName
 				? `${th.fg("dim", " · named ")}${th.bold(nextName.slice(0, 50))}`
 				: th.fg("dim", " · ctrl+r to name it")
 			: "";
+	const dir =
+		t.kind === "new"
+			? nextDir
+				? `${th.fg("dim", " · dir ")}${th.bold(prettyDir(nextDir).slice(0, 50))}`
+				: th.fg("dim", " · ctrl+w to change dir")
+			: "";
 	const text =
 		t.kind === "new"
-			? `${th.fg("accent", "＋ Your next message starts a new background agent")}${th.fg("dim", ` · ${shortCwd(t.cwd)} · ${t.model ?? "default model"}`)}${named}`
+			? `${th.fg("accent", "＋ Your next message starts a new background agent")}${th.fg("dim", ` · ${shortCwd(nextDir ?? t.cwd)} · ${t.model ?? "default model"}`)}${named}${dir}`
 			: `${th.fg("accent", "↪ Your next message goes to ")}${th.bold(th.fg(nameColor(t.id), t.title.slice(0, 50)))}${th.fg(
 					"dim",
 					` · ${t.model ? `${t.model} (changed)` : (t.agentModel ?? "its current model")}${isRunning(getAgent(t.id)) ? " · queued: it's working" : ""}`,
@@ -2111,6 +2439,23 @@ export default function (pi: ExtensionAPI) {
 		return ctx.ui.select("Model for the new background agent", options);
 	}
 
+	/**
+	 * Directory picker overlay (orchestrator: stays full-screen). undefined = cancelled.
+	 * `ctx` is any ExtensionContext: the pending-dir is stored on globalThis, so the picker can be
+	 * opened from a shortcut handler (which gets the base context, no command context).
+	 */
+	async function pickDir(ctx: ExtensionContext, opts: { title: string; base: string; initial?: string; hint?: string }): Promise<string | undefined> {
+		if (ctx.mode !== "tui" || !ctx.hasUI) {
+			// Non-interactive fallback: plain input dialog.
+			const v = await ctx.ui.input(opts.title, opts.initial ?? "");
+			return v ? expandDir(v, opts.base) : undefined;
+		}
+		return ctx.ui.custom<string | undefined>(
+			(tui, theme, _kb, done) => (coverImagesUnderOverlays(tui), new DirPickerComponent(tui, theme, done, opts)),
+			{ overlay: true, overlayOptions: overlayOpts() },
+		);
+	}
+
 	async function showHelp(ctx: ExtensionCommandContext, markdown = readReadme(), heading = "help") {
 		if (ctx.mode !== "tui") {
 			ctx.ui.notify(markdown, "info");
@@ -2272,6 +2617,54 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
+	/** `/orchestrator movedir <json>` (internal, from ctrl+w inside a session): move it to another working directory. */
+	async function moveSessionCommand(ctx: ExtensionCommandContext, arg: string) {
+		let o: { id?: string; dir?: string; file?: string };
+		try {
+			o = JSON.parse(arg);
+		} catch {
+			return;
+		}
+		const id = typeof o.id === "string" ? o.id : undefined;
+		const dir = typeof o.dir === "string" ? o.dir : undefined;
+		if (!id || !dir) return;
+		if (isRunning(getAgent(id)))
+			return ctx.ui.notify("That agent is working: wait for it to finish or stop it (c) before moving it.", "warning");
+		const live = readLive().get(id);
+		const ours = live && (live.pid === process.pid || live.pid === getAgent(id)?.pid || live.bgParent === process.pid);
+		if (live && !ours) {
+			return ctx.ui.notify(
+				live.bgParent
+					? `It's a background agent of another pi (pid ${live.bgParent}) — stop it there first.`
+					: `It's open in another pi window (pid ${live.pid}) — close it there first.`,
+				"warning",
+			);
+		}
+		const file = (typeof o.file === "string" && fs.existsSync(o.file) ? o.file : undefined) ?? getAgent(id)?.sessionFile ?? findSessionFile(id);
+		if (!file || !fs.existsSync(file)) return ctx.ui.notify("That session isn't saved yet — nothing to move.", "warning");
+		try {
+			const moved = moveSessionDir(file, dir);
+			const a = getAgent(id);
+			if (a) setAgentDir(a.id, dir, moved);
+			if (ctx.sessionManager.getSessionId() === id) {
+				// This window holds it (attached / taken over): reopen at the new path, keeping the draft.
+				const draft = ctx.ui.getEditorText();
+				await ctx.switchSession(moved, {
+					withSession: async (c) => {
+						if (draft) c.ui.setEditorText(draft);
+						c.ui.notify(`📁 Session moved to ${prettyDir(dir)} — it now runs there.`, "info");
+					},
+				});
+			} else {
+				ctx.ui.notify(`📁 Session moved to ${prettyDir(dir)} — replies to it now run there.`, "info");
+			}
+			rowCache = [];
+			(globalThis as any)[ROWS_KEY] = [];
+		} catch (e) {
+			ctx.ui.notify(`Move failed: ${e instanceof Error ? e.message : String(e)}`, "error");
+		}
+	}
+
 	/** Orchestrator: make the current attached session run in this window (waits for a background run to finish). */
 	async function takeOverCurrent(ctx: ExtensionCommandContext) {
 		const ms = modeState();
@@ -2348,8 +2741,10 @@ export default function (pi: ExtensionAPI) {
 		// Orchestrator: coming back from a session puts the cursor on it (so `t` takes it over).
 		if (orchestrating() && !isHome(ctx)) uiState.selectedId = currentId;
 		// Reload when the cache predates the session we want selected (e.g. a just-started agent).
-		if (rowCache.length === 0 || (uiState.selectedId && !rowCache.some((r) => r.info.id === uiState.selectedId)))
+		if (rowCache.length === 0 || (uiState.selectedId && !rowCache.some((r) => r.info.id === uiState.selectedId))) {
 			rowCache = await loadRows(currentId);
+			(globalThis as any)[ROWS_KEY] = rowCache;
+		}
 
 		for (;;) {
 			const atHome = orchestrating() && isHome(ctx);
@@ -2367,6 +2762,7 @@ export default function (pi: ExtensionAPI) {
 						rowCache,
 						(rows) => {
 							rowCache = rows;
+							(globalThis as any)[ROWS_KEY] = rows; // feeds the dir picker's "recent" suggestions
 						},
 						atHome,
 						(row, name) => {
@@ -2433,6 +2829,59 @@ export default function (pi: ExtensionAPI) {
 				continue;
 			}
 
+			if (result.action === "movedir") {
+				const row = result.row;
+				// Live guards: the file mustn't move while someone holds it (this window included).
+				const live = readLive().get(row.info.id);
+				const ours = live && (live.pid === process.pid || live.pid === getAgent(row.info.id)?.pid || live.bgParent === process.pid);
+				if (isRunning(getAgent(row.info.id))) {
+					ctx.ui.notify("That agent is working: wait for it to finish or cancel it (c) before moving it.", "warning");
+					continue;
+				}
+				if (live && !ours) {
+					ctx.ui.notify(
+						live.bgParent
+							? `It's a background agent of another pi (pid ${live.bgParent}) — stop it there first.`
+							: `It's open in another pi window (pid ${live.pid}) — close it there first.`,
+						"warning",
+					);
+					continue;
+				}
+				if (!row.info.path || !fs.existsSync(row.info.path)) {
+					ctx.ui.notify("That session isn't saved yet — nothing to move.", "warning");
+					continue;
+				}
+				const pick = await pickDir(ctx, {
+					title: `move "${row.title.slice(0, 50)}" to directory`,
+					base: row.info.cwd,
+					initial: row.info.cwd,
+					hint: "rewrites the session's cwd and re-files it; the next reply runs there",
+				});
+				if (!pick || pick === row.info.cwd) continue;
+				try {
+					const moved = moveSessionDir(row.info.path, pick);
+					const a = getAgent(row.info.id);
+					if (a) setAgentDir(a.id, pick, moved);
+					if (row.isCurrent && !isHome(ctx)) {
+						// This window holds the session: reopen it at its new path so the live record and
+						// session id stay consistent. (isCurrent here can only be a taken-over session in
+						// the odd case where the inbox lists home itself — safe no-op otherwise.)
+						await ctx.switchSession(moved, {
+							withSession: async (c) => {
+								c.ui.notify(`📁 Session moved to ${prettyDir(pick)} — it now runs there.`, "info");
+							},
+						});
+					} else {
+						ctx.ui.notify(`📁 Session moved to ${prettyDir(pick)} — replies to it now run there.`, "info");
+					}
+					rowCache = [];
+					(globalThis as any)[ROWS_KEY] = [];
+				} catch (e) {
+					ctx.ui.notify(`Move failed: ${e instanceof Error ? e.message : String(e)}`, "error");
+				}
+				continue;
+			}
+
 			if (result.action === "view") {
 				const row = result.row;
 				// peeking counts as looking — except the session you're in: its manual unread (blue ») is intentional
@@ -2449,6 +2898,7 @@ export default function (pi: ExtensionAPI) {
 					{ overlay: true, overlayOptions: overlayOpts() },
 				);
 				rowCache = await loadRows(currentId);
+				(globalThis as any)[ROWS_KEY] = rowCache;
 				if (r?.action === "cancel") cancelAgent(row.info.id);
 				if (r?.action === "reply") {
 					const blocked = sendBlockedReason(row.info.id, row.info.path || undefined, ctx);
@@ -2628,7 +3078,10 @@ export default function (pi: ExtensionAPI) {
 			return items.length ? items : null;
 		},
 		handler: async (args, ctx) => {
-			const a = args.trim().toLowerCase();
+			const raw = args.trim();
+			// movedir is matched on raw args (it carries a JSON payload with case-sensitive paths).
+			if (raw.startsWith("movedir ")) return moveSessionCommand(ctx, raw.slice(8).trim()); // internal: ctrl+w on an open session
+			const a = raw.toLowerCase();
 			if (a === "" || a === "toggle") return setOrchestrator(ctx, !orchestrating());
 			if (a === "on") return setOrchestrator(ctx, true);
 			if (a === "off") return setOrchestrator(ctx, false);
@@ -2729,6 +3182,52 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// ctrl+w while a new agent's prompt is pending (or on orchestrator home): pick the
+	// directory that agent will run in. Not registered as a plain extension shortcut: ctrl+w is the
+	// editor's delete-word-backward, so it's consumed contextually in the onTerminalInput handler
+	// below (same pattern as esc-cancel) and passes through to the editor everywhere else.
+	// (alt+backspace still deletes a word while typing the prompt.)
+	async function pickNewAgentDir(ctx: ExtensionContext) {
+		const t = getReplyTarget();
+		const home = orchestrating() && isHome(ctx);
+		if (!t && !home) return;
+		const base = t?.kind === "new" ? t.cwd : ctx.cwd;
+		const dir = await pickDir(ctx, {
+			title: "directory for the new agent",
+			base,
+			initial: getNextAgentDir() ?? base,
+			hint: "agent runs here; its session, skills and AGENTS.md load from this directory",
+		});
+		if (!dir) return;
+		setNextAgentDir(dir);
+		showReplyWidget(ctx);
+	}
+
+	/**
+	 * ctrl+w inside an existing session (attached or taken over): pick a new working directory for
+	 * it, then route the move through the internal /orchestrator movedir command — commands own
+	 * session switching (switchSession needs a command context; this handler only gets the base one).
+	 */
+	async function moveCurrentSessionDir(c: ExtensionContext) {
+		const id = c.sessionManager.getSessionId();
+		if (isRunning(getAgent(id)))
+			return c.ui.notify("This session's background run is still going — wait for it or stop it (ctrl+shift+s) before moving it.", "warning");
+		const cwd = c.cwd;
+		const pick = await pickDir(c, {
+			title: "move this session to directory",
+			base: cwd,
+			initial: cwd,
+			hint: "rewrites the session's cwd and re-files it; it keeps running from there",
+		});
+		if (!pick || pick === cwd) return;
+		const file = c.sessionManager.getSessionFile()!;
+		const p = (G.__piInboxPi ?? pi) as ExtensionAPI;
+		setTimeout(
+			() => void Promise.resolve(p.sendUserMessage(`/orchestrator movedir ${JSON.stringify({ id, dir: pick, file })}`, { expandPromptTemplates: true })).catch(() => {}),
+			50,
+		);
+	}
+
 	// ── Reply routing: when a reply target is set, the next message typed in pi's own editor
 	// goes to that background agent (or starts a new one) instead of the foreground session.
 	// Extension and built-in slash commands run before this hook, so they are never captured.
@@ -2786,11 +3285,12 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		const preName = t.kind === "new" ? getNextAgentName() : undefined;
-		setReplyTarget(undefined, ctx); // one message per target
+		const preDir = t.kind === "new" ? getNextAgentDir() : undefined; // ctrl+w pick; captured before the target drops
+		setReplyTarget(undefined, ctx); // one message per target (also drops the pre-name/pre-dir)
 		if (event.images?.length) ctx.ui.notify("Images can't be sent to background agents yet — sent the text only.", "warning");
 
 		if (t.kind === "new") {
-			const a = spawnAgent({ prompt: text, cwd: t.cwd, model: t.model, title: preName ?? cleanTitle(text).slice(0, 120) });
+			const a = spawnAgent({ prompt: text, cwd: preDir ?? t.cwd, model: t.model, title: preName ?? cleanTitle(text).slice(0, 120) });
 			// ctrl+r pre-name: the child applies it as its session name (works before the file exists).
 			if (preName) renameAgent(a.id, preName);
 			uiState.view = "inbox";
@@ -2846,9 +3346,10 @@ export default function (pi: ExtensionAPI) {
 		// Orchestrator: a reply target never survives into an open session (see the input hook).
 		const rt = getReplyTarget();
 		if (rt && orchestrating() && (!isHome(ctx) || rt.kind !== "new")) setReplyTarget(undefined, ctx);
-		// A new-agent pre-name never follows you into another session.
-		if (!isHome(ctx) && getNextAgentName()) {
+		// A new-agent pre-name / pre-dir never follows you into another session.
+		if (!isHome(ctx) && (getNextAgentName() || getNextAgentDir())) {
 			setNextAgentName(undefined);
+			setNextAgentDir(undefined);
 			showReplyWidget(ctx);
 		}
 		// Started a new agent, then switched to another session: stop waiting for it, so it neither
@@ -2859,6 +3360,30 @@ export default function (pi: ExtensionAPI) {
 		}
 		G.__piInboxEscUnsub?.();
 		G.__piInboxEscUnsub = ctx.ui.onTerminalInput((data) => {
+			// ctrl+w opens the directory picker — for the pending new agent's prompt (or at orchestrator
+			// home), and inside an existing session (attached / taken over), where it moves that session
+			// to another directory. Everywhere else it's the editor's delete-word-backward, so it passes
+			// through untouched. editorFocused() keeps it off menus/pickers/autocomplete, and while the
+			// picker itself is up the reply-target check fails (the overlay holds focus), so the
+			// picker's own keys always win.
+			if (matchesKey(data, "ctrl+w")) {
+				const c = (G.__piInboxAgentsCtx as ExtensionContext | undefined) ?? ctx;
+				const t = getReplyTarget();
+				const home = orchestrating() && isHome(c);
+				if (editorFocused() && c.isIdle() && !modeState().inLoop) {
+					if (t?.kind === "new" || home) {
+						// New agent pending (or about to type one at home): pick its directory.
+						void pickNewAgentDir(c);
+						return { consume: true };
+					}
+					if (orchestrating() && c.sessionManager.getSessionFile()) {
+						// Inside an existing session: move it to another directory.
+						void moveCurrentSessionDir(c);
+						return { consume: true };
+					}
+				}
+				return undefined;
+			}
 			if (!getReplyTarget() || !matchesKey(data, "escape")) return undefined;
 			const c = (G.__piInboxAgentsCtx as ExtensionContext | undefined) ?? ctx;
 			if (!editorFocused() || !c.isIdle()) return undefined;

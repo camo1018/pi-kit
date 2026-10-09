@@ -213,7 +213,7 @@ function pump() {
 // ───────────────────────── persistence / survival ─────────────────────────
 
 export const AGENTS_DIR = path.join(getAgentDir(), "inbox-agents");
-const agentFile = (id: string, ext: "json" | "out" | "err" | "exit" | "stop" | "beat") => path.join(AGENTS_DIR, `${id}.${ext}`);
+const agentFile = (id: string, ext: "json" | "out" | "err" | "exit" | "stop" | "beat" | "name") => path.join(AGENTS_DIR, `${id}.${ext}`);
 /** Owner heartbeat cadence / how stale before another pi adopts the agent. */
 const OWNER_BEAT_MS = 5_000;
 const OWNER_STALE_MS = 20_000;
@@ -352,6 +352,19 @@ export function renameAgent(id: string, name: string) {
 	fs.mkdirSync(AGENTS_DIR, { recursive: true });
 	writeAtomic(agentFile(id, "name"), JSON.stringify({ name, at: Date.now() }));
 	if (a && !a.proc && !isRunning(a)) flushPendingName(a);
+}
+
+/**
+ * Re-point a background agent at a different working directory (used when its session is moved
+ * to another directory, or before a queued agent's first run). Safe only when it isn't running.
+ */
+export function setAgentDir(id: string, cwd: string, sessionFile?: string) {
+	const a = getAgent(id);
+	if (!a) return;
+	a.cwd = cwd;
+	if (sessionFile) a.sessionFile = sessionFile;
+	touch(a);
+	persist(a);
 }
 
 function requestStop(id: string) {

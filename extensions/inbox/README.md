@@ -34,6 +34,8 @@ Source: `~/Code/pi-kit/extensions/inbox/index.ts` (background agents: `~/Code/pi
 | `Q` | Orchestrator mode: leave the mode |
 | `n` | New background agent in the current directory, using this window's model. You type its prompt in pi's editor |
 | `N` | Same, picking its model first |
+| `ctrl+w` | (while typing a new agent's prompt) pick a different directory for it — a live path picker with suggestions as you type (see [Directories](#directories)) |
+| `d` | Orchestrator mode: move the selected session to a different directory (see [Directories](#directories)) |
 | `c` | Cancel a running background agent |
 | `p` | Pin / unpin |
 | `a` | Archive / unarchive |
@@ -79,7 +81,7 @@ What to expect:
 Orchestrator mode turns the window you're in into a full-screen control panel for agents. The inbox takes the whole terminal, as if it were the program, and pi's chat view never shows while you're in it. No new window or tab is opened.
 
 - **Turn it on:** `/orchestrator` in any window, or start with `pi --orchestrator`. If you're in a session, it stays saved and listed, and the window moves to the orchestrator. `/orchestrator` again (or `/orchestrator off`, or `Q` in the orchestrator) turns it off.
-- **New agent:** `n` (or `N` to pick the model) drops you into pi's own chat window at home, so you type the prompt in pi's normal editor (`$skill`, `@file`, same keys). `esc` cancels and returns to the list. Submitting starts the agent in this directory; its live progress shows above the editor, and once it has written its session file it opens **attached** (like `enter`). Messages you send while it's starting are queued for it. `ctrl+q` while waiting goes back to the list instead (no auto-open). The header shows how many agents are working or need you.
+- **New agent:** `n` (or `N` to pick the model) drops you into pi's own chat window at home, so you type the prompt in pi's normal editor (`$skill`, `@file`, same keys). `esc` cancels and returns to the list. Submitting starts the agent in this directory — unless you picked another with `ctrl+w` first; its live progress shows above the editor, and once it has written its session file it opens **attached** (like `enter`). Messages you send while it's starting are queued for it. `ctrl+q` while waiting goes back to the list instead (no auto-open). The header shows how many agents are working or need you.
 - **Everything runs in the background.** Nothing runs inside this window's pi unless you take a session over, so switching sessions never aborts anything.
 - **Open (attached):** `enter` (or `o`) opens a session in pi's own chat view, banner `📡 attached`. What you type there is sent to a background agent on that session; it doesn't run in this window. While it works, a live panel above the editor shows the prompt, tool calls and streaming text, and the full transcript (pi's normal rendering) reloads when the run finishes. Switch away any time; it keeps going.
   - Messages sent while it's working are **queued** for its next run. Mid-run steering is not possible.
@@ -94,6 +96,15 @@ Orchestrator mode turns the window you're in into a full-screen control panel fo
 - **Go home:** `h` in the orchestrator (or `/orchestrator home`) leaves the session; any run keeps going in the background.
 - **Behind the orchestrator** is a blank "home" session that pi never saves. `esc` there doesn't drop to the chat view. `ctrl+c` twice quits pi.
 - **Ownership:** agents started from this window belong to it, as usual. Quitting or closing this pi does *not* stop them: they keep running and another window (or the next pi you start) adopts them. Other windows see them as `● working`. Opening, taking over and leaving sessions doesn't stop them.
+
+## Directories
+
+A new background agent runs in this window's directory by default — that's where pi resolves `@` files, loads project `AGENTS.md` / `.pi/` resources, and files the session. Two ways to work somewhere else:
+
+- **`ctrl+w` while typing a new agent's prompt** (after `n`, before you send): opens a full-screen directory picker. It's like a shell prompt with autocomplete — as you type, the list below shows what your text means so far (`as typed`), its parent (`..`), home (`~`), child directories of the deepest existing part of your path (filtered by what you've typed past it), and working directories of your other sessions that match (`recent`). `↑` `↓` pick, `tab` fills the suggestion into the input like shell completion, `enter` accepts (the highlighted suggestion, or the typed path as-is), `esc` cancels. The banner above the editor shows the pending directory (`· dir ~/Code/foo`); the agent you then start runs there, files its session there, and loads that project's instructions and skills. The pick is one-shot — it drops when sent (like the `ctrl+r` pre-name) or if you cancel with `esc`.
+  - `ctrl+w` is normally the editor's delete-word-backward; it only opens the picker in the orchestrator situations above (pending new agent, orchestrator home, or an attached/taken-over session). While typing a new agent's prompt, use `alt+backspace` to delete a word.
+- **`d` on a session in the orchestrator list** moves that session to another directory: rewrites its stored `cwd`, re-files the `.jsonl` under the new directory's session folder, and re-points its background agent (if any) so the next reply runs there. Blocked while the agent is working (`c` to cancel first, or wait) or while the session is open in another window. If this window holds the session, it reopens it at the new path. Useful when a session started in the wrong repo, or a project moved. (Outside orchestrator mode, `d` is still archive.)
+- **`ctrl+w` while inside an attached or taken-over session** does the same for the session on screen: pick a directory and it's re-homed (the chat reopens at the new path, any text you were typing stays in the editor). Same guards: its background run must be idle. In a normal (non-orchestrator) window, `ctrl+w` keeps its usual delete-word meaning.
 
 ## Views
 
