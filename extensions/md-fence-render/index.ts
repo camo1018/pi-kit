@@ -113,25 +113,58 @@ export function renderMarkdownFences(markdown: string): string {
 	return out.join("\n");
 }
 
-type Token = { type: string; lang?: string };
+type Token = { type: string; lang?: string; text?: string };
 type MdTheme = { codeBlockBorder(s: string): string };
 type RenderToken = (
 	this: { theme: MdTheme },
 	token: Token,
 	...rest: unknown[]
 ) => string[];
+type CodeHit = {
+	start: number;
+	end: number;
+	lang: string;
+	code: string;
+};
+type PendingCode = CodeHit & {
+	openLine: string;
+	closeLine: string;
+};
 
 const ORIGINAL = Symbol.for("pi-kit:md-fence-render:renderToken");
+const ORIGINAL_RENDER = Symbol.for("pi-kit:md-fence-render:render");
+const ORIGINAL_MOUSE = Symbol.for("pi-kit:md-fence-render:handleMouse");
+const PENDING_CODES = Symbol.for("pi-kit:md-fence-render:pendingCodes");
+const CODE_HITS = Symbol.for("pi-kit:md-fence-render:codeHits");
+const CODE_HITS_KEY = Symbol.for("pi-kit:md-fence-render:codeHitsKey");
+const CLICK_COPY = Symbol.for("pi-kit:snippet-copy:click");
 
-/** Replace code fence lines with a label; keep highlighted code lines. */
+function findLine(
+	lines: string[],
+	needle: string,
+	start: number,
+): number {
+	for (let i = start; i < lines.length; i++) {
+		if (lines[i].includes(needle)) return i;
+	}
+	return -1;
+}
+
+/** Replace code fences and make their rendered rows clickable in fullscreen. */
 function patchCodeBlocks() {
-	const proto = Markdown.prototype as unknown as {
-		renderToken: RenderToken;
-		[ORIGINAL]?: RenderToken;
-	};
-	// Keep the true original across /reload so patches don't stack.
-	const original = (proto[ORIGINAL] ??= proto.renderToken);
-	proto.renderToken = function (token, ...rest) {
+	const proto = Markdown.prototype as any;
+	// Keep the true originals across /reload so patches don't stack.
+	const original = (proto[ORIGINAL] ??= proto.renderToken) as RenderToken;
+	if (!(ORIGINAL_RENDER in proto)) {
+		proto[ORIGINAL_RENDER] = proto.render;
+	}
+	if (!(ORIGINAL_MOUSE in proto)) {
+		proto[ORIGINAL_MOUSE] = proto.handleMouse;
+	}
+	const originalRender = proto[ORIGINAL_RENDER];
+	const originalMouse = proto[ORIGINAL_MOUSE];
+
+	proto.renderToken = function (token: Token, ...rest: unknown[]) {
 		const lines = original.call(this, token, ...rest);
 		if (token?.type !== "code" || lines.length < 2) return lines;
 		const border = (s: string) => this.theme.codeBlockBorder(s);
@@ -141,7 +174,68 @@ function patchCodeBlocks() {
 		const out = [...lines];
 		out[close] = border(CLOSE);
 		out[0] = border(`${OPEN} ${token.lang || "code"}`);
+		(this[PENDING_CODES] ??= []).push({
+			start: 0,
+			end: 0,
+			lang: token.lang ?? "",
+			code: token.text ?? "",
+			openLine: out[0],
+			closeLine: out[close],
+		} satisfies PendingCode);
 		return out;
+	};
+
+	proto.render = function (width: number) {
+		this[PENDING_CODES] = [];
+		const key = `${width}\0${this.text ?? ""}`;
+		const lines = originalRender.call(this, width) as string[];
+		const pending = this[PENDING_CODES] as PendingCode[];
+		if (!pending.length) {
+			if (this[CODE_HITS_KEY] !== key) this[CODE_HITS] = [];
+			this[CODE_HITS_KEY] = key;
+			return lines;
+		}
+		const hits: CodeHit[] = [];
+		let cursor = 0;
+		for (const code of pending) {
+			const start = findLine(lines, code.openLine, cursor);
+			if (start < 0) continue;
+			const end = findLine(lines, code.closeLine, start + 1);
+			if (end < 0) continue;
+			hits.push({
+				start,
+				end,
+				lang: code.lang,
+				code: code.code,
+			});
+			cursor = end + 1;
+		}
+		this[CODE_HITS] = hits;
+		this[CODE_HITS_KEY] = key;
+		return lines;
+	};
+
+	proto.handleMouse = function (event: any) {
+		const prior = originalMouse?.call(this, event);
+		if (prior) return prior;
+		if (event.button !== "left") return undefined;
+		const hit = (this[CODE_HITS] as CodeHit[] | undefined)?.find(
+			(code) => event.y >= code.start && event.y <= code.end,
+		);
+		const copy = (globalThis as any)[CLICK_COPY];
+		if (!hit || typeof copy !== "function") return undefined;
+		if (event.type === "click") {
+			copy({ lang: hit.lang, code: hit.code });
+			return { handled: true };
+		}
+		if (
+			event.type === "press" ||
+			event.type === "release" ||
+			event.type === "drag"
+		) {
+			return { handled: true, render: false };
+		}
+		return undefined;
 	};
 }
 

@@ -92,6 +92,56 @@ const PROBES: Probe[] = [
 			}
 		},
 	},
+	{
+		ext: "md-fence-render",
+		id: "code-block-click-routes",
+		check: () => {
+			if (!hasMethod(T.Markdown, "handleMouse")) {
+				return "Markdown.handleMouse click patch is missing";
+			}
+			const key = Symbol.for("pi-kit:snippet-copy:click");
+			const previous = (globalThis as any)[key];
+			let copied: any;
+			(globalThis as any)[key] = (block: any) => {
+				copied = block;
+			};
+			const same = (s: string) => s;
+			const theme = new Proxy({} as any, {
+				get: (_t, name) => {
+					if (name === "codeBlockIndent") return "";
+					if (name === "highlightCode") return undefined;
+					return same;
+				},
+			});
+			try {
+				const md = new T.Markdown(
+					"```bash\necho hi\n```",
+					0,
+					0,
+					theme,
+				);
+				const lines = md.render(60) as string[];
+				const y = lines.findIndex((line) => line.includes("echo hi"));
+				if (y < 0) return "rendered code row was not found";
+				const press = md.handleMouse({
+					type: "press",
+					button: "left",
+					y,
+				});
+				md.handleMouse({ type: "click", button: "left", y });
+				if (!press?.handled) return "code-block press was not claimed";
+				if (copied?.code !== "echo hi") {
+					return "code-block click did not route exact source";
+				}
+				return true;
+			} catch (e) {
+				return `clicking a code block threw: ${(e as Error).message}`;
+			} finally {
+				if (previous === undefined) delete (globalThis as any)[key];
+				else (globalThis as any)[key] = previous;
+			}
+		},
+	},
 
 	// ── tool-output-hide ─────────────────────────────────────────────
 	{
