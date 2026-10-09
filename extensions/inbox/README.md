@@ -13,6 +13,7 @@ Source: `~/Code/pi-kit/extensions/inbox/index.ts` (background agents: `~/Code/pi
 | `/orchestrator home` | Orchestrator mode: leave this session (it keeps running in the background) and return to the orchestrator |
 | `/takeover` | Orchestrator mode: run this session here, like plain pi (waits for a background run to finish first) |
 | `/stop` or `ctrl+shift+s` | Orchestrator mode: stop this attached session's background run |
+| `/queue` or `alt+up` | Orchestrator mode: manage this attached session's queued messages; send one now or remove it |
 | `/inbox help` | Show this doc (also `?` inside the inbox) |
 | `/inbox filters` | Show the active filter rules, how many sessions each hides, and any rule errors |
 | `/pin` | Toggle pin on the current session |
@@ -37,6 +38,7 @@ Source: `~/Code/pi-kit/extensions/inbox/index.ts` (background agents: `~/Code/pi
 | `ctrl+w` | (while typing a new agent's prompt) pick a different directory for it — a live path picker with suggestions as you type (see [Directories](#directories)) |
 | `d` | Orchestrator mode: move the selected session to a different directory (see [Directories](#directories)) |
 | `c` | Cancel a running background agent |
+| `m` | Manage the selected agent's queued messages (when it has any) |
 | `p` | Pin / unpin |
 | `a` | Archive / unarchive |
 | `u` | Mark read / unread (toggles the `•` dot). On the session you're in: marks it unread on purpose — the `»` turns blue until you open it again from the inbox or switch away (a run finishing in front of you doesn't clear it) |
@@ -58,8 +60,9 @@ A background agent is a separate pi process working on its own session while you
 - **Model:** the banner shows which model the message will use: this window's model for a new agent, the agent's own model for a reply. Change it while the reply is pending (`ctrl+p`, `ctrl+l`, `/model`, `shift+tab` for thinking) and the banner follows, marked `(changed)`; the message runs on that model, and the agent keeps it afterwards. This uses pi's normal model selector, so it changes this window's session model too. (A background run writes its thinking level into the session file at startup. Pi itself doesn't record a `--model x:level` override when it resumes a session, so without this, later runs would restore an older level, often `off`.)
 - **Watch it:** `enter` on any row opens the agent view, a live, read-only transcript of the session. While the agent works, its current run streams under the transcript as a progress log (prompt, tool calls with `…` while running and `✗` on error, replies in flight).
 - **Reply:** `r` (or `enter`) in the agent view, then type in the editor.
-  - If the agent is working, the reply is **queued** and delivered as its next turn when the current run finishes.
+  - If the agent is working, the reply is **queued**. Queued messages run one at a time, in order, after the current run finishes.
   - If it's idle, the reply starts a new run in the background right away.
+  - In orchestrator mode, use `/queue` or `alt+up` in an attached session (or `m` on its orchestrator row) to choose any queued message. `enter` stops the current background run, puts that message first, and resumes from the completed session history; `d`, `delete`, or `backspace` removes it without affecting the run.
   - This works on **any** idle session, not just ones started with `n`. Replying turns it into a background agent.
 - **Keys in the agent view:** `enter`/`r` reply, `o` open the session here, `c` cancel the agent, `↑` `↓` `j` `k` `PgUp` `PgDn` `space` `g` `G` scroll (it follows the bottom while you're there), `esc`/`q` close. Only plain keys: pi reserves most ctrl combos (e.g. `ctrl+o`, `ctrl+x`).
 - **Know when they're done:** the footer shows e.g. `agents: 2 working · 1 needs you`. When an agent finishes you get a notification and a sound (from the sound settings in `~/.pi/agent/notify.json`), and its row gets a `•` before the title until you look at it (see Unread below).
@@ -84,8 +87,8 @@ Orchestrator mode turns the window you're in into a full-screen control panel fo
 - **New agent:** `n` (or `N` to pick the model) drops you into pi's own chat window at home, so you type the prompt in pi's normal editor (`$skill`, `@file`, same keys). `esc` cancels and returns to the list. Submitting starts the agent in this directory — unless you picked another with `ctrl+w` first; its live progress shows above the editor, and once it has written its session file it opens **attached** (like `enter`). Messages you send while it's starting are queued for it. `ctrl+q` while waiting goes back to the list instead (no auto-open). The header shows how many agents are working or need you.
 - **Everything runs in the background.** Nothing runs inside this window's pi unless you take a session over, so switching sessions never aborts anything.
 - **Open (attached):** `enter` (or `o`) opens a session in pi's own chat view, banner `📡 attached`. What you type there is sent to a background agent on that session; it doesn't run in this window. While it works, the run **streams into the transcript itself** — appended after what's on screen, rendered with pi's own message components, so a working agent looks exactly like a foreground one: your prompt, the agent's thinking/text as it's written, every tool call with its result, growing downward in the scrollable area (never in the fixed editor dock). Scroll it exactly like any transcript: wheel, `pageUp`/`pageDown` (when the editor is empty), or the terminal's own scrollback. A one-line status above the editor shows only what the transcript can't: the run's state (`⟳ working in the background` / `↻ loading` / `⏸ queued`) and a count of your queued messages — no response content. When the run finishes, the stream is replaced by the real transcript reloaded from disk (same content, no duplicates). Switch away any time; it keeps going.
-  - Messages sent while it's working are **queued** for its next run. Mid-run steering is not possible.
-  - `ctrl+shift+s` (or `/stop`) stops the background run. esc only interrupts runs in this window.
+  - Messages sent while it's working are **queued**, one message per subsequent run. Use `/queue` or `alt+up` to manage them. Choose a message and press `enter` to stop the current run and send that message now, then continue from the session's completed history. Press `d`, `delete`, or `backspace` to remove the selected message. The same manager is available with `m` on an agent's orchestrator row.
+  - `ctrl+shift+s` (or `/stop`) stops the background run and clears its queue. esc only interrupts runs in this window.
   - `/compact` and `/tree` are refused while the background run is going, because they would write to the session at the same time. They work normally once it's idle.
   - `/fork` and `/clone` work mid-run, because they only create a new session. `/clone` copies the session from disk up to the agent's last completed step, not the on-screen snapshot. The step in flight (an unanswered tool call or a prompt still being worked on) is left out. The background run carries on in the original session.
   - Model changes (`ctrl+p`, `ctrl+l`, `/model`, `shift+tab`) apply to the next background run.

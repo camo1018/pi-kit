@@ -57,6 +57,7 @@ import {
 	getSelectListTheme,
 	parseSkillBlock,
 	SessionManager,
+	SettingsManager,
 	ToolExecutionComponent,
 	UserMessageComponent,
 } from "@earendil-works/pi-coding-agent";
@@ -98,7 +99,9 @@ import {
 	startAgentSupervisor,
 	releaseAgent,
 	releaseHold,
+	removeQueuedMessage,
 	renameAgent,
+	sendQueuedMessageNow,
 	sendToAgent,
 	sessionModel,
 	spawnAgent,
@@ -855,6 +858,7 @@ type InboxResult =
 	| { action: "view"; row: Row }
 	| { action: "new"; pickModel: boolean }
 	| { action: "cancel"; row: Row }
+	| { action: "queue"; row: Row }
 	| { action: "movedir"; row: Row }
 	| { action: "home" }
 	| { action: "exitMode" }
@@ -1166,6 +1170,12 @@ class InboxComponent {
 		} else if (ch === "c") {
 			if (row && isRunning(row.bg)) this.done({ action: "cancel", row });
 			else this.say("not a running background agent");
+		} else if (ch === "m") {
+			if (row?.bg?.pending.length) {
+				this.done({ action: "queue", row });
+			} else {
+				this.say("that agent has no queued messages");
+			}
 		} else if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || ch === "q") {
 			if (this.state.query) {
 				this.state.query = "";
@@ -1435,6 +1445,7 @@ class InboxComponent {
 					k("N", "new (pick model)"),
 					k("v", "peek"),
 					...(isRunning(r?.bg) ? [k("c", "cancel")] : []),
+					...(r?.bg?.pending.length ? [k("m", "manage queue")] : []),
 					...(r && !isRunning(r?.bg) ? [k("d", "move dir")] : []),
 					...(this.atHome ? [] : [k("h", "hand back"), k("esc", "back to session")]),
 					k("p", r?.meta.pinnedAt ? "unpin" : "pin"),
@@ -1453,6 +1464,9 @@ class InboxComponent {
 						k("o", "open here"),
 						k("n", "new agent"),
 						...(isRunning(r?.bg) ? [k("c", "cancel")] : []),
+						...(r?.bg?.pending.length
+							? [k("m", "manage queue")]
+							: []),
 						k("p", r?.meta.pinnedAt ? "unpin" : "pin"),
 						k("a", archLabel),
 						k("u", r?.unread ? "mark read" : "mark unread"),
@@ -1731,6 +1745,176 @@ class ConfirmComponent {
 	}
 }
 
+// ───────────────────────────── queued messages ─────────────────────────────
+
+type QueueManagerResult =
+	| { action: "close" }
+	| {
+			action: "send";
+			message: string;
+			interrupted: boolean;
+		};
+
+/** Pick, remove, or immediately deliver one background-agent message. */
+class QueueManagerComponent {
+	private selected = 0;
+	private scroll = 0;
+	private flash?: string;
+
+	constructor(
+		private tui: TUI,
+		private theme: Theme,
+		private done: (result: QueueManagerResult) => void,
+		private id: string,
+		private title: string,
+	) {}
+
+	invalidate() {}
+
+	private messages(): string[] {
+		return getAgent(this.id)?.pending ?? [];
+	}
+
+	private clamp() {
+		this.selected = Math.max(
+			0,
+			Math.min(this.selected, this.messages().length - 1),
+		);
+	}
+
+	handleInput(data: string) {
+		const messages = this.messages();
+		this.clamp();
+		const ch = printable(data);
+		if (
+			matchesKey(data, "escape") ||
+			matchesKey(data, "ctrl+c") ||
+			ch === "q"
+		) {
+			return this.done({ action: "close" });
+		}
+		if (matchesKey(data, "up") || ch === "k") {
+			this.selected--;
+			this.clamp();
+		} else if (matchesKey(data, "down") || ch === "j") {
+			this.selected++;
+			this.clamp();
+		} else if (
+			matchesKey(data, "delete") ||
+			matchesKey(data, "backspace") ||
+			ch === "d"
+		) {
+			const message = messages[this.selected];
+			if (!message) {
+				this.flash = "nothing is queued";
+			} else if (
+				removeQueuedMessage(this.id, this.selected, message) === undefined
+			) {
+				this.flash = "the queue changed; try again";
+			} else {
+				this.flash = "removed from queue";
+				this.clamp();
+			}
+		} else if (
+			matchesKey(data, "enter") ||
+			matchesKey(data, "return")
+		) {
+			const message = messages[this.selected];
+			const result = message
+				? sendQueuedMessageNow(this.id, this.selected, message)
+				: undefined;
+			if (!result) {
+				this.flash = message
+					? "the queue changed; try again"
+					: "nothing is queued";
+			} else {
+				return this.done({
+					action: "send",
+					message: result.message,
+					interrupted: result.interrupted,
+				});
+			}
+		}
+		this.tui.requestRender();
+	}
+
+	render(width: number): string[] {
+		const th = this.theme;
+		const innerW = Math.max(30, width - 2);
+		const b = (s: string) => th.fg("borderMuted", s);
+		const line = (s: string) => b("│") + fit(s, innerW) + b("│");
+		const sep = () => b(`├${"─".repeat(innerW)}┤`);
+		const rows = Math.max(14, this.tui.terminal?.rows ?? 30);
+		const messages = this.messages();
+		this.clamp();
+		const agent = getAgent(this.id);
+		const heading = `📥 Pi Inbox · queued messages · ${this.title}`;
+		const title = ` ${th.bold(th.fg("accent", heading))} `;
+		const out = [
+			b("╭─") +
+				title +
+				b("─".repeat(Math.max(0, innerW - 1 - visibleWidth(title)))) +
+				b("╮"),
+		];
+		const state = !messages.length
+			? "the queue is empty"
+			: agent?.restartAfterInterrupt
+				? "stopping the current run; the selected message runs next"
+				: agent?.proc
+					? "the current run keeps going unless you choose send now"
+					: "waiting to start the next queued message";
+		out.push(line(` ${th.fg("dim", state)}`));
+		out.push(sep());
+
+		const listH = Math.max(3, rows - 9);
+		if (this.selected < this.scroll) this.scroll = this.selected;
+		if (this.selected >= this.scroll + listH) {
+			this.scroll = this.selected - listH + 1;
+		}
+		this.scroll = Math.max(
+			0,
+			Math.min(this.scroll, Math.max(0, messages.length - listH)),
+		);
+		for (let i = 0; i < listH; i++) {
+			const index = this.scroll + i;
+			const message = messages[index];
+			if (message === undefined) {
+				const empty = i === 0 && messages.length === 0;
+				out.push(
+					line(empty ? ` ${th.fg("dim", "(queue is empty)")}` : ""),
+				);
+				continue;
+			}
+			const selected = index === this.selected;
+			const marker = selected ? th.fg("accent", "▶") : " ";
+			const text = message.replace(/\s+/g, " ").trim();
+			const row = ` ${marker} ${th.fg("dim", `${index + 1}.`)} ${text}`;
+			out.push(line(selected ? th.bg("selectedBg", row) : row));
+		}
+		out.push(sep());
+		const selected = messages[this.selected];
+		const preview = selected
+			? wrapTextWithAnsi(selected, Math.max(10, innerW - 2)).slice(0, 2)
+			: [];
+		for (let i = 0; i < 2; i++) {
+			out.push(line(preview[i] ? ` ${preview[i]}` : ""));
+		}
+		const k = (key: string, label: string) =>
+			`${th.fg("accent", key)} ${th.fg("dim", label)}`;
+		const help = this.flash
+			? th.fg("success", this.flash)
+			: [
+					k("↑↓", "choose"),
+					k("enter", "interrupt + send now"),
+					k("d/delete", "remove"),
+					k("esc", "close"),
+				].join(th.fg("dim", " · "));
+		out.push(line(` ${help}`));
+		out.push(b(`╰${"─".repeat(innerW)}╯`));
+		return out.slice(0, rows).map((l) => truncateToWidth(l, width));
+	}
+}
+
 // ───────────────────────────── directory picker ─────────────────────────────
 
 /** Directory for the next new background agent, set with ctrl+w before sending its first prompt. */
@@ -1982,10 +2166,26 @@ function showReplyWidget(ctx: ExtensionContext) {
 		return new Text(text + cancel, 1, 0);
 	});
 }
-/** The focused component if it's pi's main editor (no dialog, picker, or overlay up). */
+/** The active TUI, including when no reply widget has captured it. */
+function activeInboxTui(ctx?: ExtensionContext): TUI | undefined {
+	const global = globalThis as any;
+	return (
+		global.__piInboxTui ??
+		global[Symbol.for("pi.inbox.tui")] ??
+		(ctx?.ui as any)?.tui
+	) as TUI | undefined;
+}
+
+/** The focused component if it's pi's main editor (no dialog or overlay). */
 function focusedEditor(): any {
-	const f = ((globalThis as any).__piInboxTui as any)?.getFocusedComponent?.() as any;
-	if (!f || typeof f.getText !== "function" || typeof f.insertTextAtCursor !== "function") return undefined;
+	const f = activeInboxTui()?.getFocusedComponent?.() as any;
+	if (
+		!f ||
+		typeof f.getText !== "function" ||
+		typeof f.insertTextAtCursor !== "function"
+	) {
+		return undefined;
+	}
 	if (typeof f.isShowingAutocomplete === "function" && f.isShowingAutocomplete()) return undefined;
 	return f;
 }
@@ -2025,6 +2225,8 @@ interface ModeState {
 	skipReopen?: boolean;
 }
 const MODE_KEY = Symbol.for("pi.inbox.mode");
+/** Agent id whose queue manager currently owns an overlay. */
+const QUEUE_MANAGER_KEY = Symbol.for("pi.inbox.queueManagerOpen");
 /** The TUI the inbox overlay last drew on (lets the inbox trigger a redraw when it closes). */
 const INBOX_TUI_KEY = Symbol.for("pi.inbox.tui");
 const modeState = (): ModeState => {
@@ -2114,16 +2316,49 @@ function showModeWidget(ctx: ExtensionContext) {
 	if (!ctx.hasUI) return;
 	if (!orchestrating() || isHome(ctx)) return ctx.ui.setWidget("inbox-mode", undefined);
 	const th = ctx.ui.theme;
-	const k = (key: string, label: string) => `${th.fg("accent", key)} ${th.fg("dim", label)}`;
+	const k = (key: string, label: string) =>
+		`${th.fg("accent", key)} ${th.fg("dim", label)}`;
 	const sep = th.fg("dim", " · ");
 	const id = ctx.sessionManager.getSessionId();
 	const ms = modeState();
+	const agent = getAgent(id);
+	const queued = agent?.pending.length ?? 0;
+	const queueKey =
+		getKeybindings().getKeys("app.message.dequeue").join("/") ||
+		"alt+up";
 	const text = ms.takenOver.has(id)
-		? [th.bold(th.fg("warning", "🎮 Orchestrator · taken over (runs here)")), k("ctrl+q", "orchestrator"), k("ctrl+q → h", "hand back")]
+		? [
+				th.bold(
+					th.fg(
+						"warning",
+						"🎮 Orchestrator · taken over (runs here)",
+					),
+				),
+				k("ctrl+q", "orchestrator"),
+				k("ctrl+q → h", "hand back"),
+			]
 		: [
-				th.bold(th.fg("accent", "📡 Orchestrator · attached (runs in background)")),
-				ms.takeoverWhenDone.has(id) ? th.fg("warning", "⏳ takes over when this run finishes") : k("/takeover", "run here"),
-				...(isRunning(getAgent(id)) ? [k("ctrl+shift+s", "stop run")] : []),
+				th.bold(
+					th.fg(
+						"accent",
+						"📡 Orchestrator · attached (runs in background)",
+					),
+				),
+				...(queued
+					? [
+							th.fg("warning", `⏳ ${queued} queued`),
+							k(queueKey, "manage queue"),
+						]
+					: []),
+				ms.takeoverWhenDone.has(id)
+					? th.fg(
+							"warning",
+							"⏳ takes over when this run finishes",
+						)
+					: k("/takeover", "run here"),
+				...(isRunning(agent)
+					? [k("ctrl+shift+s", "stop run")]
+					: []),
 				k("ctrl+q", "orchestrator"),
 			];
 	ctx.ui.setWidget("inbox-mode", [text.join(sep)]);
@@ -2141,34 +2376,80 @@ function showModeWidget(ctx: ExtensionContext) {
 // refreshCurrent() reloads the real transcript from the session file and the stream is removed —
 // same content, no duplicates.
 
+const LIVE_STREAM_COMPONENT_KEY = Symbol.for(
+	"pi.inbox.liveStreamComponent",
+);
+
 /** A cached message rendering: rebuilt only when its message's rev changes (a rev is bumped on
  * every delta), so each streamed token rebuilds exactly one assistant component — the rest render
  * from their own caches. Tool rows live inside the same cached entry: a ToolExecutionComponent
  * per call, updated in place for partial results. */
 class LiveMsgCache {
-	entry?: { rev: number; parts: any[] };
+	entry?: {
+		source: any;
+		rev: number;
+		hideThinkingBlock: boolean;
+		parts: any[];
+	};
 
-	get(m: any, md: any, th: Theme, tui: TUI): any[] {
-		if (this.entry && this.entry.rev === m.rev) {
-			// Streaming continues on the same message: update it in place (cheap re-render of one
-			// component). Finished messages keep rendering from their cache untouched.
+	get(
+		m: any,
+		md: any,
+		th: Theme,
+		tui: TUI,
+		hideThinkingBlock: boolean,
+	): any[] {
+		if (
+			this.entry &&
+			this.entry.source === m &&
+			this.entry.rev === m.rev &&
+			this.entry.hideThinkingBlock === hideThinkingBlock
+		) {
+			// Streaming continues on the same message: update it in place.
 			const first = this.entry.parts[0];
-			if (first?.updateContent && m.role === "assistant") first.updateContent(m.message, true);
+			if (first?.updateContent && m.role === "assistant") {
+				first.updateContent(m.message, true);
+			}
 			return this.entry.parts;
 		}
 		const parts: any[] = [];
 		if (m.role === "user") {
 			const sb = parseSkillBlock(m.text ?? "");
-			parts.push(sb ? new SkillLine(th, sb.name ?? "skill", sb.userMessage) : new UserMessageComponent(m.text ?? "", md, 0));
+			parts.push(
+				sb
+					? new SkillLine(th, sb.name ?? "skill", sb.userMessage)
+					: new UserMessageComponent(m.text ?? "", md, 0),
+			);
 		} else {
-			parts.push(new AssistantMessageComponent(m.message, true, md, "Thinking…", 0));
+			parts.push(
+				new AssistantMessageComponent(
+					m.message,
+					hideThinkingBlock,
+					md,
+					"Thinking…",
+					0,
+				),
+			);
 			for (const t of m.tools ?? []) {
-				const tc = new ToolExecutionComponent(t.name, t.id, t.args, { showImages: false }, undefined, tui, "");
+				const tc = new ToolExecutionComponent(
+					t.name,
+					t.id,
+					t.args,
+					{ showImages: false },
+					undefined,
+					tui,
+					"",
+				);
 				if (t.result) tc.updateResult(t.result);
 				parts.push(tc);
 			}
 		}
-		this.entry = { rev: m.rev, parts };
+		this.entry = {
+			source: m,
+			rev: m.rev,
+			hideThinkingBlock,
+			parts,
+		};
 		return parts;
 	}
 }
@@ -2178,16 +2459,37 @@ class LiveMsgCache {
  * message rev and only rebuilds the message that moved (its tools update in place). No scroll
  * logic here: the stream lives in the scrollable document, so pi's own ScrollView (fullscreen)
  * or the terminal scrollback (regular mode) does all of it, exactly like the transcript. */
-export class LiveStreamComponent {
-	private children: any[] = [];
+export class LiveStreamComponent extends Container {
+	readonly [LIVE_STREAM_COMPONENT_KEY] = true;
+	readonly cacheVersion = 3;
 	private cache: LiveMsgCache[] = [];
+	private syncedRun?: object;
 	private syncedKey = "";
 
 	constructor(
 		private tui: TUI,
 		private theme: Theme,
 		private target: () => string,
-	) {}
+		private hideThinkingBlock: boolean,
+		private promptInSnapshot: boolean,
+	) {
+		super();
+	}
+
+	setViewOptions(
+		hideThinkingBlock: boolean,
+		promptInSnapshot: boolean,
+	): void {
+		if (
+			hideThinkingBlock === this.hideThinkingBlock &&
+			promptInSnapshot === this.promptInSnapshot
+		) {
+			return;
+		}
+		this.hideThinkingBlock = hideThinkingBlock;
+		this.promptInSnapshot = promptInSnapshot;
+		this.syncedKey = "";
+	}
 
 	agentId(): string {
 		return this.target();
@@ -2196,8 +2498,18 @@ export class LiveStreamComponent {
 	/** Rebuild the child list when anything changed. Unchanged messages reuse their components. */
 	private sync(): boolean {
 		const a = getAgent(this.target());
-		const msgs = a?.liveRun?.msgs ?? [];
-		const lastRev = msgs.length ? `${msgs.length}:${msgs[msgs.length - 1].rev}` : "0";
+		const run = a?.liveRun;
+		const msgs = run?.msgs ?? [];
+		if (run !== this.syncedRun) {
+			// Revisions restart at one for every queued run. Reusing the prior
+			// run's cache would render its prompt until the transcript reloads.
+			this.syncedRun = run;
+			this.syncedKey = "";
+			this.cache = [];
+		}
+		const lastRev = msgs.length
+			? `${msgs.length}:${msgs[msgs.length - 1].rev}`
+			: "0";
 		const key = lastRev;
 		if (key === this.syncedKey) return false;
 		this.syncedKey = key;
@@ -2207,9 +2519,21 @@ export class LiveStreamComponent {
 		const md = getMarkdownTheme();
 		const th = this.theme;
 		const next: any[] = [];
-		for (let i = 0; i < msgs.length; i++) {
-			if (i > 0 && msgs[i].role === "user") next.push(new Spacer(1));
-			next.push(...this.cache[i].get(msgs[i], md, th, this.tui));
+		const start =
+			this.promptInSnapshot && msgs[0]?.role === "user" ? 1 : 0;
+		for (let i = start; i < msgs.length; i++) {
+			if (i > start && msgs[i].role === "user") {
+				next.push(new Spacer(1));
+			}
+			next.push(
+				...this.cache[i].get(
+					msgs[i],
+					md,
+					th,
+					this.tui,
+					this.hideThinkingBlock,
+				),
+			);
 		}
 		this.children = next;
 		return true;
@@ -2217,13 +2541,12 @@ export class LiveStreamComponent {
 
 	render(width: number): string[] {
 		this.sync();
-		const out: string[] = [];
-		for (const c of this.children) out.push(...c.render(width));
-		return out;
+		return super.render(width);
 	}
 
 	invalidate(): void {
-		this.syncedKey = ""; // force re-sync; parts re-render via their own components
+		this.syncedKey = "";
+		super.invalidate();
 	}
 	dispose(): void {}
 }
@@ -2254,23 +2577,130 @@ function chatContainer(tui: TUI): any | undefined {
 	return Array.isArray(chat?.children) ? chat : undefined;
 }
 
-/** Live stream for an attached session while its background run is going (the chat view reloads when it ends). */
+let thinkingVisibilityCache:
+	| { key: string; checkedAt: number; hidden: boolean }
+	| undefined;
+
+/** Read Pi's effective global/project setting, with a short streaming cache. */
+function thinkingBlocksHidden(ctx: ExtensionContext): boolean {
+	const trusted = ctx.isProjectTrusted();
+	const key = `${ctx.cwd}\0${trusted}`;
+	const now = Date.now();
+	if (
+		thinkingVisibilityCache?.key === key &&
+		now - thinkingVisibilityCache.checkedAt < 500
+	) {
+		return thinkingVisibilityCache.hidden;
+	}
+	let hidden = false;
+	try {
+		hidden = SettingsManager.create(ctx.cwd, AGENT_DIR, {
+			projectTrusted: trusted,
+		}).getHideThinkingBlock();
+	} catch {
+		// Match Pi's default if settings cannot be read.
+	}
+	thinkingVisibilityCache = { key, checkedAt: now, hidden };
+	return hidden;
+}
+
+/** Whether Pi's loaded transcript already rendered this run's prompt. */
+function snapshotHasRunPrompt(
+	ctx: ExtensionContext,
+	a: BgAgent,
+): boolean {
+	if (!a.runPrompt) return false;
+	let branch: readonly any[];
+	try {
+		branch = ctx.sessionManager.getBranch();
+	} catch {
+		return false;
+	}
+	const expected = cleanTitle(a.runPrompt);
+	for (let i = branch.length - 1; i >= 0; i--) {
+		const entry = branch[i];
+		const timestamp = Date.parse(entry?.timestamp ?? "");
+		if (
+			a.runStartedAt &&
+			Number.isFinite(timestamp) &&
+			timestamp < a.runStartedAt - 5_000
+		) {
+			break;
+		}
+		if (entry?.type !== "message") continue;
+		if (entry.message?.role !== "user") continue;
+		if (cleanTitle(messageText(entry.message.content)) === expected) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/** Remove live-stream mounts left behind by this or an older extension load. */
+function removeStaleLiveStreams(
+	chat: any,
+	keep?: LiveStreamComponent,
+): void {
+	for (let i = chat.children.length - 1; i >= 0; i--) {
+		const child = chat.children[i] as any;
+		if (child === keep) continue;
+		const marked = child?.[LIVE_STREAM_COMPONENT_KEY] === true;
+		const legacy =
+			child?.constructor?.name === "LiveStreamComponent" &&
+			typeof child.agentId === "function";
+		if (!marked && !legacy) continue;
+		chat.children.splice(i, 1);
+		child.dispose?.();
+	}
+}
+
+/** Show immediate send feedback while a new session is being created. */
+function showStartingPrompt(
+	ctx: ExtensionContext,
+	a: BgAgent | undefined,
+): void {
+	if (!ctx.hasUI || !a?.runPrompt) return;
+	const prompt = a.runPrompt;
+	ctx.ui.setWidget("inbox-live", () =>
+		new UserMessageComponent(prompt, getMarkdownTheme(), 0),
+	);
+}
+
+/** Live stream for an attached session while its background run is going. */
 function showLiveStream(ctx: ExtensionContext) {
 	if (!ctx.hasUI) return;
-	const pendingId = orchestrating() && isHome(ctx) ? modeState().openWhenReady : undefined;
-	const a = isAttached(ctx) ? getAgent(ctx.sessionManager.getSessionId()) : pendingId ? getAgent(pendingId) : undefined;
+	const a = isAttached(ctx)
+		? getAgent(ctx.sessionManager.getSessionId())
+		: undefined;
 	const G = globalThis as any;
-	const tui = (G.__piInboxTui as TUI) ?? ((ctx.ui as any).tui as TUI);
+	const tui = activeInboxTui(ctx);
+	if (tui) G.__piInboxTui = tui;
 	const chat = tui ? chatContainer(tui) : undefined;
 	if (!a || !isRunning(a) || !chat) return unmountLiveStream(ctx, G);
+	const hideThinkingBlock = thinkingBlocksHidden(ctx);
+	const promptInSnapshot = isAttached(ctx) && snapshotHasRunPrompt(ctx, a);
 	// The stream is one child of the chat container, appended after the snapshot. One stable
 	// instance per agent: its per-message cache survives re-mounts, which happen whenever pi
 	// rebuilds the chat (session switch, compaction) — detect a lost mount and re-append.
 	let stream = G[LIVE_STREAM_KEY] as LiveStreamComponent | undefined;
-	if (!stream || stream.agentId() !== a.id) {
-		stream = new LiveStreamComponent(tui, ctx.ui.theme, () => a.id);
+	if (
+		!stream ||
+		stream.agentId() !== a.id ||
+		typeof stream.setViewOptions !== "function" ||
+		stream.cacheVersion !== 3
+	) {
+		stream = new LiveStreamComponent(
+			tui,
+			ctx.ui.theme,
+			() => a.id,
+			hideThinkingBlock,
+			promptInSnapshot,
+		);
 		G[LIVE_STREAM_KEY] = stream;
+	} else {
+		stream.setViewOptions(hideThinkingBlock, promptInSnapshot);
 	}
+	removeStaleLiveStreams(chat, stream);
 	if (stream !== chat.children[chat.children.length - 1]) {
 		// Drop a previous run's stream (a different agent's) before appending this one.
 		const i = chat.children.indexOf(stream);
@@ -2284,26 +2714,32 @@ function showLiveStream(ctx: ExtensionContext) {
 	const status: string[] = [
 		th.fg("accent", a.proc ? "⟳ working in the background" : a.hold ? "↻ loading the last turn…" : "⏸ queued (waiting for a free agent slot)"),
 	];
-	if (a.pending.length)
-		status.push(th.fg("warning", `⏳ ${a.pending.length} message(s) queued — delivered when this run ends`));
+	if (a.pending.length) {
+		const count = `${a.pending.length} message(s) queued`;
+		const queueKey =
+			getKeybindings().getKeys("app.message.dequeue").join("/") ||
+			"alt+up";
+		status.push(
+			th.fg(
+				"warning",
+				`⏳ ${count} · ${queueKey} or /queue to manage`,
+			),
+		);
+	}
 	ctx.ui.setWidget("inbox-live", status);
 	// Re-render on agent updates; render()'s sync() detects what changed via its key and rebuilds
 	// only the message whose rev moved (the per-message cache makes deltas cheap).
 	if (!G[LIVE_STREAM_LISTENER]) {
 		G[LIVE_STREAM_LISTENER] = onAgentEvent(() => {
-			((globalThis as any).__piInboxTui as TUI | undefined)?.requestRender?.();
+			activeInboxTui()?.requestRender?.();
 		});
 	}
 }
 
 function unmountLiveStream(ctx: ExtensionContext, G: any) {
-	const stream = G[LIVE_STREAM_KEY] as LiveStreamComponent | undefined;
-	const tui = (G.__piInboxTui as TUI) ?? ((ctx.ui as any).tui as TUI);
-	if (stream && tui) {
-		const chat = chatContainer(tui);
-		const i = chat ? chat.children.indexOf(stream) : -1;
-		if (i !== -1) chat.children.splice(i, 1);
-	}
+	const tui = activeInboxTui(ctx);
+	const chat = tui ? chatContainer(tui) : undefined;
+	if (chat) removeStaleLiveStreams(chat);
 	G[LIVE_STREAM_KEY] = undefined;
 	G[LIVE_STREAM_LISTENER]?.();
 	G[LIVE_STREAM_LISTENER] = undefined;
@@ -2486,6 +2922,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_e, ctx) => {
 		G.__piInboxAgentsCtx = ctx;
 		G.__piInboxPi = pi; // the global listener sends commands through the live extension instance
+		// A session switch disposes custom overlays without necessarily resolving
+		// their promises. Never let an abandoned queue manager block the new UI.
+		G[QUEUE_MANAGER_KEY] = undefined;
 		if (ctx.hasUI) ctx.ui.setStatus("inbox-agents", agentsSummary());
 		showReplyWidget(ctx);
 		const id = ctx.sessionManager.getSessionId();
@@ -2498,16 +2937,29 @@ export default function (pi: ExtensionAPI) {
 	/** Orchestrator: reload the attached session's transcript (or finish a pending takeover). */
 	function scheduleRefresh(id: string) {
 		const ms = modeState();
-		if (ms.inLoop) {
-			ms.stale.add(id); // the orchestrator is up; reload when you come back to the session
+		if (ms.inLoop || G[QUEUE_MANAGER_KEY] === id) {
+			// The orchestrator or queue manager owns the UI. Reloading now would
+			// dispose its overlay; refresh after it closes instead.
+			ms.stale.add(id);
 			return;
 		}
-		const p = (G.__piInboxPi ?? pi) as ExtensionAPI;
-		setTimeout(() => void Promise.resolve(p.sendUserMessage("/orchestrator refresh", { expandPromptTemplates: true })).catch(() => {}), 50);
+		setTimeout(() => {
+			const current = modeState();
+			if (current.inLoop || G[QUEUE_MANAGER_KEY] === id) {
+				current.stale.add(id);
+				return;
+			}
+			const p = (G.__piInboxPi ?? pi) as ExtensionAPI;
+			void Promise.resolve(
+				p.sendUserMessage("/orchestrator refresh", {
+					expandPromptTemplates: true,
+				}),
+			).catch(() => {});
+		}, 50);
 	}
 	// Replace (not keep) a listener left by a previous load, so /reload picks up new listener code.
 	// Keyed by a version so per-session re-instantiation doesn't churn it.
-	const LISTENER_VERSION = 2;
+	const LISTENER_VERSION = 9;
 	if (G.__piInboxAgentsListenerVersion !== LISTENER_VERSION) {
 		if (typeof G.__piInboxAgentsListener === "function") G.__piInboxAgentsListener();
 		G.__piInboxAgentsListenerVersion = LISTENER_VERSION;
@@ -2548,7 +3000,9 @@ export default function (pi: ExtensionAPI) {
 					showLiveStream(ctx);
 					showModeWidget(ctx);
 				} else if (ms.openWhenReady && isHome(ctx)) {
-					showLiveStream(ctx); // new agent started from home, not on disk yet
+					// Show only the submitted prompt until the session is ready.
+					// Assistant output starts after the automatic session switch.
+					showStartingPrompt(ctx, getAgent(ms.openWhenReady));
 				}
 				if (ev.type === "finished" && ev.agent.id === cur && isAttached(ctx)) {
 					playSound(ev.agent.state === "error"); // the reload is the notification; still ping
@@ -2610,6 +3064,66 @@ export default function (pi: ExtensionAPI) {
 			(tui, theme, _kb, done) => (coverImagesUnderOverlays(tui), new DirPickerComponent(tui, theme, done, opts)),
 			{ overlay: true, overlayOptions: overlayOpts() },
 		);
+	}
+
+	async function manageQueue(
+		ctx: ExtensionContext,
+		explicitId?: string,
+		explicitTitle?: string,
+	): Promise<QueueManagerResult | undefined> {
+		if (ctx.mode !== "tui" || !ctx.hasUI) return undefined;
+		const homeId = orchestrating() && isHome(ctx)
+			? modeState().openWhenReady
+			: undefined;
+		const id =
+			explicitId ??
+			(isAttached(ctx) ? ctx.sessionManager.getSessionId() : homeId);
+		const agent = id ? getAgent(id) : undefined;
+		if (!agent) {
+			ctx.ui.notify(
+				"Open an attached background-agent session to manage its queue.",
+				"info",
+			);
+			return undefined;
+		}
+		const global = globalThis as any;
+		if (global[QUEUE_MANAGER_KEY]) return undefined;
+		global[QUEUE_MANAGER_KEY] = agent.id;
+		try {
+			const result = await ctx.ui.custom<QueueManagerResult>(
+				(tui, theme, _kb, done) => {
+					coverImagesUnderOverlays(tui);
+					return new QueueManagerComponent(
+						tui,
+						theme,
+						done,
+						agent.id,
+						explicitTitle ?? agent.title,
+					);
+				},
+				{ overlay: true, overlayOptions: overlayOpts("86%") },
+			);
+			showLiveStream(ctx);
+			showModeWidget(ctx);
+			return result;
+		} finally {
+			if (global[QUEUE_MANAGER_KEY] === agent.id) {
+				global[QUEUE_MANAGER_KEY] = undefined;
+			}
+			// A run may have ended while the manager owned the overlay. Reload
+			// only after it closes, preserving both the manager and its lock.
+			const latest = G.__piInboxAgentsCtx as
+				| ExtensionContext
+				| undefined;
+			if (
+				latest?.hasUI &&
+				latest.sessionManager.getSessionId() === agent.id &&
+				modeState().stale.has(agent.id) &&
+				!modeState().inLoop
+			) {
+				scheduleRefresh(agent.id);
+			}
+		}
 	}
 
 	async function showHelp(ctx: ExtensionCommandContext, markdown = readReadme(), heading = "help") {
@@ -2724,14 +3238,30 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	/** A new session is safe to open once its initial user prompt is on disk. */
+	function sessionReadyToOpen(file: string): boolean {
+		try {
+			return SessionManager.open(file)
+				.getBranch()
+				.some(
+					(e: any) =>
+						e?.type === "message" && e.message?.role === "user",
+				);
+		} catch {
+			return false;
+		}
+	}
+
 	/**
-	 * Orchestrator: a new agent was started from home in pi's chat view. Show its live progress there,
-	 * and open it attached (like enter in the list) as soon as the agent has written its session file.
+	 * Orchestrator: show the submitted prompt immediately, wait for that prompt
+	 * to reach disk, then open the session and start its assistant stream.
+	 * Streaming assistant output before the switch would remain in regular
+	 * terminal scrollback and be replayed below "Resumed session".
 	 */
 	function watchStarted(id: string, ctx: ExtensionContext) {
 		const ms = modeState();
 		ms.openWhenReady = id;
-		showLiveStream(ctx);
+		showStartingPrompt(ctx, getAgent(id));
 		const until = Date.now() + 10 * 60_000;
 		const timer = setInterval(() => {
 			if (ms.openWhenReady !== id) return clearInterval(timer);
@@ -2739,9 +3269,13 @@ export default function (pi: ExtensionAPI) {
 			const file = a?.sessionFile ?? findSessionFile(id);
 			if (a && file && !a.sessionFile) a.sessionFile = file;
 			const p = (G.__piInboxPi ?? pi) as ExtensionAPI;
-			if (file) {
+			if (file && sessionReadyToOpen(file)) {
 				clearInterval(timer);
-				void Promise.resolve(p.sendUserMessage(`/orchestrator open ${id}`, { expandPromptTemplates: true })).catch(() => {});
+				void Promise.resolve(
+					p.sendUserMessage(`/orchestrator open ${id}`, {
+						expandPromptTemplates: true,
+					}),
+				).catch(() => {});
 				return;
 			}
 			if (!a || !isRunning(a) || Date.now() > until) {
@@ -2982,6 +3516,17 @@ export default function (pi: ExtensionAPI) {
 				const row = result.row;
 				if (await ask(ctx, "Cancel background agent?", `Stop "${row.title.slice(0, 80)}"? Completed steps stay saved; you can reply later to continue.`))
 					cancelAgent(row.info.id);
+				continue;
+			}
+
+			if (result.action === "queue") {
+				await manageQueue(
+					ctx,
+					result.row.info.id,
+					result.row.title,
+				);
+				rowCache = await loadRows(currentId);
+				(globalThis as any)[ROWS_KEY] = rowCache;
 				continue;
 			}
 
@@ -3317,6 +3862,12 @@ export default function (pi: ExtensionAPI) {
 		cancelAgent(id);
 		ctx.ui.notify("■ Stopped the background run. Completed steps are saved; send a message to continue.", "info");
 	}
+	pi.registerCommand("queue", {
+		description: "Orchestrator: manage this session's queued messages",
+		handler: async (_args, ctx) => {
+			await manageQueue(ctx);
+		},
+	});
 	pi.registerCommand("stop", {
 		description: "Orchestrator: stop this session's background run (ctrl+shift+s)",
 		handler: async (_args, ctx) => stopCurrent(ctx),
@@ -3404,8 +3955,13 @@ export default function (pi: ExtensionAPI) {
 		const pending = pendingId ? getAgent(pendingId) : undefined;
 		if (!t && text && pending) {
 			if (event.images?.length) ctx.ui.notify("Images can't be sent to background agents yet: sent the text only.", "warning");
-			sendToAgent({ id: pending.id, cwd: pending.cwd, title: pending.title, text });
-			showLiveStream(ctx);
+			sendToAgent({
+				id: pending.id,
+				cwd: pending.cwd,
+				title: pending.title,
+				text,
+			});
+			showStartingPrompt(ctx, pending);
 			return { action: "handled" };
 		}
 		if (!t && orchestrating() && isHome(ctx)) t = { kind: "new", cwd: ctx.cwd, model: currentModel(ctx) };
@@ -3516,6 +4072,28 @@ export default function (pi: ExtensionAPI) {
 		}
 		G.__piInboxEscUnsub?.();
 		G.__piInboxEscUnsub = ctx.ui.onTerminalInput((data) => {
+			// Pi's dequeue key opens our queue manager for an attached
+			// background agent. Everywhere else it keeps its built-in meaning.
+			if (getKeybindings().matches(data, "app.message.dequeue")) {
+				const c =
+					(G.__piInboxAgentsCtx as ExtensionContext | undefined) ?? ctx;
+				const homeId = orchestrating() && isHome(c)
+					? modeState().openWhenReady
+					: undefined;
+				const id = isAttached(c)
+					? c.sessionManager.getSessionId()
+					: homeId;
+				if (
+					editorFocused() &&
+					!modeState().inLoop &&
+					!!id &&
+					!!getAgent(id)
+				) {
+					void manageQueue(c);
+					return { consume: true };
+				}
+				return undefined;
+			}
 			// ctrl+w opens the directory picker — for the pending new agent's prompt (or at orchestrator
 			// home), and inside an existing session (attached / taken over), where it moves that session
 			// to another directory. Everywhere else it's the editor's delete-word-backward, so it passes
