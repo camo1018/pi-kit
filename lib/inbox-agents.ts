@@ -986,11 +986,14 @@ function handleEvent(a: BgAgent, ev: any, deltaGate: () => boolean) {
 			if (ev.message?.role === "assistant") liveStartAssistant(a, ev);
 			else if (ev.message?.role === "user") {
 				const t = textOf(ev.message.content).trim();
-				// The run's own prompt is already in the live run (run() seeds it), and pi may have
-				// expanded $skill/prompt templates in the child — normalize (strips skill blocks,
-				// collapses whitespace) so the echo never duplicates it. Steering prompts always differ.
-				const seeded = cleanUserText(a.runPrompt ?? "");
-				if (t && cleanUserText(t) !== seeded) liveUser(a, cleanUserText(t));
+				// The run's prompt is already seeded into the live view. The child
+				// may prepend an expanded skill block while preserving the original
+				// inline $skill mention, so compare only the user-authored portion.
+				// A later steering prompt still renders normally.
+				const seeded = comparableUserText(a.runPrompt ?? "");
+				if (t && comparableUserText(t) !== seeded) {
+					liveUser(a, cleanUserText(t));
+				}
 			}
 			break;
 		case "message_update": {
@@ -1306,13 +1309,34 @@ export function recordActualThinkingLevel(sessionManager: any, actual: string | 
 
 // ───────────────────────────── transcript ─────────────────────────────
 
-/** `<skill name="x" ...>...</skill> rest` → `⚡x rest`. */
-/** Display text for a user prompt: skill blocks (expanded by pi) and `$skill` tokens both
- *  collapse to `⚡name`, so a prompt and its child-side echo canonicalize the same way. */
+/** Display text: collapse expanded skill blocks and `$skill` tokens. */
 function cleanUserText(s: string): string {
 	return s
 		.replace(/<skill\s+name="([^"]+)"[\s\S]*?<\/skill>\s*/g, (_m, n) => `⚡${n} `)
 		.replace(/(^|\s)\$([\w-]+)/g, (_m, pre, n) => `${pre}⚡${n}`)
+		.trim();
+}
+
+/**
+ * Canonical user-authored text for matching a run prompt with the child's echo.
+ * Inline-skills prepends one or more expanded blocks but deliberately keeps the
+ * original `$skill` token in the message, so those metadata blocks must be
+ * removed rather than converted into an additional visible skill marker.
+ */
+function comparableUserText(s: string): string {
+	let text = s;
+	for (;;) {
+		const withoutBlock = text.replace(
+			/^\s*<skill\b[^>]*>[\s\S]*?<\/skill>\s*/,
+			"",
+		);
+		if (withoutBlock === text) break;
+		text = withoutBlock;
+	}
+	return text
+		.replace(/^\s*\/skill:[\w.-]+(?:\s+|$)/i, "")
+		.replace(/(^|\s)\$([\w-]+)/g, (_m, pre, n) => `${pre}⚡${n}`)
+		.replace(/\s+/g, " ")
 		.trim();
 }
 
