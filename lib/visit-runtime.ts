@@ -388,8 +388,8 @@ function interposeChat(chat: Container, view: Container): () => void {
 /**
  * Start a visit: stash the main session's live chat tree and mount the visited
  * session's view. Call only when `isVisiting()` is false. Returns false if the
- * chat container can't be found (compat failure → callers fall back to a
- * real session switch).
+ * chat container can't be found (compat failure → callers refuse the visit;
+ * sticky takeover must never fall through to a destructive real switch).
  */
 export function openVisit(tui: TUI, ctx: { modelRegistry?: any }, o: OpenVisitOpts): boolean {
 	const st = visitState();

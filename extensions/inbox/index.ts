@@ -3772,7 +3772,14 @@ export default function (pi: ExtensionAPI) {
 						showModeWidget(ctx);
 						return; // stay in orchestrator: the visit replaced the chat view
 					}
-					// compat fallback (chat container not found): fall through to a real switch
+					// Sticky means sticky: never fall through to the real switch, because that
+					// calls prepareLeave(), aborts the main, and appends CONTINUE_MSG. If Pi's
+					// TUI internals changed, refuse the visit and preserve the takeover.
+					ctx.ui.notify(
+						"Couldn't open the visit view without interrupting the taken-over session. The main is still running; run /compat for details.",
+						"error",
+					);
+					continue;
 				}
 				const live = readLive().get(id);
 				const ours = live && (live.pid === process.pid || live.pid === getAgent(id)?.pid || live.bgParent === process.pid);
@@ -3923,6 +3930,81 @@ export default function (pi: ExtensionAPI) {
 			}
 			ctx.ui.notify("Usage: /orchestrator [on|off|home]", "warning");
 		},
+	});
+
+	// Last-resort sticky guard for ANY session-switch path, not just the orchestrator list.
+	// Pi's native switch aborts/disposes the current AgentSession. If the current session is the
+	// taken-over main, turn a resume/open into a visit and cancel the native switch. Explicit
+	// handback/takeover paths call prepareLeave first, which removes `takenOver`, so they pass.
+	pi.on("session_before_switch", async (e: any, ctx: ExtensionContext) => {
+		if (!orchestrating()) return undefined;
+		const ms = modeState();
+		const mainId = ctx.sessionManager.getSessionId();
+		if (!ms.takenOver.has(mainId)) return undefined;
+		const file = typeof e?.targetSessionFile === "string"
+			? e.targetSessionFile
+			: undefined;
+		if (!file) {
+			if (ctx.hasUI) {
+				ctx.ui.notify(
+					"The taken-over session is still the main. Hand it back before starting a new foreground session.",
+					"warning",
+				);
+			}
+			return { cancel: true };
+		}
+		let target: SessionManager;
+		try {
+			target = SessionManager.open(file);
+		} catch {
+			if (ctx.hasUI) ctx.ui.notify("Couldn't open that session; the taken-over main was left untouched.", "error");
+			return { cancel: true };
+		}
+		const id = target.getSessionId();
+		if (id === mainId) {
+			// Re-selecting the main is only a reveal, never a teardown/reload. A move to
+			// a new file path is allowed only while idle (moveSessionDir's own guard).
+			if (isVisiting()) {
+				const tui = activeInboxTui(ctx);
+				if (tui) closeVisit(tui);
+			}
+			if (file === ctx.sessionManager.getSessionFile()) return { cancel: true };
+			if (!ctx.isIdle()) {
+				ctx.ui.notify("The taken-over session is still running; it was not reloaded.", "warning");
+				return { cancel: true };
+			}
+			return undefined;
+		}
+		const tui = activeInboxTui(ctx);
+		if (!tui) {
+			if (ctx.hasUI) ctx.ui.notify("Couldn't open the visit view; the taken-over main is still running.", "error");
+			return { cancel: true };
+		}
+		if (isVisiting()) closeVisit(tui);
+		const branch = target.getBranch() as any[];
+		const firstUser = branch.find(
+			(entry: any) =>
+				entry?.type === "message" && entry.message?.role === "user",
+		) as any;
+		const title =
+			target.getSessionName?.() ??
+			cleanTitle(messageText(firstUser?.message?.content) || "session").slice(0, 120);
+		if (!openVisit(tui, ctx, {
+			mainId,
+			id,
+			file,
+			cwd: target.getCwd(),
+			title,
+			modelRegistry: (ctx as any).modelRegistry,
+			recordedModel: sessionModel(file),
+		})) {
+			ctx.ui.notify("Couldn't open the visit view; the taken-over main is still running.", "error");
+			return { cancel: true };
+		}
+		markRead(id);
+		showModeWidget(ctx);
+		showLiveStream(ctx);
+		return { cancel: true };
 	});
 
 	// Attached session with a background run going: pi's on-screen copy is a snapshot, and these
