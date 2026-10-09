@@ -9,13 +9,13 @@ Display-only changes to how fenced blocks render in the transcript:
   literal ```` ```lang ```` / ```` ``` ```` fence lines are replaced by
   `┌─ lang` / `└─` markers (`┌─ code` when untagged).
 - In Pi's actual fullscreen TUI renderer, clicking any row of a code block
-  copies that exact block through `snippet-copy`. Regular mode keeps mouse
-  input for terminal selection, even when the orchestrator overlay is
-  full-width.
+  copies that exact block through `click-copy`. Regular mode
+  keeps mouse input for terminal selection, even when the orchestrator overlay
+  is full-width.
 - Adds copy-safe code block rules to the system prompt: code lines under 80
   columns, comments on their own line, no leading indent. Prose blocks
   (```text drafts like Slack messages) are exempt — one sentence/bullet per
-  line, no hard wrapping; they're copied with `/cc` (snippet-copy) instead
+  line, no hard wrapping; they're copied by clicking (click-to-copy) instead
   of mouse selection.
 
 The session file and model context keep the raw fences; `/copy` copies them.
@@ -32,7 +32,7 @@ hook for drawing code blocks. Last verified on **Pi 0.99.1**.
 | `markdown-render-token` | `Markdown.prototype.renderToken` (private, pi-tui) | Patch wraps nothing; plain ```` ``` ```` fences return |
 | `markdown-fence-shape` | `renderToken` emits `theme.codeBlockBorder("```lang")` as the first line and `codeBlockBorder("```")` as the closing line | Exact-match check fails; stock fences return |
 | `code-block-label-renders` | End to end: a rendered `bash` block contains `┌─ bash` and `└─`, and no ```` ``` ```` | Catches anything above, plus a patch that didn't install |
-| `code-block-click-routes` | `Markdown.render()` row mapping plus fullscreen `handleMouse()` press/click dispatch | Code blocks still render and `/cc` works, but clicking does not copy |
+| `code-block-click-routes` | `Markdown.render()` row mapping plus fullscreen `handleMouse()` press/click dispatch | Code blocks still render, but clicking does not copy |
 
 Other assumptions (not probed):
 

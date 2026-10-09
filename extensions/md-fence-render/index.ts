@@ -33,11 +33,11 @@ const MD_CLOSE = ["", CLOSE];
  * code, keep lines under 80 columns. For prose meant to be pasted
  * elsewhere (```text drafts like Slack messages), wrapping is actively
  * harmful — the breaks end up in the paste — so keep one sentence or
- * bullet per line and copy via /cc (snippet-copy) instead of selection.
+ * bullet per line and copy via click-to-copy instead of selection.
  */
 const COPY_GUIDELINES = [
 	"In shell and code blocks, keep every line under 80 characters. Break long shell commands with trailing ` \\` continuations (or one flag per line); break long code expressions across lines.",
-	"In prose code blocks (```text, e.g. Slack drafts or emails), do NOT hard-wrap at 80 columns — write each sentence, bullet, or paragraph as one long line. Those breaks would end up in the pasted message; the user copies prose blocks with /cc, so long lines are safe.",
+	"In prose code blocks (```text, e.g. Slack drafts or emails), do NOT hard-wrap at 80 columns — write each sentence, bullet, or paragraph as one long line. Those breaks would end up in the pasted message; the user copies blocks by clicking, so long lines are safe.",
 	"In shell code blocks, put comments on their own line above the command — never trailing `# ...` after a command on the same line. Don't include prompts like `$ ` or output in runnable blocks.",
 	"Don't indent top-level lines of a code block (no leading spaces unless the language syntax requires them).",
 ];
@@ -137,7 +137,7 @@ const ORIGINAL_MOUSE = Symbol.for("pi-kit:md-fence-render:handleMouse");
 const PENDING_CODES = Symbol.for("pi-kit:md-fence-render:pendingCodes");
 const CODE_HITS = Symbol.for("pi-kit:md-fence-render:codeHits");
 const CODE_HITS_KEY = Symbol.for("pi-kit:md-fence-render:codeHitsKey");
-const CLICK_COPY = Symbol.for("pi-kit:snippet-copy:click");
+const CLICK_COPY = Symbol.for("pi-kit:click-copy:click");
 
 function findLine(
 	lines: string[],
