@@ -182,8 +182,16 @@ function patchCodeBlocks() {
 		const blockIndex = (this[PENDING_CODES] ??= []).length;
 		const copied = this[COPIED_FEEDBACK]?.index === blockIndex;
 		const label = `${OPEN} ${token.lang || "code"}`;
+		const highlight = (s: string) =>
+			typeof this.theme?.codeBlock === "function"
+				? this.theme.codeBlock(s)
+				: typeof this.theme?.code === "function"
+					? this.theme.code(s)
+					: border(s);
 		out[close] = border(CLOSE);
-		out[0] = border(copied ? `${label} · Copied` : label);
+		out[0] = copied
+			? `${border(label)} ${highlight("· Copied")}`
+			: border(label);
 		this[PENDING_CODES].push({
 			start: 0,
 			end: 0,
