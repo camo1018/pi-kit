@@ -133,6 +133,18 @@ const PROBES: Probe[] = [
 				if (copied?.code !== "echo hi") {
 					return "code-block click did not route exact source";
 				}
+				if (typeof copied.setCopied !== "function") {
+					return "code-block click did not expose inline feedback";
+				}
+				copied.setCopied(true);
+				const feedback = md.render(60).join("\n");
+				if (!feedback.includes("bash · Copied")) {
+					return "copied feedback did not render beside the block";
+				}
+				copied.setCopied(false);
+				if (md.render(60).join("\n").includes("· Copied")) {
+					return "copied feedback did not clear from the block";
+				}
 				return true;
 			} catch (e) {
 				return `clicking a code block threw: ${(e as Error).message}`;

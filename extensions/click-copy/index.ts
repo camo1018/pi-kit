@@ -23,23 +23,52 @@ import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 interface ClickedBlock {
 	lang: string;
 	code: string;
+	setCopied?: (copied: boolean) => void;
 }
 
 const CLICK_COPY = Symbol.for("pi-kit:click-copy:click");
+const FEEDBACK_STATUS = "click-copy-render";
+const FEEDBACK_MS = 1_500;
 
 export default function clickCopy(pi: ExtensionAPI) {
 	registerLoadedExtension("click-copy");
 	let activeCtx: any;
+	let feedbackTimer: ReturnType<typeof setTimeout> | undefined;
+	let clearFeedback: (() => void) | undefined;
+	let request = 0;
 
-	async function copyCode(code: string, lang: string) {
+	function requestRender() {
+		// Clearing an absent status is a public, display-neutral way to ask Pi's
+		// active TUI to render. It also works while a taken-over session visits
+		// another agent, where that agent's Markdown is outside the main chat.
+		activeCtx?.ui?.setStatus?.(FEEDBACK_STATUS, undefined);
+	}
+
+	function resetFeedback() {
+		if (feedbackTimer) clearTimeout(feedbackTimer);
+		feedbackTimer = undefined;
+		clearFeedback?.();
+		clearFeedback = undefined;
+	}
+
+	function showFeedback(block: ClickedBlock) {
+		resetFeedback();
+		if (!block.setCopied) return;
+		block.setCopied(true);
+		clearFeedback = () => block.setCopied?.(false);
+		requestRender();
+		feedbackTimer = setTimeout(() => {
+			resetFeedback();
+			requestRender();
+		}, FEEDBACK_MS);
+	}
+
+	async function copyCode(block: ClickedBlock, copyRequest: number) {
 		try {
-			await copyToClipboard(code);
-			const n = code.split("\n").length;
-			activeCtx?.ui?.notify?.(
-				`Copied${lang ? ` (${lang})` : ""} — ${n} line${n === 1 ? "" : "s"}`,
-				"info",
-			);
+			await copyToClipboard(block.code);
+			if (copyRequest === request) showFeedback(block);
 		} catch (err: any) {
+			if (copyRequest !== request) return;
 			activeCtx?.ui?.notify?.(
 				`Copy failed: ${err?.message ?? String(err)}`,
 				"error",
@@ -48,11 +77,17 @@ export default function clickCopy(pi: ExtensionAPI) {
 	}
 
 	(globalThis as any)[CLICK_COPY] = (block: ClickedBlock) => {
-		void copyCode(block.code, block.lang);
+		void copyCode(block, ++request);
 	};
 
-	// Keep the notify context fresh across sessions/reloads.
+	// Keep the UI context fresh across sessions/reloads.
 	pi.on("session_start", (_event, ctx?: any) => {
+		resetFeedback();
 		activeCtx = ctx;
+	});
+	pi.on("session_shutdown", () => {
+		request++;
+		resetFeedback();
+		activeCtx = undefined;
 	});
 }
