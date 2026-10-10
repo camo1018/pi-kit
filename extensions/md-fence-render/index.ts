@@ -130,6 +130,10 @@ type PendingCode = CodeHit & {
 	openLine: string;
 	closeLine: string;
 };
+type CopiedFeedback = {
+	token: object;
+	index: number;
+};
 
 const ORIGINAL = Symbol.for("pi-kit:md-fence-render:renderToken");
 const ORIGINAL_RENDER = Symbol.for("pi-kit:md-fence-render:render");
@@ -137,6 +141,9 @@ const ORIGINAL_MOUSE = Symbol.for("pi-kit:md-fence-render:handleMouse");
 const PENDING_CODES = Symbol.for("pi-kit:md-fence-render:pendingCodes");
 const CODE_HITS = Symbol.for("pi-kit:md-fence-render:codeHits");
 const CODE_HITS_KEY = Symbol.for("pi-kit:md-fence-render:codeHitsKey");
+const COPIED_FEEDBACK = Symbol.for(
+	"pi-kit:md-fence-render:copiedFeedback",
+);
 const CLICK_COPY = Symbol.for("pi-kit:click-copy:click");
 
 function findLine(
@@ -172,9 +179,12 @@ function patchCodeBlocks() {
 		const close = lines.lastIndexOf(border("```"));
 		if (close <= 0) return lines;
 		const out = [...lines];
+		const blockIndex = (this[PENDING_CODES] ??= []).length;
+		const copied = this[COPIED_FEEDBACK]?.index === blockIndex;
+		const label = `${OPEN} ${token.lang || "code"}`;
 		out[close] = border(CLOSE);
-		out[0] = border(`${OPEN} ${token.lang || "code"}`);
-		(this[PENDING_CODES] ??= []).push({
+		out[0] = border(copied ? `${label} · Copied` : label);
+		this[PENDING_CODES].push({
 			start: 0,
 			end: 0,
 			lang: token.lang ?? "",
@@ -219,13 +229,32 @@ function patchCodeBlocks() {
 		const prior = originalMouse?.call(this, event);
 		if (prior) return prior;
 		if (event.button !== "left") return undefined;
-		const hit = (this[CODE_HITS] as CodeHit[] | undefined)?.find(
+		const hits = this[CODE_HITS] as CodeHit[] | undefined;
+		const index = hits?.findIndex(
 			(code) => event.y >= code.start && event.y <= code.end,
 		);
+		const hit = index === undefined || index < 0 ? undefined : hits?.[index];
 		const copy = (globalThis as any)[CLICK_COPY];
-		if (!hit || typeof copy !== "function") return undefined;
+		if (!hit || index === undefined || typeof copy !== "function") {
+			return undefined;
+		}
 		if (event.type === "click") {
-			copy({ lang: hit.lang, code: hit.code });
+			const feedbackToken = {};
+			copy({
+				lang: hit.lang,
+				code: hit.code,
+				setCopied: (copied: boolean) => {
+					if (copied) {
+						this[COPIED_FEEDBACK] = {
+							token: feedbackToken,
+							index,
+						} satisfies CopiedFeedback;
+					} else if (this[COPIED_FEEDBACK]?.token === feedbackToken) {
+						this[COPIED_FEEDBACK] = undefined;
+					}
+					this.invalidate();
+				},
+			});
 			return { handled: true };
 		}
 		if (

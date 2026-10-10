@@ -9,9 +9,10 @@ Display-only changes to how fenced blocks render in the transcript:
   literal ```` ```lang ```` / ```` ``` ```` fence lines are replaced by
   `┌─ lang` / `└─` markers (`┌─ code` when untagged).
 - In Pi's actual fullscreen TUI renderer, clicking any row of a code block
-  copies that exact block through `click-copy`. Regular mode
-  keeps mouse input for terminal selection, even when the orchestrator overlay
-  is full-width.
+  copies that exact block through `click-copy`. Its opening marker briefly
+  changes to `┌─ lang · Copied`, including in background-agent and visited
+  taken-over session views. Regular mode keeps mouse input for terminal
+  selection, even when the orchestrator overlay is full-width.
 - Adds copy-safe code block rules to the system prompt: code lines under 80
   columns, comments on their own line, no leading indent. Prose blocks
   (```text drafts like Slack messages) are exempt — one sentence/bullet per
@@ -32,7 +33,7 @@ hook for drawing code blocks. Last verified on **Pi 0.99.1**.
 | `markdown-render-token` | `Markdown.prototype.renderToken` (private, pi-tui) | Patch wraps nothing; plain ```` ``` ```` fences return |
 | `markdown-fence-shape` | `renderToken` emits `theme.codeBlockBorder("```lang")` as the first line and `codeBlockBorder("```")` as the closing line | Exact-match check fails; stock fences return |
 | `code-block-label-renders` | End to end: a rendered `bash` block contains `┌─ bash` and `└─`, and no ```` ``` ```` | Catches anything above, plus a patch that didn't install |
-| `code-block-click-routes` | `Markdown.render()` row mapping plus fullscreen `handleMouse()` press/click dispatch | Code blocks still render, but clicking does not copy |
+| `code-block-click-routes` | `Markdown.render()` row mapping, inline feedback, and fullscreen `handleMouse()` press/click dispatch | Code blocks still render, but clicking does not copy or show local feedback |
 
 Other assumptions (not probed):
 
