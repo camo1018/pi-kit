@@ -9,7 +9,7 @@
  *   /archive          toggle archive on the current session
  *
  * Inside the inbox:
- *   ↑/↓ PgUp/PgDn  move          enter       agent view: live transcript (r there = reply)
+ *   ↑/↓ ←/→ PgUp/PgDn  move (←/→ = 5 rows)   enter       agent view: live transcript (r there = reply)
  *   o              open (switch to) session in this window
  *   n / N          new background agent (N: pick its model); you type its prompt in pi's editor
  *   ctrl+w   pick a working directory: for a new agent (while typing its prompt / at home), and
@@ -1148,6 +1148,8 @@ class InboxComponent {
 				this.rebuild();
 			} else if (kb.matches(data, "tui.select.up")) this.move(-1);
 			else if (kb.matches(data, "tui.select.down")) this.move(1);
+			else if (matchesKey(data, "left")) this.move(-5);
+			else if (matchesKey(data, "right")) this.move(5);
 			else {
 				const ch = printable(data);
 				if (ch) {
@@ -1166,6 +1168,8 @@ class InboxComponent {
 
 		if (kb.matches(data, "tui.select.up") || ch === "k") this.move(-1);
 		else if (kb.matches(data, "tui.select.down") || ch === "j") this.move(1);
+		else if (matchesKey(data, "left")) this.move(-5);
+		else if (matchesKey(data, "right")) this.move(5);
 		else if (kb.matches(data, "tui.select.pageUp")) this.move(-this.listHeight());
 		else if (kb.matches(data, "tui.select.pageDown")) this.move(this.listHeight());
 		else if (matchesKey(data, "home") || ch === "g") this.move(-1e9);
@@ -1479,6 +1483,7 @@ class InboxComponent {
 			: orchestrating()
 			? [
 					k("↑↓", "move"),
+					k("←→", "±5"),
 					k("enter", "open"),
 					k("t", "take over"),
 					k("n", "new agent"),
@@ -1500,6 +1505,7 @@ class InboxComponent {
 				].join(th.fg("dim", " · "))
 				: [
 						k("↑↓", "move"),
+						k("←→", "±5"),
 						k("enter", "view/reply"),
 						k("o", "open here"),
 						k("n", "new agent"),
