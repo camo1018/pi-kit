@@ -2265,6 +2265,8 @@ interface ModeState {
 	betweenRuns: Set<string>;
 	/** A new agent started from home: shown in pi's chat view, and opened attached once its session file exists. */
 	openWhenReady?: string;
+	/** The takeover-completion switch in refreshCurrent is in flight for this session id. */
+	takeoverSwitch?: string;
 	/** The next blank session is home for typing a new agent's prompt: don't cover it with the orchestrator. */
 	skipReopen?: boolean;
 }
@@ -3408,12 +3410,21 @@ export default function (pi: ExtensionAPI) {
 				releaseAgent(id); // a foreground session from now on
 			}
 			const draft = ctx.ui.getEditorText();
-			await ctx.switchSession(file, {
-				withSession: async (c) => {
-					if (draft) c.ui.setEditorText(draft);
-					if (takeover) c.ui.notify("🎮 Taken over: this session now runs here, like plain pi. ctrl+q: orchestrator · ctrl+q → h: hand back.", "info");
-				},
-			});
+			// Completing a takeover switches to the session this window already holds. The sticky
+			// guard cancels same-file switches (it protects the main from re-select aborts), which
+			// would strand the takeover: no session_start, no banner, no 🎮 notify, and the working-
+			// run case keeps its stale snapshot. Tell the guard this switch is ours to let through.
+			if (takeover) ms.takeoverSwitch = id;
+			try {
+				await ctx.switchSession(file, {
+					withSession: async (c) => {
+						if (draft) c.ui.setEditorText(draft);
+						if (takeover) c.ui.notify("🎮 Taken over: this session now runs here, like plain pi. ctrl+q: orchestrator · ctrl+q → h: hand back.", "info");
+					},
+				});
+			} finally {
+				if (takeover) ms.takeoverSwitch = undefined;
+			}
 		} finally {
 			if (between) releaseHold(id); // start the queued run now that the chat shows the last one
 		}
@@ -4146,6 +4157,14 @@ export default function (pi: ExtensionAPI) {
 		if (!orchestrating()) return undefined;
 		const ms = modeState();
 		const mainId = ctx.sessionManager.getSessionId();
+		// The takeover-completion switch targets the main's own file; it must go through so
+		// session_start re-runs under the takeover (banner, notify, transcript reload).
+		if (
+			ms.takeoverSwitch &&
+			ms.takeoverSwitch === mainId &&
+			e?.targetSessionFile === ctx.sessionManager.getSessionFile()
+		)
+			return undefined;
 		if (!ms.takenOver.has(mainId)) return undefined;
 		const file = typeof e?.targetSessionFile === "string"
 			? e.targetSessionFile
