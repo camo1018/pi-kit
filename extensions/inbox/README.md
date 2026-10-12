@@ -26,6 +26,7 @@ Source: `~/Code/pi-kit/extensions/inbox/index.ts` (background agents: `~/Code/pi
 | Key | Action |
 |---|---|
 | `↑` `↓` / `j` `k` | Move |
+| `←` `→` | Move up / down 5 rows |
 | `PgUp` `PgDn`, `g` `G` | Page / jump to top or bottom |
 | `enter` | **Agent view**: live transcript of the session; `r` there to reply (see [Background agents](#background-agents)) |
 | `o` | Open (switch to) the selected session in this window. In orchestrator mode: open it attached (same as `enter`) |
