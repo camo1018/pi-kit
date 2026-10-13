@@ -4,11 +4,13 @@ Reference other Pi sessions from a prompt with `@[...]`.
 
 - Typing `@[` opens a fuzzy picker over all saved sessions (all projects),
   matched by name, first message, cwd basename, or id. Accepting inserts
-  `@[<session-id>]` in place. Plain `@` file completion is untouched.
-- On submit, each `@[id]` token expands to the referenced session's
-  active-branch transcript, injected as a `<skill>`-shaped block (which the
-  TUI collapses) ahead of your message. The token itself becomes a `«name»`
-  marker.
+  `@[<session name>]` in place (the id is used when the session has no name,
+  or its name contains a `]`). Plain `@` file completion is untouched.
+- On submit, each `@[name]` (or `@[id]`) token expands to the referenced
+  session's transcript, injected as a `<skill>`-shaped block (which the TUI
+  collapses) ahead of your message. The token itself becomes a `«name»`
+  marker. Id tokens resolve first; name tokens resolve to the most recently
+  modified session when names collide.
 - `@[...]` inside code spans/fences stays literal; unknown ids are untouched.
 
 ## Internal dependencies (brittleness matrix)
