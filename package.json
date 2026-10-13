@@ -17,6 +17,7 @@
       "extensions/snippet-copy/index.ts",
       "extensions/md-fence-render/index.ts",
       "extensions/tool-output-hide/index.ts",
+      "extensions/thinking-block-hide/index.ts",
       "extensions/voice/index.ts",
       "extensions/compat-check/index.ts",
       "extensions/session-mention/index.ts"

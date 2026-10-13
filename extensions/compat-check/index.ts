@@ -190,8 +190,61 @@ const PROBES: Probe[] = [
 		id: "patch-installed",
 		check: () =>
 			need(
-				(globalThis as any)[Symbol.for("pi.ext.tool-output-hide")]?.patched === true,
+				(globalThis as any)[
+					Symbol.for("pi.ext.tool-output-hide")
+				]?.patched === true,
 				"extension loaded but its prototype patches were not installed",
+			),
+	},
+
+	// ── thinking-block-hide ──────────────────────────────
+	{
+		ext: "thinking-block-hide",
+		id: "assistant-message-content",
+		check: () =>
+			need(
+				hasMethod(A.AssistantMessageComponent, "updateContent") &&
+					hasMethod(A.AssistantMessageComponent, "render"),
+				"AssistantMessageComponent updateContent/render is missing",
+			),
+	},
+	{
+		ext: "thinking-block-hide",
+		id: "custom-editor-handle-input",
+		check: () =>
+			need(
+				hasMethod(A.CustomEditor, "handleInput"),
+				"CustomEditor.handleInput is missing",
+			),
+	},
+	{
+		ext: "thinking-block-hide",
+		id: "custom-editor-action-handlers",
+		check: () =>
+			need(
+				classSource(A.CustomEditor).includes("actionHandlers"),
+				"CustomEditor no longer dispatches via actionHandlers",
+			),
+	},
+	{
+		ext: "thinking-block-hide",
+		id: "hidden-thinking-label-ui-api",
+		check: (c) =>
+			need(
+				!c.hasUI ||
+					typeof c.ui.setHiddenThinkingLabel === "function",
+				"ctx.ui.setHiddenThinkingLabel is gone",
+			),
+	},
+	{
+		ext: "thinking-block-hide",
+		id: "patch-installed",
+		check: () =>
+			need(
+				(globalThis as any)[
+					Symbol.for("pi.ext.thinking-block-hide")
+				]?.patched === true,
+				"extension loaded but its patches were not installed",
 			),
 	},
 
