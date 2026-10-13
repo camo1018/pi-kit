@@ -80,7 +80,8 @@ For a cloned install, `git pull` is equivalent to `pi update --extension`.
 | `md-fence-render/` | Render ```` ```md ```` blocks as Markdown; `┌─ lang` / `└─` markers instead of ```` ``` ```` fences on code; copy-safe code block prompt rules. ⚠️ [internals](extensions/md-fence-render/README.md) |
 | `click-copy/` | Click a fenced block in fullscreen TUI to copy it exactly (pbcopy / OSC 52). [internals](extensions/click-copy/README.md) |
 | `snippet-copy/` | `/cc [n|lang]`, `ctrl+shift+y`, numbered block labels. Optional alongside click-copy — load both or pick one via the package resource filter. [internals](extensions/snippet-copy/README.md) |
-| `tool-output-hide/` | Collapse noisy tool output. ⚠️ [internals](extensions/tool-output-hide/README.md) |
+| `tool-output-hide/` | Add a hidden state for noisy tool output. ⚠️ [internals](extensions/tool-output-hide/README.md) |
+| `thinking-block-hide/` | Add a fully hidden state for thinking blocks (`ctrl+t`, `/thinking-blocks`). ⚠️ [internals](extensions/thinking-block-hide/README.md) |
 | `final-answer-divider/` | Visual divider before the final answer |
 | `compat-check/` | Warns on startup / `/reload` when a Pi upgrade breaks an extension that uses Pi internals (`/compat` for the full report) |
 
