@@ -3,10 +3,11 @@
  *
  * - Typing `@[` opens a fuzzy picker over ALL saved sessions (all projects),
  *   matched by name, first message, cwd basename, or session id.
- *   Accepting inserts `@[session-id]` in place — plain `@` file completion is
- *   untouched for everything else.
- * - On submit, every `@[id]` token is expanded: the referenced session's
- *   active-branch transcript is rendered as markdown and injected as a
+ *   Accepting inserts `@[<session name>]` in place (falls back to the id when
+ *   the session has no name, or its name contains a `]`). Plain `@` file
+ *   completion is untouched for everything else.
+ * - On submit, every `@[name]` (or `@[id]`) token is expanded: the referenced
+ *   session's active-branch transcript is rendered as markdown and injected as a
  *   <skill>-shaped block ahead of your message (pi's TUI collapses that shape
  *   in user messages, so the injected transcript doesn't flood the chat view).
  *   The token itself is replaced with a short «name» marker so your sentence
@@ -30,9 +31,11 @@ import { fuzzyFilter } from "@earendil-works/pi-tui";
 
 // `@[query` immediately before the cursor, preceded by start/whitespace/opening punctuation.
 // Mirrors the token shape pi-tui uses for @ file completion, but requires the '[' after '@'.
-const COMPLETION_PATTERN = /(?:^|[\s([{<"'`])@\[([\w.:+\- /]*)$/;
-// `@[id]` tokens in submitted text.
-const TOKEN_PATTERN = /(^|[\s([{<"''])@\[([A-Za-z0-9][\w.\-]*)\]/g;
+// The query can be any prose up to ']' — session names contain punctuation.
+const COMPLETION_PATTERN = /(?:^|[\s([{<"'`])@\[([^\]\n]*)$/;
+// `@[...]` tokens in submitted text: contents are a session name or id, up to
+// the first ']'. Unknown names/ids are left literal.
+const TOKEN_PATTERN = /(^|[\s([{<"''])@\[([^\]\n]+)\]/g;
 
 interface SessionRef {
 	info: SessionInfo;
@@ -93,7 +96,8 @@ function codeRanges(text: string): Array<[number, number]> {
 
 function findSessionMentions(
 	text: string,
-	sessions: Map<string, SessionInfo>,
+	byId: Map<string, SessionInfo>,
+	byName: Map<string, SessionInfo>,
 ): Array<{ match: string; info: SessionInfo }> {
 	const code = codeRanges(text);
 	const inCode = (i: number) => code.some(([s, e]) => i >= s && i < e);
@@ -102,13 +106,15 @@ function findSessionMentions(
 	for (const m of text.matchAll(TOKEN_PATTERN)) {
 		const atIdx = (m.index ?? 0) + m[1].length;
 		if (inCode(atIdx)) continue;
-		const id = m[2];
-		const info = sessions.get(id);
-		// Replace only the `@[id]` part (not the preceding boundary char) so the
+		// Ids win when a token is shaped like both; duplicate names resolve to
+		// the most recently modified session.
+		const token = m[2];
+		const info = byId.get(token) ?? byName.get(token);
+		// Replace only the `@[...]` part (not the preceding boundary char) so the
 		// user's sentence spacing is preserved.
-		if (info && !seen.has(id)) {
-			seen.add(id);
-			found.push({ match: `@[${id}]`, info });
+		if (info && !seen.has(info.id)) {
+			seen.add(info.id);
+			found.push({ match: `@[${token}]`, info });
 		}
 	}
 	return found;
@@ -151,11 +157,16 @@ export default function (pi: ExtensionAPI): void {
 		const text = event.text;
 		if (!text.includes("@[")) return { action: "continue" };
 
-		// Index known sessions by id for token resolution.
+		// Index known sessions by id and by name for token resolution. The list
+		// is sorted newest-first, so the first name hit is the most recent one.
 		const byId = new Map<string, SessionInfo>();
-		for (const s of await listSessions()) byId.set(s.info.id, s.info);
+		const byName = new Map<string, SessionInfo>();
+		for (const s of await listSessions()) {
+			byId.set(s.info.id, s.info);
+			if (s.info.name && !byName.has(s.info.name)) byName.set(s.info.name, s.info);
+		}
 
-		const mentions = findSessionMentions(text, byId);
+		const mentions = findSessionMentions(text, byId, byName);
 		if (mentions.length === 0) return { action: "continue" };
 
 		try {
@@ -212,10 +223,18 @@ export default function (pi: ExtensionAPI): void {
 					return `${Math.floor(s / 86400)}d`;
 				};
 
+				// Insert the session's NAME when possible so the prompt stays
+				// readable; fall back to the id for unnamed sessions or names
+				// containing ']' (which would end the token early).
+				const valueOf = (s: SessionRef): string => {
+					const name = s.info.name;
+					return name && !name.includes("]") ? `@[${name}]` : `@[${s.info.id}]`;
+				};
+
 				return {
 					prefix: `@[${query}`,
 					items: matches.slice(0, 20).map((s) => ({
-						value: `@[${s.info.id}]`,
+						value: valueOf(s),
 						label: labelOf(s),
 						description: `${s.dir} · ${rel(s.info.modified)} · ${s.info.messageCount} msg · ${s.info.id}`,
 					})),
