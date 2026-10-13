@@ -2,7 +2,13 @@
  * Background agents for the Inbox.
  *
  * Every background agent is a short-lived child pi process:
- *   pi --mode json --session-id <id> -- "<message>"
+ *   pi --mode json --session-id <id>
+ * with the message piped on stdin (NOT as a positional argument: pi's startup
+ * parser turns any argument beginning with `@` into a file mention, so a
+ * prompt like "@foo fix this" would kill the child with "File not found"
+ * before it ever runs — and a bare "@" makes it try to read the cwd as a
+ * file). Stdin content is prepended to the prompt, which is equivalent here
+ * since each run sends exactly one message.
  * with the same settings, skills and extensions as a normal pi (nothing is trimmed).
  * It runs one prompt against its session file, streams JSON events to us on stdout,
  * and exits. Follow-up messages re-run pi on the same session id, so the agent keeps
@@ -750,7 +756,6 @@ function run(a: BgAgent) {
 	const model = a.nextModel ?? (a.runs === 0 ? a.model : undefined);
 	a.nextModel = undefined;
 	if (model) args.push("--model", model);
-	args.push("--", message);
 
 	let child: ChildProcess;
 	let outFd: number | undefined;
@@ -762,6 +767,7 @@ function run(a: BgAgent) {
 		errFd = fs.openSync(agentFile(a.id, "err"), "w");
 		// detached: own session + process group, no controlling tty → no SIGHUP when the tab closes,
 		// and not in pi's process group. Output goes to files, so nothing breaks when we're gone.
+		// stdin is a pipe we write the message to (see spawn below).
 		child = spawn(cmd, args, {
 			cwd: a.cwd,
 			env: {
@@ -770,10 +776,15 @@ function run(a: BgAgent) {
 				PI_INBOX_BG_AGENT: a.id,
 				[BACKGROUND_MCP_AUTO_APPROVE_ENV]: "1",
 			},
-			stdio: ["ignore", outFd, errFd],
+			stdio: ["pipe", outFd, errFd],
 			detached: true,
 		});
 		child.unref();
+		// Deliver the prompt on stdin. detached children must not inherit our tty's
+		// stdin, and a pipe lets the message start with any character (incl. '@')
+		// without tripping pi's `@file` argument expansion.
+		child.stdin!.on("error", () => {}); // EPIPE if the child dies early
+		child.stdin!.end(message);
 	} catch (e) {
 		a.state = "error";
 		a.error = `spawn failed: ${e instanceof Error ? e.message : String(e)}`;
