@@ -126,12 +126,19 @@ export function cleanStepText(text: string): string {
 	return cleaned;
 }
 
+export function extractPlanText(message: string): string | undefined {
+	const headerMatch = message.match(/\*{0,2}Plan:\*{0,2}\s*\n/i);
+	if (!headerMatch || headerMatch.index === undefined) return undefined;
+	const body = message.slice(headerMatch.index + headerMatch[0].length).trim();
+	return body ? `Plan:\n${body}` : undefined;
+}
+
 export function extractTodoItems(message: string): TodoItem[] {
 	const items: TodoItem[] = [];
-	const headerMatch = message.match(/\*{0,2}Plan:\*{0,2}\s*\n/i);
-	if (!headerMatch) return items;
+	const planText = extractPlanText(message);
+	if (!planText) return items;
 
-	const planSection = message.slice(message.indexOf(headerMatch[0]) + headerMatch[0].length);
+	const planSection = planText.replace(/^Plan:\s*\n/i, "");
 	const numberedPattern = /^\s*(\d+)[.)]\s+\*{0,2}([^*\n]+)/gm;
 
 	for (const match of planSection.matchAll(numberedPattern)) {
