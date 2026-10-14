@@ -26,8 +26,13 @@ const oldDir = process.env.PI_CODING_AGENT_DIR;
 process.env.PI_CODING_AGENT_DIR = dir;
 writeFileSync(join(dir, "notify.json"), JSON.stringify({ enabled: false }));
 const { default: inbox } = await import("./index.ts");
-const { registry, removeQueuedMessage, releaseAgent, sessionModel } =
-	await import("../../lib/inbox-agents.ts");
+const {
+	applyEvent,
+	registry,
+	removeQueuedMessage,
+	releaseAgent,
+	sessionModel,
+} = await import("../../lib/inbox-agents.ts");
 const { closeVisit, visitingId } = await import("../../lib/visit-runtime.ts");
 const { default: renameChat } = await import("../rename-chat/index.ts");
 initTheme("dark");
@@ -273,6 +278,37 @@ async function setup(t: TestContext, takenOver = true) {
 		overlay: () => overlay,
 	};
 }
+
+test(
+	"a timed-out agent stops showing as working when it settles",
+	async (t) => {
+		const f = await setup(t);
+		const a = await f.visit("timed-out agent");
+		applyEvent(a, {
+			type: "auto_retry_end",
+			success: false,
+			finalError: "Request timed out while offline",
+		});
+		applyEvent(a, { type: "agent_settled" });
+
+		assert.equal(a.state, "error");
+		assert.equal(a.error, "Request timed out while offline");
+		assert.equal(a.needsYou, true);
+		// The process remains reserved until it exits, preventing another writer.
+		assert.ok(a.proc);
+
+		const { list, done } = await f.openInbox();
+		const rendered = list.render(120).join("\n");
+		const row = rendered
+			.split("\n")
+			.find((line: string) => line.includes("timed-out agent"));
+		assert.ok(row);
+		assert.match(row, /✗ error/);
+		assert.doesNotMatch(row, /working/);
+		list.handleInput("\x1b");
+		await done;
+	},
+);
 
 test("queue status follows the visited agent, not the foreground", async (t) => {
 	const f = await setup(t);
