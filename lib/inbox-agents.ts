@@ -60,6 +60,11 @@ export interface BgAgent {
 	/** Set while a run is in flight (our own child, or an adopted orphan). */
 	proc?: AgentProc;
 	pid?: number;
+	/**
+	 * The child emitted agent_settled, so the run's user-visible state is final.
+	 * Keep proc until the one-shot child exits to prevent a second writer.
+	 */
+	settledAt?: number;
 	/** Prompt of the in-flight run (persisted so an adopter can show it). */
 	runPrompt?: string;
 	runStartedAt?: number;
@@ -392,6 +397,8 @@ const OWNER_STALE_MS = 20_000;
 /** Child heartbeat staleness (after a startup grace) that means the child died without a word. */
 const CHILD_STALE_MS = 45_000;
 const CHILD_GRACE_MS = 90_000;
+/** A JSON-mode child should exit immediately after agent_settled. */
+const SETTLED_EXIT_GRACE_MS = 5_000;
 
 interface SavedAgent {
 	v: 1;
@@ -404,6 +411,7 @@ interface SavedAgent {
 	state: AgentState;
 	pending: string[];
 	pid?: number;
+	settledAt?: number;
 	runPrompt?: string;
 	runStartedAt?: number;
 	createdAt: number;
@@ -463,6 +471,7 @@ function persist(a: BgAgent) {
 		state: a.state,
 		pending: a.pending,
 		pid: a.pid,
+		settledAt: a.settledAt,
 		runPrompt: a.runPrompt,
 		runStartedAt: a.runStartedAt,
 		createdAt: a.createdAt,
@@ -719,9 +728,14 @@ function adopt(s: SavedAgent) {
 		restartAfterInterrupt: s.restartAfterInterrupt,
 	};
 	registry().agents.set(a.id, a);
-	const inFlight = s.pid && (s.state === "working" || s.state === "cancelled");
+	const inFlight =
+		s.pid &&
+		(s.state === "working" ||
+			s.state === "cancelled" ||
+			s.settledAt !== undefined);
 	if (inFlight) {
 		a.pid = s.pid;
+		a.settledAt = s.settledAt;
 		a.runPrompt = s.runPrompt;
 		a.runStartedAt = s.runStartedAt;
 		a.outOffset = 0; // replay the run so far
@@ -810,6 +824,7 @@ function run(a: BgAgent) {
 		},
 	};
 	a.pid = child.pid;
+	a.settledAt = undefined;
 	a.runPrompt = message;
 	a.runStartedAt = Date.now();
 	a.outOffset = 0;
@@ -826,6 +841,7 @@ function run(a: BgAgent) {
 function monitor(a: BgAgent, child?: ChildProcess) {
 	let exited: number | undefined;
 	let exitSignal: string | undefined;
+	let settledStopRequested = false;
 	child?.on("exit", (code, signal) => {
 		exited = code ?? 1;
 		exitSignal = signal ?? undefined;
@@ -915,6 +931,17 @@ function monitor(a: BgAgent, child?: ChildProcess) {
 			const age = Date.now() - (a.runStartedAt ?? 0);
 			if (age > CHILD_GRACE_MS && childBeatAge(a.id) > CHILD_STALE_MS) code = -1;
 		}
+		if (
+			code === undefined &&
+			a.settledAt &&
+			!settledStopRequested &&
+			Date.now() - a.settledAt > SETTLED_EXIT_GRACE_MS
+		) {
+			// agent_settled is definitive. Do not leave a JSON-mode process that
+			// failed to exit holding the agent in a half-finished state forever.
+			settledStopRequested = true;
+			a.proc?.kill("SIGTERM");
+		}
 		if (code === undefined) return;
 		clearInterval(timer);
 		drain();
@@ -924,8 +951,10 @@ function monitor(a: BgAgent, child?: ChildProcess) {
 }
 
 function finishRun(a: BgAgent, code: number, signal?: string) {
+	const wasSettled = a.settledAt !== undefined;
 	a.proc = undefined;
 	a.pid = undefined;
+	a.settledAt = undefined;
 	flushPendingModel(a);
 	a.runPrompt = undefined;
 	a.runStartedAt = undefined;
@@ -948,7 +977,7 @@ function finishRun(a: BgAgent, code: number, signal?: string) {
 	} else if (a.state === "cancelled") {
 		a.activity = "cancelled";
 		persist(a);
-	} else if (code !== 0 || a.error) {
+	} else if ((code !== 0 && !wasSettled) || a.error) {
 		a.state = "error";
 		const lastLine = errTail(a.id)
 			.split("\n")
@@ -1088,16 +1117,44 @@ function handleEvent(a: BgAgent, ev: any, deltaGate: () => boolean) {
 			touch(a);
 			break;
 		case "auto_retry_end":
-			// A provider error that pi retried successfully isn't a run failure; exhausted
-			// retries (success: false) keep the error from the failed message_end.
+			// A provider error that pi retried successfully isn't a run failure.
+			// Preserve the explicit final error even if no message_end carried it.
 			if (ev.success) a.error = undefined;
+			else if (typeof ev.finalError === "string" && ev.finalError) {
+				a.error = ev.finalError;
+			}
 			touch(a);
+			break;
+		case "agent_settled":
+			settleRun(a);
 			break;
 		case "compaction_start":
 			a.activity = "compacting…";
 			touch(a);
 			break;
 	}
+}
+
+/**
+ * Reflect Pi's definitive run boundary immediately. The process handle stays
+ * attached until the one-shot child exits, preventing concurrent session
+ * writes.
+ */
+function settleRun(a: BgAgent) {
+	if (a.settledAt) return;
+	a.settledAt = Date.now();
+	a.activity = undefined;
+	if (a.restartAfterInterrupt) {
+		a.state = a.pending.length ? "queued" : "idle";
+	} else if (a.state !== "cancelled" && a.error) {
+		a.state = "error";
+	} else if (a.state !== "cancelled") {
+		a.state = a.pending.length ? "queued" : "idle";
+	}
+	a.needsYou = a.state === "error" ||
+		(a.state === "idle" && a.pending.length === 0);
+	persist(a);
+	touch(a);
 }
 
 function textOf(content: unknown): string {
