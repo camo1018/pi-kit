@@ -199,7 +199,10 @@ The preview pane under the list shows the dir, created/updated/pinned/archived t
 - **Filter rules**: `~/.pi/agent/inbox-filters.json`, matched against each session's `SessionInfo` on every refresh and cached by file mtime.
 - **Live status**: each Pi process writes `~/.pi/agent/inbox-live/<pid>.json` with its session and `working`/`idle` state. It updates on `session_start`, `agent_start` and `agent_settled`, and deletes the file on shutdown. Files for dead PIDs are pruned when the inbox reads them.
 - **Session status**: parsed from the tail of each session `.jsonl`: the last message's role and `stopReason`. Results are cached by file mtime and size.
-- **Session list**: `SessionManager.listAll()`, which covers every project folder under `~/.pi/agent/sessions/`.
+- **Session list**: a two-phase scan of `~/.pi/agent/sessions/` (replaces `SessionManager.listAll()`, which full-parses every file on every refresh):
+  1. **Header scan**: read only the first line of each `.jsonl` (id, cwd, timestamp) — a few ms for hundreds of sessions — and partition on the store's archive marks.
+  2. **Targeted parse**: full-parse only the files the current view needs. Archived sessions are parsed on demand, the first time you open a tab that can show them (Archived, All, Filtered) or run `/inbox filters`; from then on they stay cached and refresh like active ones.
+  Parsed `SessionInfo`s (message count, name, first message, newest activity) are cached per file keyed on mtime+size, so refreshes only reparse files that changed. The text index used by `/` search and filter rules keeps the oldest 5 and newest 10 messages per session instead of the whole transcript — deep middle-of-history text isn't searchable (that tradeoff is what makes the inbox open in ~150ms instead of ~1s).
 
 ## Troubleshooting
 

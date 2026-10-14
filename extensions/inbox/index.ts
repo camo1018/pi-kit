@@ -46,6 +46,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as readline from "node:readline";
 import {
 	installBackgroundMcpAutoApproval,
 } from "../../lib/background-mcp-approval.ts";
@@ -668,8 +669,9 @@ interface Row {
 	unread?: boolean;
 }
 
-async function loadRows(currentId: string | undefined): Promise<Row[]> {
-	const [infos, store, live, filters] = [await SessionManager.listAll(), loadStore(), readLive(), loadFilters()];
+async function loadRows(currentId: string | undefined, wantArchived = false): Promise<Row[]> {
+	const [store, live, filters] = [loadStore(), readLive(), loadFilters()];
+	const infos = await scanSessions(store, wantArchived);
 	const rows: Row[] = [];
 	for (const info of infos) {
 		const isCurrent = info.id === currentId;
@@ -729,6 +731,175 @@ async function loadRows(currentId: string | undefined): Promise<Row[]> {
 	const since = unreadBaseline(store);
 	for (const r of rows) r.unread = isUnread(r, since);
 	return rows;
+}
+
+// ───────────────────── session discovery: header scan + cached parse ─────────────────────
+//
+// SessionManager.listAll() full-parses every session file on every call (~200 files, ~180MB
+// here) — that was the ~1s ctrl+q delay, and it re-ran every 2.5s while the inbox was open.
+// Instead: scan first lines only (header: id, cwd, timestamp), partition on archive state from
+// the store, and full-parse just the files a view needs. Parsed SessionInfos are cached per
+// file keyed on mtime+size, so refreshes only reparse files that actually changed.
+// Archived sessions are parsed on demand (the first time a view that shows them is opened).
+
+interface HeaderInfo {
+	path: string;
+	id: string;
+	cwd: string;
+	created: Date;
+	modified: Date;
+	/** mtime+size at header-scan time; reused to key the full-parse cache. */
+	mtimeMs: number;
+	size: number;
+}
+
+/** First line of a session file is always the `session` header: id, timestamp, cwd. */
+function readSessionHeaderLine(file: string): HeaderInfo | undefined {
+	try {
+		const st = fs.statSync(file);
+		if (st.size === 0) return;
+		const fd = fs.openSync(file, "r");
+		try {
+			// headers are tiny, but a 4KB window guards against a bloated first entry
+			const len = Math.min(st.size, 4096);
+			const buf = Buffer.alloc(len);
+			fs.readSync(fd, buf, 0, len, 0);
+			const nl = buf.indexOf(10);
+			const line = (nl === -1 ? buf : buf.subarray(0, nl)).toString("utf-8").trim();
+			const h = JSON.parse(line);
+			if (h?.type !== "session" || typeof h.id !== "string" || typeof h.cwd !== "string") return;
+			// `modified` falls back to mtime; the full parse refines it from message timestamps.
+			return { path: file, id: h.id, cwd: h.cwd, created: new Date(h.timestamp), modified: st.mtime, mtimeMs: st.mtimeMs, size: st.size };
+		} finally {
+			fs.closeSync(fd);
+		}
+	} catch {
+		return undefined;
+	}
+}
+
+/** Cheap directory walk of ~/.pi/agent/sessions: header line only, one file at a time. */
+function scanHeaders(): HeaderInfo[] {
+	const root = path.join(AGENT_DIR, "sessions");
+	let dirs: fs.Dirent[];
+	try {
+		dirs = fs.readdirSync(root, { withFileTypes: true });
+	} catch {
+		return [];
+	}
+	const out: HeaderInfo[] = [];
+	for (const d of dirs) {
+		if (!d.isDirectory() && !d.isSymbolicLink()) continue;
+		let files: string[];
+		try {
+			files = fs.readdirSync(path.join(root, d.name));
+		} catch {
+			continue;
+		}
+		for (const f of files) {
+			if (!f.endsWith(".jsonl")) continue;
+			const h = readSessionHeaderLine(path.join(root, d.name, f));
+			if (h) out.push(h);
+		}
+	}
+	return out;
+}
+
+/**
+ * Full-parse a session file into a SessionInfo, mirroring pi's buildSessionInfo(): message
+ * count, session name, first message, and a *capped* text index (first/last few messages) —
+ * search still finds every session, it just can't match on deep middle-of-history text.
+ */
+async function buildInfo(h: HeaderInfo): Promise<SessionInfo> {
+	let messageCount = 0;
+	let name: string | undefined;
+	let firstMessage = "";
+	let lastActivityMs = 0;
+	const head: string[] = [];
+	const tail: string[] = [];
+	// bounded text index: newest + oldest messages kept for search + filter rules (`text` regexes);
+	// deep middle-of-history text isn't searchable — the tradeoff for not holding full transcripts.
+	const KEEP_HEAD = 5;
+	const KEEP_TAIL = 10;
+	try {
+		const rl = readline.createInterface({ input: fs.createReadStream(h.path, { encoding: "utf-8" }), crlfDelay: Infinity });
+		for await (const line of rl) {
+			let entry: any;
+			try {
+				entry = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			if (entry.type === "session_info" && typeof entry.name === "string") name = entry.name.trim() || undefined;
+			if (entry.type !== "message" || !entry.message) continue;
+			// parity with pi's buildSessionInfo: every message entry counts, any role.
+			messageCount++;
+			const ts = entry.message.timestamp ?? entry.timestamp;
+			const t = typeof ts === "number" ? ts : Date.parse(ts);
+			if (!Number.isNaN(t)) lastActivityMs = Math.max(lastActivityMs, t);
+			const m = entry.message;
+			if (!["user", "assistant"].includes(m.role)) continue;
+			const text = messageText(m.content).trim();
+			if (!text) continue;
+			if (m.role === "user" && !firstMessage) firstMessage = text;
+			if (tail.length >= KEEP_TAIL) tail.shift();
+			tail.push(text);
+			if (head.length < KEEP_HEAD) head.push(text);
+		}
+	} catch {
+		// unreadable → empty-ish
+	}
+	const overlap = Math.min(head.length, tail.length, KEEP_HEAD);
+	return {
+		path: h.path,
+		id: h.id,
+		cwd: h.cwd,
+		name,
+		created: h.created,
+		modified: lastActivityMs > 0 ? new Date(lastActivityMs) : h.modified,
+		messageCount,
+		firstMessage: firstMessage || "(no messages)",
+		allMessagesText: head.concat(tail.slice(overlap)).join(" "),
+	};
+}
+
+interface ScanPartition {
+	active: HeaderInfo[];
+	archived: HeaderInfo[];
+}
+
+const infoCache = new Map<string, { mtimeMs: number; size: number; info: SessionInfo }>();
+
+async function parseCached(h: HeaderInfo): Promise<SessionInfo> {
+	const c = infoCache.get(h.path);
+	if (c && c.mtimeMs === h.mtimeMs && c.size === h.size) return c.info;
+	const info = await buildInfo(h);
+	infoCache.set(h.path, { mtimeMs: h.mtimeMs, size: h.size, info });
+	return info;
+}
+
+/**
+ * Two-phase discovery: header scan of every file, partition on the store's archive marks.
+ * `wantArchived` adds the archived partition (parsed on demand — the Archived/All/Filtered
+ * tabs, or `/inbox filters`). Parsed infos are cached per file (mtime+size), so both the
+ * archived partition and steady-state refreshes only reparse files that actually changed —
+ * an archived session that wakes up is never served stale.
+ */
+async function scanSessions(store: Store, wantArchived: boolean): Promise<SessionInfo[]> {
+	const headers = scanHeaders();
+	const archivedIds = new Set(Object.entries(store.sessions).filter(([, m]) => m.archivedAt).map(([id]) => id));
+	const part: ScanPartition = { active: [], archived: [] };
+	for (const h of headers) (archivedIds.has(h.id) ? part.archived : part.active).push(h);
+	const targets = wantArchived ? [...part.active, ...part.archived] : part.active;
+	// Like pi's own discovery, a handful at a time: parses are I/O bound, not CPU.
+	const out: SessionInfo[] = [];
+	const QUEUE = 10;
+	let next = 0;
+	const worker = async () => {
+		while (next < targets.length) out.push(await parseCached(targets[next++]!));
+	};
+	await Promise.all(Array.from({ length: Math.min(QUEUE, targets.length) }, worker));
+	return out;
 }
 
 /**
@@ -877,6 +1048,11 @@ function printable(data: string): string | undefined {
 type View = "inbox" | "archived" | "all" | "filtered";
 const VIEWS: View[] = ["inbox", "archived", "all", "filtered"];
 
+/** Views that list archived sessions — they trigger (and then keep warm) the archived parse. */
+function viewWantsArchived(v: View): boolean {
+	return v === "archived" || v === "all" || v === "filtered";
+}
+
 interface UIState {
 	view: View;
 	query: string;
@@ -907,6 +1083,8 @@ class InboxComponent {
 	/** `replace`: the original name is shown but the first typed char wipes it; cleared once you move the cursor. */
 	private renaming?: { id: string; input: Input; replace: boolean };
 	private loading = false;
+	/** Set once archived sessions have been parsed at least once (refresh keeps them warm). */
+	private archivedLoaded = false;
 	private timer?: ReturnType<typeof setInterval>;
 	private flash?: { text: string; until: number };
 	private quitArmed = 0;
@@ -938,11 +1116,12 @@ class InboxComponent {
 
 	invalidate() {}
 
-	private async refresh() {
+	private async refresh(wantArchived = this.archivedLoaded || viewWantsArchived(this.state.view)) {
 		if (this.loading) return;
 		this.loading = true;
 		try {
-			this.rows = await loadRows(this.currentId);
+			this.rows = await loadRows(this.currentId, wantArchived);
+			this.archivedLoaded ||= wantArchived;
 			this.onRows(this.rows);
 			this.rebuild();
 			this.tui.requestRender();
@@ -968,6 +1147,11 @@ class InboxComponent {
 			else inbox++;
 		}
 		return { inbox, archived, all: inbox + archived, filtered };
+	}
+
+	/** True when the current tab shows archived sessions (they're parsed on demand). */
+	private showsArchived(): boolean {
+		return viewWantsArchived(this.state.view);
 	}
 
 	private rebuild() {
@@ -1030,6 +1214,9 @@ class InboxComponent {
 		this.state.selectedId = undefined;
 		this.selected = 0;
 		this.scroll = 0;
+		// Archived sessions are parsed lazily: the first switch to a tab that can show them
+		// triggers the load (cached afterwards; refresh keeps them warm from then on).
+		if (viewWantsArchived(v) && !this.archivedLoaded) void this.refresh(true);
 		this.rebuild();
 	}
 
@@ -3682,7 +3869,7 @@ export default function (pi: ExtensionAPI) {
 
 	async function openInbox(ctx: ExtensionCommandContext) {
 		if (ctx.mode !== "tui") {
-			// Plain-text fallback for non-interactive modes.
+			// Plain-text fallback for non-interactive modes: inbox rows only, archived skipped.
 			const rows = await loadRows(viewedSession(ctx).id);
 			const lines = rows
 				.filter((r) => !r.meta.archivedAt && !r.filtered)
@@ -3722,7 +3909,7 @@ export default function (pi: ExtensionAPI) {
 				!rowCache.some((r) => r.info.id === uiState.selectedId)) ||
 			rowCache.some((r) => r.isCurrent !== (r.info.id === viewed.id))
 		) {
-			rowCache = await loadRows(viewed.id);
+			rowCache = await loadRows(viewed.id, viewWantsArchived(uiState.view));
 			(globalThis as any)[ROWS_KEY] = rowCache;
 		}
 
@@ -3843,7 +4030,7 @@ export default function (pi: ExtensionAPI) {
 					result.row.info.id,
 					result.row.title,
 				);
-				rowCache = await loadRows(viewed.id);
+				rowCache = await loadRows(viewed.id, viewWantsArchived(uiState.view));
 				(globalThis as any)[ROWS_KEY] = rowCache;
 				continue;
 			}
@@ -3915,7 +4102,7 @@ export default function (pi: ExtensionAPI) {
 						}),
 					{ overlay: true, overlayOptions: overlayOpts() },
 				);
-				rowCache = await loadRows(viewed.id);
+				rowCache = await loadRows(viewed.id, viewWantsArchived(uiState.view));
 				(globalThis as any)[ROWS_KEY] = rowCache;
 				if (r?.action === "cancel") cancelAgent(row.info.id);
 				if (r?.action === "reply") {
@@ -3935,7 +4122,7 @@ export default function (pi: ExtensionAPI) {
 						if (!text) continue;
 						sendToAgent({ id: row.info.id, cwd: row.info.cwd, sessionFile: file, title: row.title, text });
 						uiState.selectedId = row.info.id;
-						rowCache = await loadRows(viewed.id);
+						rowCache = await loadRows(viewed.id, viewWantsArchived(uiState.view));
 						continue;
 					}
 					setReplyTarget(
@@ -4125,7 +4312,7 @@ export default function (pi: ExtensionAPI) {
 			const a = args.trim().toLowerCase();
 			if (["help", "?", "docs", "readme"].includes(a)) return showHelp(ctx);
 			if (["filters", "filter", "blocklist"].includes(a)) {
-				const rows = await loadRows(viewedSession(ctx).id);
+				const rows = await loadRows(viewedSession(ctx).id, true);
 				return showHelp(ctx, filtersReport(rows), "filters");
 			}
 			return openInbox(ctx);
