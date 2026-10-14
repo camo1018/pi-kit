@@ -15,7 +15,9 @@ That installs everything. To **pick extensions** — pi-kit is modular, you don'
 have to load all of it:
 
 ```bash
-git clone https://github.com/camo1018/pi-kit ~/Code/pi-kit && ~/Code/pi-kit/install.sh --extensions inbox,plan-mode
+git clone https://github.com/camo1018/pi-kit ~/Code/pi-kit
+cd ~/Code/pi-kit
+./install.sh --extensions inbox,plan-mode
 ```
 
 `install.sh` registers the package with pi (from the clone, so edits apply on
@@ -27,6 +29,10 @@ overwriting existing ones. Re-run it to change the selection:
 ~/Code/pi-kit/install.sh --extensions all          # back to everything
 ~/Code/pi-kit/install.sh --extensions "inbox,plan-mode,voice" --voice
 ```
+
+When filtering, select both `click-copy` and `md-fence-render` for clickable
+code blocks. `snippet-copy` is independent and provides `/cc` plus
+`ctrl+shift+y`; it can be enabled with or without click-to-copy.
 
 - `--voice` installs sox + whisper-cpp and downloads the dictation models
   (~500 MB) into `~/.pi/agent/voice/models/`.
@@ -72,14 +78,15 @@ For a cloned install, `git pull` is equivalent to `pi update --extension`.
 | Extension | What it does |
 |---|---|
 | `inbox/` + `lib/inbox-agents.ts` | Orchestrator mode (`pi --orchestrator`, `ctrl+q`): session inbox, background agents, attach/takeover. ⚠️ [docs + internals](extensions/inbox/README.md) |
-| `plan-mode/` | Read-only plan mode (`/plan`, `ctrl+shift+r`, `/todos`) |
+| `plan-mode/` | Read-only planning with durable files and headless support (`/plan`, `/plan-execute`, `/plan-refine`, `/todos`) |
 | `voice/` | Local voice dictation via sox + whisper.cpp (`/voice`, `/voice check`). macOS |
 | `notify/` | Sound + macOS notification when a turn finishes (`/notify`, `~/.pi/agent/notify.json`) |
 | `rename-chat/` | `rename-chat` tool so the agent can title sessions |
 | `inline-skills/` | `$skill` inline skill references |
+| `session-mention/` | Reference another saved session with `@[name]`; autocomplete inserts names and submit expands the transcript. [docs](extensions/session-mention/README.md) |
 | `md-fence-render/` | Render ```` ```md ```` blocks as Markdown; `┌─ lang` / `└─` markers instead of ```` ``` ```` fences on code; copy-safe code block prompt rules. ⚠️ [internals](extensions/md-fence-render/README.md) |
-| `click-copy/` | Click a fenced block in fullscreen TUI to copy it exactly (pbcopy / OSC 52). [internals](extensions/click-copy/README.md) |
-| `snippet-copy/` | `/cc [n|lang]`, `ctrl+shift+y`, numbered block labels. Optional alongside click-copy — load both or pick one via the package resource filter. [internals](extensions/snippet-copy/README.md) |
+| `click-copy/` | Click a fenced block in fullscreen TUI to copy it exactly; requires `md-fence-render`. [docs](extensions/click-copy/README.md) |
+| `snippet-copy/` | Copy fenced blocks by number or language with `/cc [n|lang]` or `ctrl+shift+y`; works independently of click-to-copy. [docs](extensions/snippet-copy/README.md) |
 | `tool-output-hide/` | Add a hidden state for noisy tool output. ⚠️ [internals](extensions/tool-output-hide/README.md) |
 | `thinking-block-hide/` | Add a fully hidden state for thinking blocks (`ctrl+t`, `/thinking-blocks`). ⚠️ [internals](extensions/thinking-block-hide/README.md) |
 | `final-answer-divider/` | Visual divider before the final answer |
