@@ -3,13 +3,13 @@
 Copy fenced code blocks from assistant messages exactly — one keystroke,
 no mouse selection, no wrap or padding artifacts.
 
-```
+````text
 /cc            copy the most recent code block
 /cc 3          copy block #3
 /cc text       copy the most recent block tagged ```text
                (e.g. the latest Slack draft)
 ctrl+shift+y   copy the most recent code block
-```
+````
 
 Click-to-copy used to live here; it now lives in the separate
 **click-copy** extension (the two share nothing — a click copies without
@@ -27,11 +27,10 @@ touching the numbering here, and `/cc` works without the click hook).
 
 ## Why it exists
 
-pi-tui hard-wraps long lines into physical terminal rows, so triple-click
-line selection copies wrap-induced fragments — and the copy-safe guideline
-(md-fence-render) means even prose like Slack drafts contains real line
-breaks at ~80 columns. `/cc` bypasses selection entirely and copies the
-exact original text.
+pi-tui wraps long lines into physical terminal rows, so mouse selection can
+copy display-induced fragments. `/cc` bypasses terminal selection and copies
+the exact original text, preserving only the line breaks that were actually in
+the fenced block.
 
 ## Transformer ordering
 
@@ -43,9 +42,9 @@ blocks with nested fences are numbered correctly instead of truncating at
 the first inner fence. If you add a language to `RENDER_LANGS` there, mirror
 it here.
 
-## Pi internals this depends on
+## APIs used
 
-All public APIs:
+This extension uses only public APIs:
 
 - `pi.registerCommand("cc", …)` with `getArgumentCompletions`
 - `pi.registerShortcut("ctrl+shift+y", …)`

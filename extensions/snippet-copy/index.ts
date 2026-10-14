@@ -22,9 +22,6 @@
  * over SSH — the exact original text, one block, no padding, no
  * wrap-induced line breaks.
  *
- * Click-to-copy lives in the separate click-copy extension; when both
- * are loaded, a click copies without touching the numbering here.
- *
  * Load order: registered before md-fence-render (transformers chain in
  * package order), so labels attach to the raw markdown and survive
  * fence rewriting; rendered ```md blocks keep their labels, and code
@@ -234,7 +231,7 @@ export default function snippetCopy(pi: ExtensionAPI) {
 	pi.registerCommand("cc", {
 		description:
 			"Copy a code block to the clipboard (default: latest; " +
-			"/cc <n> by number; /cc <lang> e.g. /cc text for the latest draft",
+			"/cc <n> by number; /cc <lang> e.g. /cc text for latest draft)",
 		getArgumentCompletions: (prefix: string) => {
 			const p = prefix.trim().toLowerCase().replace(/^#/, "");
 			const items = [...blocks]
