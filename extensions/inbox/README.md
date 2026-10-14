@@ -8,7 +8,7 @@ Source: `~/Code/pi-kit/extensions/inbox/index.ts` (background agents: `~/Code/pi
 
 | Command | What it does |
 |---|---|
-| `/inbox` or `ctrl+q` | Open the inbox overlay |
+| `/inbox`, `shift+tab`, or `ctrl+q` | Open the inbox overlay |
 | `/orchestrator` | Toggle [orchestrator mode](#orchestrator-mode): this window becomes a full-screen agent control panel (`pi --orchestrator` starts in it). Also `on`, `off` |
 | `/orchestrator home` | Orchestrator mode: leave this session (it keeps running in the background) and return to the orchestrator |
 | `/takeover` | Orchestrator mode: run this session here, like plain pi (waits for a background run to finish first) |
@@ -100,7 +100,7 @@ Orchestrator mode turns the window you're in into a full-screen control panel fo
   - Messages sent while it's working are **queued**, one message per subsequent run. Use `/queue` or `alt+up` to manage them. Choose a message and press `enter` to stop the current run and send that message now, then continue from the session's completed history. Press `d`, `delete`, or `backspace` to remove the selected message. The same manager is available with `m` on an agent's orchestrator row.
   - `ctrl+shift+s` (or `/stop`) stops the background run and clears its queue. esc only interrupts runs in this window.
   - `/compact` and `/tree` are refused while the background run is going, because they would write to the session at the same time. They work normally once it's idle.
-  - `/fork` and `/clone` work mid-run, because they only create a new session. `/clone` copies the session from disk up to the agent's last completed step, not the on-screen snapshot. The step in flight (an unanswered tool call or a prompt still being worked on) is left out. The background run carries on in the original session.
+  - `/fork` and `/clone` work mid-run, because they only create a new session. `/clone` copies the session from disk up to the agent's last completed step, not the on-screen snapshot. The step in flight (an unanswered tool call or a prompt still being worked on) is left out. The background run carries on in the original session. The clone is listed as `◆ your turn` (not `● working`/`⚠ stalled`) until it has activity of its own: its tail ends at a tool result, but nothing is running on it.
   - Model changes (`ctrl+p`, `ctrl+l`, `/model`, `shift+tab`) apply to the next background run.
   - While visiting with a taken-over main, the normal model picker (`ctrl+l` / `/model`), model cycling (`ctrl+p` / `ctrl+shift+p`), and thinking controls (`shift+tab` / `/thinking`) target the visited session only. The footer reflects the choice immediately. If the agent is busy, the choice is saved for its next run without interrupting it or writing to its active transcript. The main's model and thinking level stay unchanged; cancelling a picker changes neither session.
 - **Take over:** `t` on a session (or `/takeover` from an attached session) makes it run here, like plain pi: streaming, esc to interrupt, steering, every command. Only a taken-over session gets a mode banner: `Orchestrator - taken over`. Attached and visited sessions use their normal UI without an orchestrator banner. If its background run is still going, it takes over automatically when that run finishes.

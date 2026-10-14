@@ -1,7 +1,7 @@
 /**
  * Inbox — a visual "todo box" for all Pi sessions.
  *
- *   /inbox            open the inbox (also: ctrl+q)
+ *   /inbox            open the inbox (also: shift+tab, ctrl+q)
  *   /orchestrator     toggle inbox orchestrator mode: this window becomes a full-screen
  *                     agent control panel (pi --orchestrator); on | off | home
  *                     (home = hand back the taken-over session)
@@ -201,6 +201,9 @@ interface SessionMeta {
 	seenAt?: number;
 	/** You marked it unread by hand (`u`). Shows the dot until you next look at it or mark it read. */
 	unreadAt?: number;
+	/** When this session was created as a mid-run clone (cut at the last completed step). Until it has
+	 * activity of its own its tail ends at a tool result, which would otherwise read as stalled/working. */
+	clonedAt?: number;
 }
 interface Store {
 	version: 1;
@@ -229,6 +232,7 @@ function updateMeta(sessionId: string, fn: (m: SessionMeta) => void): SessionMet
 	if (!meta.filter) delete meta.filter;
 	if (!meta.seenAt) delete meta.seenAt;
 	if (!meta.unreadAt) delete meta.unreadAt;
+	if (!meta.clonedAt) delete meta.clonedAt;
 	if (Object.keys(meta).length === 0) delete store.sessions[sessionId];
 	else store.sessions[sessionId] = meta;
 	saveStore(store);
@@ -673,12 +677,19 @@ async function loadRows(currentId: string | undefined): Promise<Row[]> {
 		const title = info.name || cleanTitle(info.firstMessage) || "(no messages)";
 		const meta = store.sessions[info.id] ?? {};
 		const rule = matchRule(info, filters);
+		let tail = readTail(info.path);
+		// A fresh clone (copied up to the agent's last completed step mid-run) ends at a tool result,
+		// which reads as "stalled" / "● working?" — but nothing is running on it. Until it has
+		// activity of its own (a write newer than the clone), it's simply your turn.
+		if (meta.clonedAt && tail.status === "stalled" && info.modified.getTime() <= meta.clonedAt) {
+			tail = { ...tail, status: "your-turn" };
+		}
 		rows.push({
 			info,
 			meta,
 			rule,
 			filtered: isFiltered(meta, rule),
-			tail: readTail(info.path),
+			tail,
 			live: live.get(info.id),
 			isCurrent,
 			takenOver: modeState().takenOver.has(info.id),
@@ -4101,7 +4112,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("inbox", {
-		description: "Visual todo-box of all sessions: status, pin, archive (ctrl+q)",
+		description: "Visual todo-box of all sessions: status, pin, archive (shift+tab / ctrl+q)",
 		getArgumentCompletions: (prefix) => {
 			const p = prefix.trim();
 			const items = [
@@ -4289,6 +4300,16 @@ export default function (pi: ExtensionAPI) {
 		const behind = sm.getLeafId() !== leaf;
 		const cloned = sm.createBranchedSession(leaf);
 		if (!cloned || !fs.existsSync(cloned)) return ctx.ui.notify("Clone failed: couldn't write the new session.", "error");
+		try {
+			// Mark the clone: its tail ends at a tool result, which the inbox would otherwise
+			// call stalled/working until it has activity of its own.
+			const cloneId = SessionManager.open(cloned, ctx.sessionManager.getSessionDir()).getSessionId();
+			updateMeta(cloneId, (m) => {
+				m.clonedAt = Date.now();
+			});
+		} catch {
+			// best effort — only the status badge is affected
+		}
 		await ctx.switchSession(cloned, {
 			withSession: async (c) => {
 				c.ui.notify(
@@ -4335,6 +4356,14 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("takeover", {
 		description: "Orchestrator: run this session here, like plain pi (waits for a background run to finish)",
 		handler: async (_args, ctx) => takeOverCurrent(ctx),
+	});
+
+	pi.registerShortcut("shift+tab", {
+		description: "Open session inbox (the orchestrator, in orchestrator mode)",
+		handler: async () => {
+			// Shortcuts don't get a command context (needed to switch sessions), so route through the command.
+			pi.sendUserMessage("/inbox", { expandPromptTemplates: true });
+		},
 	});
 
 	pi.registerShortcut("ctrl+q", {
