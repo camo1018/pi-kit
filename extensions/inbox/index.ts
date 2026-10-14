@@ -7,6 +7,8 @@
  *                     (home = hand back the taken-over session)
  *   /pin              toggle pin on the current session
  *   /archive          toggle archive on the current session
+ *   /bookmark         return to the transcript row saved by the inbox
+ *                     (also: ctrl+shift+b; fullscreen mode)
  *
  * Inside the inbox:
  *   ↑/↓ ←/→ PgUp/PgDn  move (←/→ = 5 rows)   enter       agent view: live transcript (r there = reply)
@@ -30,7 +32,8 @@
  *   ⚠ stalled    run was cut off mid-turn (process died / quit while working)
  *   ◉            session is open in some Pi process right now
  *
- * Pin/archive metadata lives in ~/.pi/agent/inbox.json (session files are not modified).
+ * Pin/archive/bookmark metadata lives in ~/.pi/agent/inbox.json.
+ * Session files are not modified.
  * Filter rules (a blocklist for kinds of sessions, e.g. automated jobs) live in
  * ~/.pi/agent/inbox-filters.json; matching sessions move to the Filtered tab.
  * /inbox filters shows the active rules and what they hide.
@@ -205,6 +208,12 @@ interface SessionMeta {
 	/** When this session was created as a mid-run clone (cut at the last completed step). Until it has
 	 * activity of its own its tail ends at a tool result, which would otherwise read as stalled/working. */
 	clonedAt?: number;
+	/** Fullscreen transcript row remembered when leaving through the inbox. */
+	scrollBookmark?: {
+		top: number;
+		width: number;
+		savedAt: number;
+	};
 }
 interface Store {
 	version: 1;
@@ -234,6 +243,13 @@ function updateMeta(sessionId: string, fn: (m: SessionMeta) => void): SessionMet
 	if (!meta.seenAt) delete meta.seenAt;
 	if (!meta.unreadAt) delete meta.unreadAt;
 	if (!meta.clonedAt) delete meta.clonedAt;
+	if (
+		!meta.scrollBookmark ||
+		!Number.isFinite(meta.scrollBookmark.top) ||
+		meta.scrollBookmark.top < 0
+	) {
+		delete meta.scrollBookmark;
+	}
 	if (Object.keys(meta).length === 0) delete store.sessions[sessionId];
 	else store.sessions[sessionId] = meta;
 	saveStore(store);
@@ -2420,6 +2436,72 @@ function activeInboxTui(ctx?: ExtensionContext): TUI | undefined {
 	) as TUI | undefined;
 }
 
+interface BookmarkTui extends TUI {
+	readonly mode: "fullscreen";
+	readonly viewportTop: number;
+	scrollBy(lines: number): void;
+	flash?(message: string, durationMs?: number): void;
+}
+
+function bookmarkTui(tui: TUI | undefined): BookmarkTui | undefined {
+	const candidate = tui as Partial<BookmarkTui> | undefined;
+	return candidate?.mode === "fullscreen" &&
+		typeof candidate.viewportTop === "number" &&
+		typeof candidate.scrollBy === "function"
+		? (candidate as BookmarkTui)
+		: undefined;
+}
+
+/** Remember the transcript row visible before the user leaves this session. */
+function rememberScrollBookmark(
+	sessionId: string,
+	tui: TUI | undefined,
+): boolean {
+	const viewport = bookmarkTui(tui);
+	if (!viewport) return false;
+	const top = Math.max(0, Math.floor(viewport.viewportTop));
+	const width = Math.max(1, viewport.terminal.columns);
+	const previous = loadStore().sessions[sessionId]?.scrollBookmark;
+	if (previous?.top === top && previous.width === width) return true;
+	updateMeta(sessionId, (meta) => {
+		meta.scrollBookmark = { top, width, savedAt: Date.now() };
+	});
+	return true;
+}
+
+/** Jump the session on screen back to its last remembered transcript row. */
+function restoreScrollBookmark(ctx: ExtensionContext): void {
+	const tui = activeInboxTui(ctx);
+	const viewport = bookmarkTui(tui);
+	if (!viewport) {
+		ctx.ui.notify(
+			"Scroll bookmarks require fullscreen TUI mode.",
+			"warning",
+		);
+		return;
+	}
+	const id = viewedSession(ctx).id;
+	const bookmark = loadStore().sessions[id]?.scrollBookmark;
+	if (!bookmark) {
+		ctx.ui.notify(
+			"No scroll bookmark for this session yet. Open the inbox first.",
+			"info",
+		);
+		return;
+	}
+	viewport.scrollBy(bookmark.top - viewport.viewportTop);
+	const message = "🔖 Returned to the last place you were reading";
+	if (typeof viewport.flash === "function") viewport.flash(message);
+	else ctx.ui.notify(message, "info");
+}
+
+/** Save a visit before restoring the sticky taken-over session behind it. */
+function closeVisitRemembering(tui: TUI, ctx: ExtensionContext): boolean {
+	const id = visitState().visit?.id;
+	if (id) rememberScrollBookmark(id, tui);
+	return closeVisit(tui);
+}
+
 /** The focused component if it's pi's main editor (no dialog or overlay). */
 function focusedEditor(allowAutocomplete = false): any {
 	const f = (activeInboxTui() as any)?.getFocusedComponent?.();
@@ -3913,11 +3995,16 @@ export default function (pi: ExtensionAPI) {
 			(globalThis as any)[ROWS_KEY] = rowCache;
 		}
 
+		let bookmarkCaptured = false;
 		for (;;) {
 			const atHome = orchestrating() && isHome(ctx);
 			let result = await ctx.ui.custom<InboxResult>(
 				(tui, theme, kb, done) => {
 					(globalThis as any)[INBOX_TUI_KEY] = tui;
+					if (!bookmarkCaptured && !atHome) {
+						rememberScrollBookmark(viewed.id, tui);
+						bookmarkCaptured = true;
+					}
 					coverImagesUnderOverlays(tui);
 					return new InboxComponent(
 						tui,
@@ -4358,6 +4445,10 @@ export default function (pi: ExtensionAPI) {
 	// taken-over main, turn a resume/open into a visit and cancel the native switch. Explicit
 	// handback/takeover paths call prepareLeave first, which removes `takenOver`, so they pass.
 	pi.on("session_before_switch", async (e: any, ctx: ExtensionContext) => {
+		rememberScrollBookmark(
+			viewedSession(ctx).id,
+			activeInboxTui(ctx),
+		);
 		if (!orchestrating()) return undefined;
 		const ms = modeState();
 		const mainId = ctx.sessionManager.getSessionId();
@@ -4559,6 +4650,16 @@ export default function (pi: ExtensionAPI) {
 			// Shortcuts don't get a command context (needed to switch sessions), so route through the command.
 			pi.sendUserMessage("/inbox", { expandPromptTemplates: true });
 		},
+	});
+
+	pi.registerCommand("bookmark", {
+		description: "Return to the transcript position saved by the inbox",
+		handler: async (_args, ctx) => restoreScrollBookmark(ctx),
+	});
+
+	pi.registerShortcut("ctrl+shift+b", {
+		description: "Return to the last place read in this session",
+		handler: async (ctx) => restoreScrollBookmark(ctx),
 	});
 
 	// ctrl+w while a new agent's prompt is pending (or on orchestrator home): pick the
@@ -4853,7 +4954,7 @@ export default function (pi: ExtensionAPI) {
 				if (isVisiting() && editorFocused() && !modeState().inLoop) {
 					const tui = activeInboxTui(c);
 					if (tui) {
-						closeVisit(tui);
+						closeVisitRemembering(tui, c);
 						showModeWidget(c);
 						showLiveStream(c);
 						return { consume: true };

@@ -19,6 +19,7 @@ Source: `~/Code/pi-kit/extensions/inbox/index.ts` (background agents: `~/Code/pi
 | `/pin` | Toggle pin on the current session |
 | `/archive` | Toggle archive (done) on the current session |
 | `/rename [title]` | Rename the current session (no title: auto-title from its first user message). Also available to the agent as the `rename-chat` tool — same naming, works on background-agent sessions too via its `session` param |
+| `/bookmark` or `ctrl+shift+b` | Fullscreen mode: return to the transcript position saved when you last opened the inbox or switched away |
 | `ctrl+r` | Rename the current session. On orchestrator home / while typing a new agent's first prompt (`n`), names that new agent instead (empty = name from its prompt); after sending, renames the just-started agent |
 
 ## Keys inside the inbox
@@ -188,6 +189,7 @@ The preview pane under the list shows the dir, created/updated/pinned/archived t
 
 ## Behaviors to know
 
+- **Reading-position bookmark (fullscreen).** Opening the inbox or switching away remembers the current session's vertical transcript position. After returning to that session, press `ctrl+shift+b` (or run `/bookmark`) to jump back to the same row. Each session has its own bookmark. Regular mode uses the terminal's native scrollback, which Pi extensions cannot reposition.
 - **Auto-unarchive.** If you send a prompt in an archived session, it moves back to the Inbox.
 - **Opening a busy session.** If the session is open or working in another Pi process, you're asked to confirm, since two writers can create diverging branches. Switching away from a session that is still working also asks for confirmation, because it aborts the current run.
 - **Session files are never modified** by pin or archive. Rename uses Pi's normal `session_info` entry, the same as `/name`.
@@ -195,7 +197,7 @@ The preview pane under the list shows the dir, created/updated/pinned/archived t
 
 ## How it works
 
-- **Pin, archive and filter-override state**: `~/.pi/agent/inbox.json`, keyed by session id. Every Pi process re-reads it before writing, so they don't overwrite each other.
+- **Pin, archive, filter-override, and scroll-bookmark state**: `~/.pi/agent/inbox.json`, keyed by session id. Every Pi process re-reads it before writing, so they don't overwrite each other.
 - **Filter rules**: `~/.pi/agent/inbox-filters.json`, matched against each session's `SessionInfo` on every refresh and cached by file mtime.
 - **Live status**: each Pi process writes `~/.pi/agent/inbox-live/<pid>.json` with its session and `working`/`idle` state. It updates on `session_start`, `agent_start` and `agent_settled`, and deletes the file on shutdown. Files for dead PIDs are pruned when the inbox reads them.
 - **Session status**: parsed from the tail of each session `.jsonl`: the last message's role and `stopReason`. Results are cached by file mtime and size.
@@ -222,6 +224,7 @@ methods or undocumented file layout. Last verified on **Pi 0.99.1**.
 | `tui-composite-methods` | `compositeOverlays` (protected) and `compositeLineAt` (private) on `TuiMainScreen`/`TuiAltScreen` | `coverImagesUnderOverlays()`: blanks terminal-image rows under the inbox and full-width overlays | Guarded by `typeof`: pasted screenshots / images draw over the inbox again |
 | `tui-composite-dispatch` | TUI calls them as `this.compositeOverlays(...)` / `this.compositeLineAt(...)` so per-instance overrides take effect | Same | Same, silently |
 | `tui-focused-component` | `tui.getFocusedComponent()` | `editorFocused()`: esc cancels the "next message goes to …" reply target only when the editor has focus | esc-to-cancel stops working (returns false) |
+| `tui-alt-screen-scroll` | Public `TuiAltScreen#viewportTop` and `#scrollBy()` | Per-session transcript bookmarks (`ctrl+shift+b`) | Bookmark saving/restoring is disabled; the rest of inbox works |
 | `editor-methods` | `Editor#getText`, `#insertTextAtCursor`, `#isShowingAutocomplete` (duck-typed on the focused component) | Same | Same |
 | `keybindings-get-keys` | `getKeybindings().getKeys(id)` | Key labels in the orchestrator help | Falls back to hard-coded labels |
 | `session-manager-api` | `SessionManager.open()`, `#getBranch`, `#getSessionFile`, `#getSessionId`, `#appendSessionInfo` | Reading other sessions; renaming (also used by `rename-chat`) | Inbox list / agent view / rename throw |
