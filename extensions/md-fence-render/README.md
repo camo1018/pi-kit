@@ -8,11 +8,16 @@ Display-only changes to how fenced blocks render in the transcript:
 - Every other code block keeps Pi's highlight.js syntax highlighting, but the
   literal ```` ```lang ```` / ```` ``` ```` fence lines are replaced by
   `┌─ lang` / `└─` markers (`┌─ code` when untagged).
-- In Pi's actual fullscreen TUI renderer, clicking any row of a code block
-  copies that exact block through `click-copy`. Its opening marker briefly
-  changes to `┌─ lang · Copied`, including in background-agent and visited
-  taken-over session views. Regular mode keeps mouse input for terminal
-  selection, even when the orchestrator overlay is full-width.
+- In Pi's actual fullscreen TUI renderer, a single click on any row of a
+  code block copies that exact block through `click-copy`. Its opening marker
+  briefly changes to `┌─ lang · Copied`, including in background-agent and
+  visited taken-over session views. Regular mode keeps mouse input for
+  terminal selection, even when the orchestrator overlay is full-width.
+- Selection passthrough: press/drag/release are never claimed, so dragging
+  over a code block uses Pi's native fullscreen selection (with
+  copy-on-select) to copy just the highlighted part, and double/triple
+  clicks fall back to word/line selection. Only a still single click (no
+  drag) copies the whole block.
 - Adds copy-safe code block rules to the system prompt: code lines under 80
   columns, comments on their own line, no leading indent. Prose blocks
   (```text drafts like Slack messages) are exempt — one sentence/bullet per
@@ -33,16 +38,18 @@ hook for drawing code blocks. Last verified on **Pi 0.99.1**.
 | `markdown-render-token` | `Markdown.prototype.renderToken` (private, pi-tui) | Patch wraps nothing; plain ```` ``` ```` fences return |
 | `markdown-fence-shape` | `renderToken` emits `theme.codeBlockBorder("```lang")` as the first line and `codeBlockBorder("```")` as the closing line | Exact-match check fails; stock fences return |
 | `code-block-label-renders` | End to end: a rendered `bash` block contains `┌─ bash` and `└─`, and no ```` ``` ```` | Catches anything above, plus a patch that didn't install |
-| `code-block-click-routes` | `Markdown.render()` row mapping, inline feedback, and fullscreen `handleMouse()` press/click dispatch | Code blocks still render, but clicking does not copy or show local feedback |
+| `code-block-click-routes` | `Markdown.render()` row mapping, inline feedback, and fullscreen `handleMouse()` click dispatch (press left unclaimed for selection passthrough; multi-click declined) | Code blocks still render, but clicking does not copy or show local feedback, or dragging no longer selects inside the block |
 
 Other assumptions (not probed):
 
 - `renderToken(token, ...)`: token is the first argument and has
   `type`/`lang`/`text`.
 - `Markdown.render(width)` returns the same rows and local Y coordinates used
-  by fullscreen mouse dispatch. Claiming a code-block press intentionally
-  favors click-to-copy over drag selection inside that block; other rows keep
-  fullscreen selection behavior.
+  by fullscreen mouse dispatch. `handleMouse()` only claims the single-click
+  event; press/drag/release pass through to fullscreen selection so users can
+  still select and copy parts of a block. Clicks arrive from Pi's release path
+  only when the press didn't move, and `clickCount > 1` (double/triple) is
+  declined in favor of word/line selection.
 - `Markdown` is imported from `@earendil-works/pi-tui`, which Pi's extension
   loader aliases to the same bundled copy interactive mode uses. If the alias
   stops being shared, the patch silently applies to an unused copy (the

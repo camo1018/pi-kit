@@ -25,10 +25,19 @@ pi-tui hard-wraps long lines into physical terminal rows, so triple-click
 line selection copies wrap-induced fragments. Click-to-copy bypasses
 selection entirely and copies the exact original text.
 
+## Partial selection
+
+Copying part of a block still works: press and drag over the block to
+highlight, and Pi's fullscreen copy-on-select copies just that part
+(double-click = word, triple-click = line). Only a still, unmoved single
+click copies the whole block. This mirrors how Pi's own fullscreen selection
+treats clicks on handled components.
+
 ## Implementation
 
-`md-fence-render` maps rendered rows to code blocks and claims press/click
-in its fullscreen `handleMouse`, routing the exact source and an inline
+`md-fence-render` maps rendered rows to code blocks and claims only the
+single-click event in its fullscreen `handleMouse` (press/drag/release pass
+through to Pi's selection engine), routing the exact source and an inline
 feedback callback through the click hook this extension exposes on
 `globalThis` by symbol (`Symbol.for("pi-kit:click-copy:click")`).
 

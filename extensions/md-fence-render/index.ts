@@ -246,33 +246,33 @@ function patchCodeBlocks() {
 		if (!hit || index === undefined || typeof copy !== "function") {
 			return undefined;
 		}
-		if (event.type === "click") {
-			const feedbackToken = {};
-			copy({
-				lang: hit.lang,
-				code: hit.code,
-				setCopied: (copied: boolean) => {
-					if (copied) {
-						this[COPIED_FEEDBACK] = {
-							token: feedbackToken,
-							index,
-						} satisfies CopiedFeedback;
-					} else if (this[COPIED_FEEDBACK]?.token === feedbackToken) {
-						this[COPIED_FEEDBACK] = undefined;
-					}
-					this.invalidate();
-				},
-			});
-			return { handled: true };
-		}
-		if (
-			event.type === "press" ||
-			event.type === "release" ||
-			event.type === "drag"
-		) {
-			return { handled: true, render: false };
-		}
-		return undefined;
+		if (event.type !== "click") return undefined;
+		// Selection passthrough: press/drag/release are never claimed, so
+		// pi's fullscreen selection engine owns those gestures — dragging
+		// over the block highlights, and copy-on-select copies just the
+		// selected part. A click only arrives here when the press didn't
+		// move, and pi's release path dispatches it before clearing the
+		// press-anchored selection. Multi-clicks (double = word, triple =
+		// line) fall back to pi's selection granularity, so only single
+		// clicks copy the whole block.
+		if ((event.clickCount ?? 1) > 1) return undefined;
+		const feedbackToken = {};
+		copy({
+			lang: hit.lang,
+			code: hit.code,
+			setCopied: (copied: boolean) => {
+				if (copied) {
+					this[COPIED_FEEDBACK] = {
+						token: feedbackToken,
+						index,
+					} satisfies CopiedFeedback;
+				} else if (this[COPIED_FEEDBACK]?.token === feedbackToken) {
+					this[COPIED_FEEDBACK] = undefined;
+				}
+				this.invalidate();
+			},
+		});
+		return { handled: true };
 	};
 }
 

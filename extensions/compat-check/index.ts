@@ -128,8 +128,25 @@ const PROBES: Probe[] = [
 					button: "left",
 					y,
 				});
+				if (press?.handled) {
+					return "code-block press was claimed (selection passthrough is broken: dragging can no longer select inside the block)";
+				}
 				md.handleMouse({ type: "click", button: "left", y });
-				if (!press?.handled) return "code-block press was not claimed";
+				if (!copied?.code) return "code-block click did not route exact source";
+				if (copied.code !== "echo hi") {
+					return "code-block click routed wrong source";
+				}
+				copied = undefined;
+				md.handleMouse({
+					type: "click",
+					button: "left",
+					y,
+					clickCount: 2,
+				});
+				if (copied) {
+						return "multi-click on a code block should fall back to word/line selection, not copy the block";
+				}
+				md.handleMouse({ type: "click", button: "left", y });
 				if (copied?.code !== "echo hi") {
 					return "code-block click did not route exact source";
 				}
