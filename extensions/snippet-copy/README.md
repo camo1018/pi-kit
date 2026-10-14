@@ -3,13 +3,14 @@
 Copy fenced code blocks from assistant messages exactly — one keystroke,
 no mouse selection, no wrap or padding artifacts.
 
-````text
-/cc            copy the most recent code block
-/cc 3          copy block #3
-/cc text       copy the most recent block tagged ```text
-               (e.g. the latest Slack draft)
-ctrl+shift+y   copy the most recent code block
-````
+## Usage
+
+| Command | Action |
+|---|---|
+| `/cc` | Copy the most recent code block |
+| `/cc 3` | Copy block #3 |
+| `/cc text` | Copy the most recent block tagged `text`, such as a Slack draft |
+| `ctrl+shift+y` | Copy the most recent code block |
 
 Click-to-copy used to live here; it now lives in the separate
 **click-copy** extension (the two share nothing — a click copies without
