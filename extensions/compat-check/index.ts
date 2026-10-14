@@ -293,6 +293,22 @@ const PROBES: Probe[] = [
 	},
 	{
 		ext: "inbox",
+		id: "tui-alt-screen-scroll",
+		check: () => {
+			const viewport = Object.getOwnPropertyDescriptor(
+				T.TuiAltScreen?.prototype,
+				"viewportTop",
+			);
+			return need(
+				typeof viewport?.get === "function" &&
+					hasMethod(T.TuiAltScreen, "scrollBy"),
+				"TuiAltScreen viewportTop/scrollBy is missing " +
+					"(session bookmarks break)",
+			);
+		},
+	},
+	{
+		ext: "inbox",
 		id: "editor-methods",
 		check: () => {
 			const missing = ["getText", "insertTextAtCursor", "isShowingAutocomplete"].filter((m) => !hasMethod(T.Editor, m));

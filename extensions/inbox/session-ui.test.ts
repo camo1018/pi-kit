@@ -105,10 +105,17 @@ async function setup(t: TestContext, takenOver = true) {
 		getSessionStats() {},
 	};
 	const tui = {
+		mode: "fullscreen",
 		children: [doc, { children: [footer] }],
 		getFocusedComponent: () => focus,
 		requestRender: mock.fn(),
-		terminal: { rows: 30 },
+		viewportTop: 0,
+		scrollBy(lines: number) {
+			this.viewportTop = Math.max(0, this.viewportTop + lines);
+			this.requestRender();
+		},
+		flash: mock.fn(),
+		terminal: { rows: 30, columns: 120 },
 	} as unknown as TUI;
 	globals.__piInboxTui = tui;
 	const handlers = new Map<string, Function[]>();
@@ -520,12 +527,23 @@ test("takeover rows show ⚑ regardless of which row is current", async (t) => {
 	const f = await setup(t);
 	const visited = await f.visit("viewed-row");
 	const { list, done } = await f.openInbox();
+	const viewedIndex = list.selected;
+	const mainIndex = list.visible.findIndex(
+		(row: any) => row.info.id === f.main.getSessionId(),
+	);
+	assert.notEqual(mainIndex, -1);
+	while (list.selected !== mainIndex) {
+		list.handleInput(list.selected < mainIndex ? "j" : "k");
+	}
 	for (const width of [80, 160]) {
 		const lines: string[] = list.render(width);
 		const flagged = lines.filter((line) => line.includes("⚑"));
 		assert.equal(flagged.length, 1);
 		assert.doesNotMatch(flagged[0], /»/);
-		assert.match(lines.find((line) => line.includes("viewed-row"))!, /»/);
+		assert.equal(list.visible[mainIndex].isCurrent, false);
+	}
+	while (list.selected !== viewedIndex) {
+		list.handleInput(list.selected < viewedIndex ? "j" : "k");
 	}
 	const mode = (globalThis as any)[Symbol.for("pi.inbox.mode")];
 	mode.takenOver.clear();
@@ -569,6 +587,48 @@ for (const takenOver of [false, true]) {
 		assert.equal(visitingId(), takenOver ? id : undefined);
 	});
 }
+
+test(
+	"inbox remembers the reading position and the hotkey returns",
+	async (t) => {
+		const f = await setup(t);
+		const viewport = f.tui as TUI & {
+			viewportTop: number;
+			flash: ReturnType<typeof mock.fn>;
+		};
+		viewport.viewportTop = 37;
+		const { list, done } = await f.openInbox();
+		list.handleInput("\x1b");
+		await done;
+
+		const store = JSON.parse(
+			readFileSync(join(dir, "inbox.json"), "utf8"),
+		);
+		assert.equal(
+			store.sessions[f.main.getSessionId()].scrollBookmark.top,
+			37,
+		);
+
+		viewport.viewportTop = 91;
+		await f.shortcuts.get("ctrl+shift+b").handler(f.ctx);
+		assert.equal(viewport.viewportTop, 37);
+
+		await f.visit("another reading position");
+		viewport.viewportTop = 52;
+		const visitedInbox = await f.openInbox();
+		visitedInbox.list.handleInput("\x1b");
+		await visitedInbox.done;
+		viewport.viewportTop = 91;
+		await f.shortcuts.get("ctrl+shift+b").handler(f.ctx);
+		assert.equal(viewport.viewportTop, 52);
+
+		assert.deepEqual(f.key("\x1b"), { consume: true });
+		viewport.viewportTop = 91;
+		await f.shortcuts.get("ctrl+shift+b").handler(f.ctx);
+		assert.equal(viewport.viewportTop, 37);
+		assert.equal(viewport.flash.mock.calls.length, 3);
+	},
+);
 
 test("cached inbox rows follow each visit and can still reveal the main", async (t) => {
 	const f = await setup(t);
