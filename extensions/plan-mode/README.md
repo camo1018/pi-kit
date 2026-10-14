@@ -7,6 +7,8 @@ Read-only exploration mode for safe code analysis.
 - **Built-in write tools disabled**: Disables edit/write while preserving other active tools
 - **Bash allowlist**: Only read-only bash commands are allowed
 - **Plan extraction**: Extracts numbered steps from `Plan:` sections
+- **Durable plan files**: Saves full plans under `<agent-dir>/plans/<project>/`
+- **Headless support**: Background agents save plans without requiring a dialog
 - **Progress tracking**: Widget shows completion status during execution
 - **[DONE:n] markers**: Explicit step completion tracking
 - **Session persistence**: State survives session resume
@@ -14,7 +16,9 @@ Read-only exploration mode for safe code analysis.
 ## Commands
 
 - `/plan` - Toggle plan mode
-- `/todos` - Show current plan progress
+- `/plan-execute` - Execute the extracted plan and track its progress
+- `/plan-refine` - Refine the extracted plan in an interactive editor
+- `/todos` - Show current plan progress and saved file path
 - `Ctrl+Shift+R` - Toggle plan mode (shortcut)
 
 ## Usage
@@ -30,9 +34,16 @@ Plan:
 3. Third step description
 ```
 
-4. Choose "Execute the plan" when prompted
-5. During execution, the agent marks steps complete with `[DONE:n]` tags
-6. Progress widget shows completion status
+4. The full plan is saved under `<agent-dir>/plans/<project>/` (normally
+   `~/.pi/agent/plans/<project>/`)
+5. Choose "Execute the plan" when prompted
+6. During execution, the agent marks steps complete with `[DONE:n]` tags
+7. Progress widget shows completion status
+
+In inbox/orchestrator background runs, the agent cannot open an interactive
+selection dialog. It still extracts and saves the plan, then leaves the session
+waiting for you. Take over the session and run `/plan-execute` or
+`/plan-refine`.
 
 ## How It Works
 
@@ -41,6 +52,11 @@ Plan:
 - Other active tools remain available
 - Bash commands filtered through allowlist
 - Agent creates a plan without making changes
+
+### Headless / Orchestrator Mode
+- Plan extraction and file saving work when `ctx.hasUI` is false
+- The saved todo state is restored when the session is taken over
+- `/plan-execute` and `/plan-refine` replace the unavailable selection dialog
 
 ### Execution Mode
 - Full tool access restored

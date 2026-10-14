@@ -8,6 +8,8 @@
  * - /plan command or Ctrl+Shift+R to toggle
  * - Bash restricted to allowlisted read-only commands
  * - Extracts numbered plan steps from "Plan:" sections
+ * - Saves full plans to the agent directory in TUI and headless modes
+ * - /plan-execute and /plan-refine resume plans after background runs
  * - [DONE:n] markers to complete steps during execution
  * - Progress tracking widget during execution
  */
@@ -17,7 +19,14 @@ import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 import { Key } from "@earendil-works/pi-tui";
-import { extractTodoItems, isSafeCommand, markCompletedSteps, type TodoItem } from "./utils.ts";
+import { savePlanFile } from "./storage.ts";
+import {
+	extractPlanText,
+	extractTodoItems,
+	isSafeCommand,
+	markCompletedSteps,
+	type TodoItem,
+} from "./utils.ts";
 
 // Tools
 const PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls", "questionnaire"];
@@ -30,6 +39,8 @@ interface PlanModeState {
 	todos?: TodoItem[];
 	executing?: boolean;
 	toolsBeforePlanMode?: string[];
+	planText?: string;
+	planFile?: string;
 }
 
 // Type guard for assistant messages
@@ -51,6 +62,8 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	let executionMode = false;
 	let todoItems: TodoItem[] = [];
 	let toolsBeforePlanMode: string[] | undefined;
+	let currentPlanText: string | undefined;
+	let currentPlanFile: string | undefined;
 
 	pi.registerFlag("plan", {
 		description: "Start in plan mode (read-only exploration)",
@@ -121,15 +134,85 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 			todos: todoItems,
 			executing: executionMode,
 			toolsBeforePlanMode,
+			planText: currentPlanText,
+			planFile: currentPlanFile,
 		});
+	}
+
+	function planTodoListMessage() {
+		const todoListText = todoItems
+			.map((item, i) => `${i + 1}. ☐ ${item.text}`)
+			.join("\n");
+		return {
+			customType: "plan-todo-list",
+			content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
+			display: true,
+		};
+	}
+
+	function startExecution(ctx: ExtensionContext): boolean {
+		const firstTodoItem = todoItems[0];
+		if (!firstTodoItem) {
+			ctx.ui.notify("No saved plan. Create one with /plan first.", "info");
+			return false;
+		}
+
+		planModeEnabled = false;
+		executionMode = true;
+		restoreNormalModeTools();
+		updateStatus(ctx);
+		persistState();
+
+		const remainingList = todoItems
+			.map((item) => `${item.step}. ${item.text}`)
+			.join("\n");
+		const execMessage = `Execute the plan.
+
+Remaining steps:
+${remainingList}
+
+Start with: ${firstTodoItem.text}
+After completing a step, include a [DONE:n] tag in your response.`;
+		pi.sendMessage(planTodoListMessage(), { deliverAs: "followUp" });
+		pi.sendMessage(
+			{ customType: "plan-mode-execute", content: execMessage, display: true },
+			{ triggerTurn: true, deliverAs: "followUp" },
+		);
+		return true;
+	}
+
+	async function refinePlan(ctx: ExtensionContext): Promise<void> {
+		if (todoItems.length === 0) {
+			ctx.ui.notify("No saved plan. Create one with /plan first.", "info");
+			return;
+		}
+		if (!ctx.hasUI) {
+			pi.sendMessage(
+				{
+					customType: "plan-mode-headless",
+					content: "Plan refinement needs an interactive session.",
+					display: true,
+				},
+				{ triggerTurn: false },
+			);
+			return;
+		}
+
+		const refinement = await ctx.ui.editor("Refine the plan:", "");
+		if (refinement?.trim()) {
+			pi.sendMessage(planTodoListMessage(), { deliverAs: "followUp" });
+			pi.sendUserMessage(refinement.trim(), { deliverAs: "followUp" });
+		}
 	}
 
 	function togglePlanMode(ctx: ExtensionContext): void {
 		planModeEnabled = !planModeEnabled;
 		executionMode = false;
-		todoItems = [];
 
 		if (planModeEnabled) {
+			todoItems = [];
+			currentPlanText = undefined;
+			currentPlanFile = undefined;
 			enablePlanModeTools();
 			ctx.ui.notify("Plan mode enabled. Built-in write tools disabled.");
 		} else {
@@ -145,15 +228,36 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		handler: async (_args, ctx) => togglePlanMode(ctx),
 	});
 
+	pi.registerCommand("plan-execute", {
+		description: "Execute the saved plan and track its progress",
+		handler: async (_args, ctx) => {
+			startExecution(ctx);
+		},
+	});
+
+	pi.registerCommand("plan-refine", {
+		description: "Refine the saved plan interactively",
+		handler: async (_args, ctx) => refinePlan(ctx),
+	});
+
 	pi.registerCommand("todos", {
 		description: "Show current plan todo list",
 		handler: async (_args, ctx) => {
 			if (todoItems.length === 0) {
-				ctx.ui.notify("No todos. Create a plan first with /plan", "info");
+				const saved = currentPlanFile
+					? ` Last plan saved to ${currentPlanFile}`
+					: "";
+				ctx.ui.notify(`No todos. Create a plan first with /plan.${saved}`, "info");
 				return;
 			}
-			const list = todoItems.map((item, i) => `${i + 1}. ${item.completed ? "✓" : "○"} ${item.text}`).join("\n");
-			ctx.ui.notify(`Plan Progress:\n${list}`, "info");
+			const list = todoItems
+				.map((item, i) => {
+					const mark = item.completed ? "✓" : "○";
+					return `${i + 1}. ${mark} ${item.text}`;
+				})
+				.join("\n");
+			const saved = currentPlanFile ? `\n\nSaved: ${currentPlanFile}` : "";
+			ctx.ui.notify(`Plan Progress:\n${list}${saved}`, "info");
 		},
 	});
 
@@ -260,45 +364,79 @@ After completing a step, include a [DONE:n] tag in your response.`,
 		persistState();
 	});
 
-	// Handle plan completion and plan mode UI
+	// Extract and save plans in every mode; only the choice dialog needs a UI.
 	pi.on("agent_end", async (event, ctx) => {
-		// Check if execution is complete
 		if (executionMode && todoItems.length > 0) {
-			if (todoItems.every((t) => t.completed)) {
-				const completedList = todoItems.map((t) => `~~${t.text}~~`).join("\n");
+			if (todoItems.every((item) => item.completed)) {
+				const completedList = todoItems
+					.map((item) => `~~${item.text}~~`)
+					.join("\n");
 				pi.sendMessage(
-					{ customType: "plan-complete", content: `**Plan Complete!** ✓\n\n${completedList}`, display: true },
+					{
+						customType: "plan-complete",
+						content: `**Plan Complete!** ✓\n\n${completedList}`,
+						display: true,
+					},
 					{ triggerTurn: false },
 				);
 				executionMode = false;
 				todoItems = [];
 				updateStatus(ctx);
-				persistState(); // Save cleared state so resume doesn't restore old execution mode
+				persistState();
 			}
 			return;
 		}
 
-		if (!planModeEnabled || !ctx.hasUI) return;
+		if (!planModeEnabled) return;
 
-		// Extract todos from last assistant message
-		const lastAssistant = [...event.messages].reverse().find(isAssistantMessage);
-		if (lastAssistant) {
-			const extracted = extractTodoItems(getTextContent(lastAssistant));
-			if (extracted.length > 0) {
-				todoItems = extracted;
-			}
+		const lastAssistant = [...event.messages]
+			.reverse()
+			.find(isAssistantMessage);
+		if (!lastAssistant) return;
+
+		const assistantText = getTextContent(lastAssistant);
+		const planText = extractPlanText(assistantText);
+		const extracted = extractTodoItems(assistantText);
+		if (!planText || extracted.length === 0) return;
+
+		todoItems = extracted;
+		currentPlanText = planText;
+		currentPlanFile = undefined;
+		let saveError: string | undefined;
+		try {
+			currentPlanFile = await savePlanFile({
+				cwd: ctx.cwd,
+				planText,
+				sessionId: ctx.sessionManager.getSessionId(),
+				title: todoItems[0]?.text ?? "Plan",
+			});
+		} catch (error) {
+			saveError = error instanceof Error ? error.message : String(error);
 		}
-
-		if (todoItems.length === 0) return;
 		persistState();
 
-		// Show plan steps and prompt for next action
-		const todoListText = todoItems.map((t, i) => `${i + 1}. ☐ ${t.text}`).join("\n");
-		const planTodoListMessage = {
-			customType: "plan-todo-list",
-			content: `**Plan Steps (${todoItems.length}):**\n\n${todoListText}`,
-			display: true,
-		};
+		if (!ctx.hasUI) {
+			const saved = currentPlanFile
+				? `Plan saved to ${currentPlanFile}.`
+				: `Plan extracted, but saving failed: ${saveError ?? "unknown error"}.`;
+			pi.sendMessage(
+				{
+					customType: "plan-mode-headless",
+					content:
+						`${saved}\n\nTake over this session, then run ` +
+						"`/plan-execute` or `/plan-refine`.",
+					display: true,
+				},
+				{ triggerTurn: false },
+			);
+			return;
+		}
+
+		if (currentPlanFile) {
+			ctx.ui.notify(`Plan saved to ${currentPlanFile}`, "info");
+		} else if (saveError) {
+			ctx.ui.notify(`Could not save plan: ${saveError}`, "warning");
+		}
 
 		const choice = await ctx.ui.select("Plan mode - what next?", [
 			"Execute the plan (track progress)",
@@ -307,34 +445,9 @@ After completing a step, include a [DONE:n] tag in your response.`,
 		]);
 
 		if (choice?.startsWith("Execute")) {
-			const firstTodoItem = todoItems[0];
-			if (!firstTodoItem) return;
-
-			planModeEnabled = false;
-			executionMode = true;
-			restoreNormalModeTools();
-			updateStatus(ctx);
-			persistState();
-
-			const remainingList = todoItems.map((t) => `${t.step}. ${t.text}`).join("\n");
-			const execMessage = `Execute the plan.
-
-Remaining steps:
-${remainingList}
-
-Start with: ${firstTodoItem.text}
-After completing a step, include a [DONE:n] tag in your response.`;
-			pi.sendMessage(planTodoListMessage, { deliverAs: "followUp" });
-			pi.sendMessage(
-				{ customType: "plan-mode-execute", content: execMessage, display: true },
-				{ triggerTurn: true, deliverAs: "followUp" },
-			);
+			startExecution(ctx);
 		} else if (choice === "Refine the plan") {
-			const refinement = await ctx.ui.editor("Refine the plan:", "");
-			if (refinement?.trim()) {
-				pi.sendMessage(planTodoListMessage, { deliverAs: "followUp" });
-				pi.sendUserMessage(refinement.trim(), { deliverAs: "followUp" });
-			}
+			await refinePlan(ctx);
 		}
 	});
 
@@ -355,7 +468,10 @@ After completing a step, include a [DONE:n] tag in your response.`;
 			planModeEnabled = planModeEntry.data.enabled ?? planModeEnabled;
 			todoItems = planModeEntry.data.todos ?? todoItems;
 			executionMode = planModeEntry.data.executing ?? executionMode;
-			toolsBeforePlanMode = planModeEntry.data.toolsBeforePlanMode ?? toolsBeforePlanMode;
+			toolsBeforePlanMode =
+				planModeEntry.data.toolsBeforePlanMode ?? toolsBeforePlanMode;
+			currentPlanText = planModeEntry.data.planText ?? currentPlanText;
+			currentPlanFile = planModeEntry.data.planFile ?? currentPlanFile;
 		}
 
 		// On resume: re-scan messages to rebuild completion state
