@@ -4,17 +4,23 @@
  * - Typing `$` (at line start or after whitespace/opening punctuation) opens a
  *   fuzzy list of skills. Accepting a completion inserts `$skill-name ` IN PLACE
  *   — your sentence is not reordered.
- * - On submit, every `$skill-name` token that matches a loaded skill is expanded:
- *   the skill instructions are prepended as a <skill> block (same format pi core
- *   uses for /skill:name, so it renders collapsed in the TUI), and your message
- *   text is kept verbatim after it.
+ * - The prompt is stored EXACTLY as typed: `Use $grafana to check p99` shows up
+ *   verbatim in the transcript, tree view, editor history, and session file.
+ *   No `<skill>` block is ever persisted.
+ * - The `context` event expands `$skill-name` mentions into the in-flight
+ *   request just before it is sent to the model (in place, on Pi's own clone),
+ *   prepending the same `<skill name="..." location="...">` block pi core uses
+ *   for /skill:name. Re-applied on every request, so the skill instructions
+ *   stay context-resident for the whole conversation.
  * - Tokens inside `inline code` or ``` fenced blocks are ignored, and unknown
- *   names (e.g. $HOME) are left untouched.
+ *   names (e.g. $HOME) are left untouched. Messages already expanded by core
+ *   `/skill:` (stored with a leading `<skill` block) are skipped.
  *
  * Replaces the npm package `pi-inline-skills-and-prompts`, which moved the
- * skill to the front of the line.
+ * skill to the front of the line, and the earlier input-time transform, which
+ * polluted the persisted prompt with the skill body.
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 import type { ExtensionAPI, SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import { stripFrontmatter } from "@earendil-works/pi-coding-agent";
@@ -69,8 +75,16 @@ function findSkillMentions(text: string, skills: Map<string, SkillRef>): SkillRe
 	return [...found.values()];
 }
 
+/** Skill body cache keyed by path; invalidated when the file's mtime changes. */
+const bodyCache = new Map<string, { mtimeMs: number; body: string }>();
+
 function readSkillBody(skill: SkillRef): string {
-	return stripFrontmatter(readFileSync(skill.filePath, "utf-8")).trim();
+	const { mtimeMs } = statSync(skill.filePath);
+	const cached = bodyCache.get(skill.filePath);
+	if (cached && cached.mtimeMs === mtimeMs) return cached.body;
+	const body = stripFrontmatter(readFileSync(skill.filePath, "utf-8")).trim();
+	bodyCache.set(skill.filePath, { mtimeMs, body });
+	return body;
 }
 
 function buildSkillBlock(skills: SkillRef[]): string {
@@ -90,25 +104,63 @@ function buildSkillBlock(skills: SkillRef[]): string {
 	return `<skill name="${names}" location="${skills[0].filePath}">\nThe user referenced multiple skills inline. Apply each where referenced.\n\n${inner}\n</skill>`;
 }
 
+/** Join the text parts of a user message's content. */
+function userText(content: string | Array<{ type: string; text?: string }>): string {
+	if (typeof content === "string") return content;
+	return content
+		.filter((part) => part.type === "text" && typeof part.text === "string")
+		.map((part) => part.text)
+		.join("");
+}
+
+/** Prepend the skill block to a user message's first text part (in place). */
+function prependToContent(msg: { content: string | Array<{ type: string; text?: string }> }, block: string): void {
+	if (typeof msg.content === "string") {
+		msg.content = `${block}\n\n${msg.content}`;
+		return;
+	}
+	const idx = msg.content.findIndex((part) => part.type === "text");
+	if (idx === -1) {
+		msg.content.unshift({ type: "text", text: block });
+		return;
+	}
+	const part = msg.content[idx];
+	if (part && typeof part.text === "string") msg.content[idx] = { type: "text", text: `${block}\n\n${part.text}` };
+}
+
 export default function (pi: ExtensionAPI): void {
 	registerLoadedExtension("inline-skills");
-	// ---- Expand $skill mentions on submit ---------------------------------
-	pi.on("input", async (event, ctx) => {
-		if (event.source === "extension") return { action: "continue" };
-		const text = event.text;
-		if (!text.includes("$")) return { action: "continue" };
-		// Leave real slash commands alone (core handles /skill:x and prompt templates).
-		if (text.startsWith("/")) return { action: "continue" };
 
-		const mentions = findSkillMentions(text, getSkills(pi));
-		if (mentions.length === 0) return { action: "continue" };
+	// ---- Expand $skill mentions in the request sent to the model -----------
+	// Runs on every LLM request, on pi's own clone of the conversation. The
+	// persisted session (and therefore the transcript, tree view, and editor
+	// history) keeps the prompt exactly as typed. Editing event.messages in
+	// place is the documented contract and preserves the system message layout,
+	// so prompt prefix caching is unaffected.
+	pi.on("context", (event) => {
+		const skills = getSkills(pi);
+		for (const msg of event.messages) {
+			if (msg.role !== "user") continue;
+			const text = userText(msg.content);
+			if (!text.includes("$")) continue;
+			// Skip messages already expanded by core /skill: (their body may
+			// itself contain $tokens that would spuriously re-expand).
+			if (text.startsWith("<skill")) continue;
 
-		try {
-			const block = buildSkillBlock(mentions);
-			return { action: "transform", text: `${block}\n\n${text}` };
-		} catch (err) {
-			ctx.ui.notify(`inline-skills: failed to load skill: ${err instanceof Error ? err.message : String(err)}`, "error");
-			return { action: "continue" };
+			const mentions = findSkillMentions(text, skills);
+			if (mentions.length === 0) continue;
+
+			let block: string;
+			try {
+				block = buildSkillBlock(mentions);
+			} catch {
+				// Fail soft: send the request unexpanded rather than breaking the
+				// turn. `context` fires on every request, so surfacing an error here
+				// would repeat once per request; an unexpanded $mention is visible
+				// in the transcript, which is enough to notice and retry.
+				continue;
+			}
+			prependToContent(msg, block);
 		}
 	});
 
