@@ -83,7 +83,7 @@ For a cloned install, `git pull` is equivalent to `pi update --extension`.
 | `notify/` | Sound + macOS notification when a turn finishes (`/notify`, `~/.pi/agent/notify.json`) |
 | `rename-chat/` | `rename-chat` tool so the agent can title sessions |
 | `inline-skills/` | `$skill` inline skill references |
-| `session-mention/` | Reference another saved session with `@[name]`; autocomplete inserts names and submit expands the transcript. [docs](extensions/session-mention/README.md) |
+| `session-mention/` | Reference another saved session with `@[id]`; autocomplete shows titles but inserts stable ids, and bounded escaped transcripts expand only in request-time context. [docs](extensions/session-mention/README.md) |
 | `md-fence-render/` | Render ```` ```md ```` blocks as Markdown; `┌─ lang` / `└─` markers instead of ```` ``` ```` fences on code; copy-safe code block prompt rules. ⚠️ [internals](extensions/md-fence-render/README.md) |
 | `click-copy/` | Click a fenced block in fullscreen TUI to copy it exactly; requires `md-fence-render`. [docs](extensions/click-copy/README.md) |
 | `snippet-copy/` | Copy fenced blocks by number or language with `/cc <number-or-language>` or `ctrl+shift+y`; works independently of click-to-copy. [docs](extensions/snippet-copy/README.md) |

@@ -14,6 +14,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Markdown } from "@earendil-works/pi-tui";
 import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
+import { isClosingFence } from "../../lib/markdown-fences.ts";
 
 /** Fence info strings that get unwrapped and rendered as Markdown. */
 const RENDER_LANGS = new Set(["markdown", "md"]);
@@ -56,10 +57,9 @@ function parseFence(line: string): (Fence & { lang: string }) | null {
 	};
 }
 
-/** A closing fence: same char, at least as long, nothing else on the line. */
+/** A CommonMark closing fence matching the open fence's char and length. */
 function closes(line: string, f: Fence): boolean {
-	const t = line.trim();
-	return t.length >= f.len && t === f.char.repeat(t.length);
+	return isClosingFence(line, f);
 }
 
 export function renderMarkdownFences(markdown: string): string {
