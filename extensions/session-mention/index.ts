@@ -1,60 +1,64 @@
 /**
  * session-mention — reference other Pi sessions from a prompt with `@[...]`.
  *
- * - Typing `@[` opens a fuzzy picker over ALL saved sessions (all projects),
- *   matched by name, first message, cwd basename, or session id.
- *   Accepting inserts `@[<session name>]` in place (falls back to the id when
- *   the session has no name, or its name contains a `]`). Plain `@` file
- *   completion is untouched for everything else.
- * - On submit, every `@[name]` (or `@[id]`) token is expanded: the referenced
- *   session's active-branch transcript is rendered as markdown and injected as a
- *   <skill>-shaped block ahead of your message (pi's TUI collapses that shape
- *   in user messages, so the injected transcript doesn't flood the chat view).
- *   The token itself is replaced with a short «name» marker so your sentence
- *   still reads.
- * - Tokens inside `inline code` or fenced blocks are ignored; unknown ids are
- *   left untouched (so `@[...]` in code stays literal).
- *
- * Works for every submit path (plain, steering, follow-up, queued) because it
- * rides the `input` event, which runs before skill/template expansion on all
- * of them.
- *
- * Requires lib/inbox-agents.ts (transcriptMarkdown). No Pi internals beyond
- * public extension APIs — see README.md.
+ * Autocomplete always inserts the immutable session id, while showing the
+ * human-readable title. On each model request, mentions are expanded only in
+ * Pi's in-flight context clone. The saved prompt remains exactly as typed.
+ * Transcript bodies are size-bounded and XML-escaped before being placed in a
+ * <skill>-shaped envelope.
  */
 
 import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 import { transcriptMarkdown } from "../../lib/inbox-agents.ts";
+import {
+	indexSessionIdentities,
+	renderQuotedSession,
+	wrapQuotedSessions,
+} from "./format.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { SessionManager, type SessionInfo } from "@earendil-works/pi-coding-agent";
+import {
+	SessionManager,
+	type SessionInfo,
+} from "@earendil-works/pi-coding-agent";
 import { fuzzyFilter } from "@earendil-works/pi-tui";
 
-// `@[query` immediately before the cursor, preceded by start/whitespace/opening punctuation.
-// Mirrors the token shape pi-tui uses for @ file completion, but requires the '[' after '@'.
-// The query can be any prose up to ']' — session names contain punctuation.
 const COMPLETION_PATTERN = /(?:^|[\s([{<"'`])@\[([^\]\n]*)$/;
-// `@[...]` tokens in submitted text: contents are a session name or id, up to
-// the first ']'. Unknown names/ids are left literal.
-const TOKEN_PATTERN = /(^|[\s([{<"''])@\[([^\]\n]+)\]/g;
+const TOKEN_PATTERN = /(^|[\s([{<"'])@\[([^\]\n]+)\]/g;
+const MAX_SESSION_TRANSCRIPT_CHARS = 24 * 1024;
+const MAX_REQUEST_TRANSCRIPT_CHARS = 64 * 1024;
+const MAX_REQUEST_SESSION_MENTIONS = 16;
+const MIN_TRANSCRIPT_CHARS = 256;
 
 interface SessionRef {
 	info: SessionInfo;
-	/** Length-1 preview of the session's first user message. */
 	preview: string;
-	/** cwd basename for display. */
 	dir: string;
+}
+
+interface SessionIndex {
+	byId: Map<string, SessionInfo>;
+	byName: Map<string, SessionInfo>;
+}
+
+interface MentionOccurrence {
+	start: number;
+	end: number;
+	info: SessionInfo;
+}
+
+interface TextSlot {
+	text: string;
+	set(value: string): void;
 }
 
 function previewOf(info: SessionInfo): string {
 	return info.firstMessage.replace(/\s+/g, " ").trim().slice(0, 60);
 }
 
-/** Compare by modified time, newest first. */
 function byModified(a: SessionRef, b: SessionRef): number {
 	return b.info.modified.getTime() - a.info.modified.getTime();
 }
 
-/** List sessions once per autocomplete burst, cached for 1s (typing re-queries). */
 let cachedAt = 0;
 let cachedSessions: SessionRef[] | undefined;
 let inflight: Promise<SessionRef[]> | undefined;
@@ -70,7 +74,8 @@ async function listSessions(): Promise<SessionRef[]> {
 				.map((info) => ({
 					info,
 					preview: previewOf(info),
-					dir: info.cwd.split("/").filter(Boolean).pop() ?? info.cwd,
+					dir:
+						info.cwd.split("/").filter(Boolean).pop() ?? info.cwd,
 				}))
 				.sort(byModified);
 		} catch {
@@ -85,181 +90,343 @@ async function listSessions(): Promise<SessionRef[]> {
 	return result;
 }
 
-/** Return [start, end) ranges covered by fenced or inline code. */
 function codeRanges(text: string): Array<[number, number]> {
 	const ranges: Array<[number, number]> = [];
-	const re = /```[\s\S]*?(?:```|$)|`[^`\n]*`/g;
-	let m: RegExpExecArray | null;
-	while ((m = re.exec(text))) ranges.push([m.index, m.index + m[0].length]);
+	const pattern = /```[\s\S]*?(?:```|$)|`[^`\n]*`/g;
+	let match: RegExpExecArray | null;
+	while ((match = pattern.exec(text))) {
+		ranges.push([match.index, match.index + match[0].length]);
+	}
 	return ranges;
 }
 
 function findSessionMentions(
 	text: string,
-	byId: Map<string, SessionInfo>,
-	byName: Map<string, SessionInfo>,
-): Array<{ match: string; info: SessionInfo }> {
+	index: SessionIndex,
+): MentionOccurrence[] {
 	const code = codeRanges(text);
-	const inCode = (i: number) => code.some(([s, e]) => i >= s && i < e);
-	const found: Array<{ match: string; info: SessionInfo }> = [];
-	const seen = new Set<string>();
-	for (const m of text.matchAll(TOKEN_PATTERN)) {
-		const atIdx = (m.index ?? 0) + m[1].length;
-		if (inCode(atIdx)) continue;
-		// Ids win when a token is shaped like both; duplicate names resolve to
-		// the most recently modified session.
-		const token = m[2];
-		const info = byId.get(token) ?? byName.get(token);
-		// Replace only the `@[...]` part (not the preceding boundary char) so the
-		// user's sentence spacing is preserved.
-		if (info && !seen.has(info.id)) {
-			seen.add(info.id);
-			found.push({ match: `@[${token}]`, info });
-		}
+	const inCode = (position: number) =>
+		code.some(([start, end]) => position >= start && position < end);
+	const found: MentionOccurrence[] = [];
+	for (const match of text.matchAll(TOKEN_PATTERN)) {
+		const start = (match.index ?? 0) + match[1].length;
+		if (inCode(start)) continue;
+		const token = match[2];
+		const info = index.byId.get(token) ?? index.byName.get(token);
+		if (!info) continue;
+		found.push({
+			start,
+			end: start + token.length + 3,
+			info,
+		});
 	}
 	return found;
 }
 
-/** Display label for a session: name, else first-message preview. */
 function labelOf(ref: SessionRef): string {
 	return ref.info.name || ref.preview || "(no messages)";
 }
 
 function titleOf(info: SessionInfo): string {
-	return info.name || previewOf(info) || info.id;
+	return (info.name || previewOf(info) || info.id).slice(0, 200);
 }
 
-/** Render the mention block for one or more referenced sessions. */
-function buildMentionBlock(mentions: Array<{ info: SessionInfo }>): string {
-	const parts: string[] = [];
-	for (const { info } of mentions) {
-		let body: string;
-		try {
-			body = transcriptMarkdown(info.path);
-		} catch (err) {
-			body = `_Could not read session: ${err instanceof Error ? err.message : String(err)}_`;
-		}
-		parts.push(
-			`<session id="${info.id}" name="${titleOf(info).replace(/"/g, "'")}" cwd="${info.cwd}">\n${body}\n</session>`,
-		);
+function markerOf(info: SessionInfo): string {
+	const title = titleOf(info)
+		.replace(/[<>&«»\r\n]/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+	return `«${title || info.id}»`;
+}
+
+function textSlots(message: any): TextSlot[] {
+	if (typeof message?.content === "string") {
+		return [{
+			text: message.content,
+			set: (value) => {
+				message.content = value;
+			},
+		}];
 	}
-	return parts.length === 1
-		? parts[0]
-		: `<sessions>\nThe user referenced multiple sessions inline. Each session follows.\n\n${parts.join("\n\n")}\n</sessions>`;
+	if (!Array.isArray(message?.content)) return [];
+	const slots: TextSlot[] = [];
+	message.content.forEach((part: any, index: number) => {
+		if (part?.type !== "text" || typeof part.text !== "string") return;
+		slots.push({
+			text: part.text,
+			set: (value) => {
+				message.content[index] = { ...part, text: value };
+			},
+		});
+	});
+	return slots;
+}
+
+/** Skip a block another request-time extension already prepended. */
+function authoredOffset(text: string): number {
+	if (!/^\s*<skill\b/.test(text)) return 0;
+	const end = text.indexOf("</skill>");
+	return end < 0 ? text.length : end + "</skill>".length;
+}
+
+function prependToMessage(message: any, block: string): void {
+	if (typeof message.content === "string") {
+		message.content = `${block}\n\n${message.content}`;
+		return;
+	}
+	if (!Array.isArray(message.content)) return;
+	const index = message.content.findIndex(
+		(part: any) => part?.type === "text",
+	);
+	if (index < 0) {
+		message.content.unshift({ type: "text", text: block });
+		return;
+	}
+	const part = message.content[index];
+	message.content[index] = {
+		...part,
+		text: `${block}\n\n${part.text ?? ""}`,
+	};
+}
+
+function replaceMentions(
+	slot: TextSlot,
+	mentions: MentionOccurrence[],
+	includedIds: Set<string>,
+): void {
+	let text = slot.text;
+	const replacements = mentions
+		.filter((mention) => includedIds.has(mention.info.id))
+		.sort((a, b) => b.start - a.start);
+	for (const mention of replacements) {
+		text =
+			text.slice(0, mention.start) +
+			markerOf(mention.info) +
+			text.slice(mention.end);
+	}
+	slot.set(text);
+}
+
+function readTranscript(info: SessionInfo): string {
+	try {
+		return transcriptMarkdown(info.path);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return `_Could not read session: ${message}_`;
+	}
+}
+
+function buildMentionBlock(
+	infos: SessionInfo[],
+	budget: number,
+	maxSessions: number,
+): {
+	block?: string;
+	includedIds: Set<string>;
+	bodyChars: number;
+} {
+	const rendered = [];
+	const names: string[] = [];
+	const includedIds = new Set<string>();
+	let remaining = budget;
+	let bodyChars = 0;
+	for (const info of infos.slice(0, maxSessions)) {
+		const limit = Math.min(MAX_SESSION_TRANSCRIPT_CHARS, remaining);
+		if (limit < MIN_TRANSCRIPT_CHARS) break;
+		const session = renderQuotedSession(
+			{
+				id: info.id,
+				title: titleOf(info),
+				cwd: info.cwd,
+				body: readTranscript(info),
+			},
+			limit,
+		);
+		rendered.push(session);
+		names.push(titleOf(info));
+		includedIds.add(info.id);
+		bodyChars += session.bodyChars;
+		remaining -= session.bodyChars;
+	}
+	if (rendered.length === 0) {
+		return { includedIds, bodyChars };
+	}
+	return {
+		block: wrapQuotedSessions(rendered, names, infos[0].path),
+		includedIds,
+		bodyChars,
+	};
 }
 
 export default function (pi: ExtensionAPI): void {
 	registerLoadedExtension("session-mention");
 
-	// ---- Expand @[id] mentions on submit ---------------------------------
-	pi.on("input", async (event, ctx) => {
-		if (event.source === "extension") return { action: "continue" };
-		const text = event.text;
-		if (!text.includes("@[")) return { action: "continue" };
-
-		// Index known sessions by id and by name for token resolution. The list
-		// is sorted newest-first, so the first name hit is the most recent one.
-		const byId = new Map<string, SessionInfo>();
-		const byName = new Map<string, SessionInfo>();
-		for (const s of await listSessions()) {
-			byId.set(s.info.id, s.info);
-			if (s.info.name && !byName.has(s.info.name)) byName.set(s.info.name, s.info);
+	pi.on("context", async (event) => {
+		const userMessages = event.messages.filter(
+			(message: any) => message?.role === "user",
+		) as any[];
+		if (!userMessages.some((message) =>
+			textSlots(message).some((slot) => slot.text.includes("@[")))) {
+			return;
 		}
 
-		const mentions = findSessionMentions(text, byId, byName);
-		if (mentions.length === 0) return { action: "continue" };
-
-		try {
-			// Replace each token with a short readable marker, then prepend the
-			// transcript block (skill-block pattern: TUI collapses it).
-			let newText = text;
-			for (const { match, info } of mentions) {
-				const marker = `«${titleOf(info).replace(/[«»]/g, "")}»`;
-				newText = newText.split(match).join(marker);
+		const index: SessionIndex = indexSessionIdentities(
+			(await listSessions()).map((session) => session.info),
+		);
+		let remaining = MAX_REQUEST_TRANSCRIPT_CHARS;
+		let remainingSessions = MAX_REQUEST_SESSION_MENTIONS;
+		for (const message of [...userMessages].reverse()) {
+			if (
+				remaining < MIN_TRANSCRIPT_CHARS ||
+				remainingSessions === 0
+			) {
+				break;
 			}
-			const block = buildMentionBlock(mentions);
-			const names = mentions.map((m) => titleOf(m.info)).join(", ");
-			return {
-				action: "transform",
-				// Skill-block shape: name + location attrs, body, blank line, rest.
-				// pi's TUI collapses this pattern in the user message, so the
-				// injected transcript doesn't flood the chat view.
-				text: `<skill name="↪ ${names}" location="${mentions[0].info.path}">\n${block}\n</skill>\n\n${newText}`,
-			};
-		} catch (err) {
-			ctx.ui.notify(
-				`session-mention: failed to load session: ${err instanceof Error ? err.message : String(err)}`,
-				"error",
+			const slots = textSlots(message);
+			const mentionsBySlot = new Map<TextSlot, MentionOccurrence[]>();
+			const infos = new Map<string, SessionInfo>();
+			for (const slot of slots) {
+				const offset = authoredOffset(slot.text);
+				const mentions = findSessionMentions(
+					slot.text.slice(offset),
+					index,
+				).map((mention) => ({
+					...mention,
+					start: mention.start + offset,
+					end: mention.end + offset,
+				}));
+				if (mentions.length === 0) continue;
+				mentionsBySlot.set(slot, mentions);
+				for (const mention of mentions) {
+					infos.set(mention.info.id, mention.info);
+				}
+			}
+			if (infos.size === 0) continue;
+
+			const built = buildMentionBlock(
+				[...infos.values()],
+				remaining,
+				remainingSessions,
 			);
-			return { action: "continue" };
+			if (!built.block) continue;
+			for (const [slot, mentions] of mentionsBySlot) {
+				replaceMentions(slot, mentions, built.includedIds);
+			}
+			prependToMessage(message, built.block);
+			remaining -= built.bodyChars;
+			remainingSessions -= built.includedIds.size;
 		}
 	});
 
-	// ---- `@[` autocomplete -------------------------------------------------
 	pi.on("session_start", (_event, ctx) => {
 		ctx.ui.addAutocompleteProvider((current) => ({
-			async getSuggestions(lines, cursorLine, cursorCol, options) {
+			async getSuggestions(
+				lines,
+				cursorLine,
+				cursorCol,
+				options,
+			) {
 				const before = (lines[cursorLine] ?? "").slice(0, cursorCol);
 				const match = before.match(COMPLETION_PATTERN);
-				if (!match) return current.getSuggestions(lines, cursorLine, cursorCol, options);
+				if (!match) {
+					return current.getSuggestions(
+						lines,
+						cursorLine,
+						cursorCol,
+						options,
+					);
+				}
 
 				const query = match[1] ?? "";
 				const sessions = await listSessions();
 				const matches = query
-					? fuzzyFilter(sessions, query, (s) =>
-							`${s.info.name ?? ""} ${s.preview} ${s.dir} ${s.info.id}`,
+					? fuzzyFilter(
+							sessions,
+							query,
+							(session) =>
+								`${session.info.name ?? ""} ` +
+								`${session.preview} ${session.dir} ` +
+								`${session.info.id}`,
 						)
 					: sessions.slice(0, 20);
 				if (matches.length === 0) {
-					// No session matches: fall back to file completion so `@` stays useful.
-					return current.getSuggestions(lines, cursorLine, cursorCol, options);
+					return current.getSuggestions(
+						lines,
+						cursorLine,
+						cursorCol,
+						options,
+					);
 				}
 
-				const rel = (d: Date) => {
-					const s = Math.floor((Date.now() - d.getTime()) / 1000);
-					if (s < 60) return `${s}s`;
-					if (s < 3600) return `${Math.floor(s / 60)}m`;
-					if (s < 86400) return `${Math.floor(s / 3600)}h`;
-					return `${Math.floor(s / 86400)}d`;
-				};
-
-				// Insert the session's NAME when possible so the prompt stays
-				// readable; fall back to the id for unnamed sessions or names
-				// containing ']' (which would end the token early).
-				const valueOf = (s: SessionRef): string => {
-					const name = s.info.name;
-					return name && !name.includes("]") ? `@[${name}]` : `@[${s.info.id}]`;
+				const relative = (date: Date) => {
+					const seconds = Math.floor(
+						(Date.now() - date.getTime()) / 1000,
+					);
+					if (seconds < 60) return `${seconds}s`;
+					if (seconds < 3600) {
+						return `${Math.floor(seconds / 60)}m`;
+					}
+					if (seconds < 86400) {
+						return `${Math.floor(seconds / 3600)}h`;
+					}
+					return `${Math.floor(seconds / 86400)}d`;
 				};
 
 				return {
 					prefix: `@[${query}`,
-					items: matches.slice(0, 20).map((s) => ({
-						value: valueOf(s),
-						label: labelOf(s),
-						description: `${s.dir} · ${rel(s.info.modified)} · ${s.info.messageCount} msg · ${s.info.id}`,
+					items: matches.slice(0, 20).map((session) => ({
+						value: `@[${session.info.id}]`,
+						label: labelOf(session),
+						description:
+							`${session.dir} · ` +
+							`${relative(session.info.modified)} · ` +
+							`${session.info.messageCount} msg · ` +
+							`${session.info.id}`,
 					})),
 				};
 			},
 
-			applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+			applyCompletion(
+				lines,
+				cursorLine,
+				cursorCol,
+				item,
+				prefix,
+			) {
 				const line = lines[cursorLine] ?? "";
 				const before = line.slice(0, cursorCol);
 				const match = before.match(COMPLETION_PATTERN);
 				if (!match || !item.value.startsWith("@[")) {
-					return current.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
+					return current.applyCompletion(
+						lines,
+						cursorLine,
+						cursorCol,
+						item,
+						prefix,
+					);
 				}
 
-				// Replace from the '@[' to the cursor with the full token.
 				const tokenStart = cursorCol - (match[1].length + 2);
 				const after = line.slice(cursorCol);
-				const insert = after.startsWith(" ") ? item.value : `${item.value} `;
+				const insert = after.startsWith(" ")
+					? item.value
+					: `${item.value} `;
 				const newLines = [...lines];
-				newLines[cursorLine] = line.slice(0, tokenStart) + insert + after;
-				return { lines: newLines, cursorLine, cursorCol: tokenStart + insert.length };
+				newLines[cursorLine] =
+					line.slice(0, tokenStart) + insert + after;
+				return {
+					lines: newLines,
+					cursorLine,
+					cursorCol: tokenStart + insert.length,
+				};
 			},
 
 			shouldTriggerFileCompletion(lines, cursorLine, cursorCol) {
-				return current.shouldTriggerFileCompletion?.(lines, cursorLine, cursorCol) ?? true;
+				return current.shouldTriggerFileCompletion?.(
+					lines,
+					cursorLine,
+					cursorCol,
+				) ?? true;
 			},
 		}));
 	});

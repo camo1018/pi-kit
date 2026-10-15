@@ -31,6 +31,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { copyToClipboard } from "@earendil-works/pi-coding-agent";
 import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
+import { isClosingFence } from "../../lib/markdown-fences.ts";
 
 /** Fence info strings md-fence-render renders as Markdown. Keep in sync
  * with extensions/md-fence-render/index.ts RENDER_LANGS. */
@@ -47,7 +48,7 @@ let blocks: Block[] = [];
 /** code text -> id (first occurrence wins, so identical blocks share an id). */
 let idByCode = new Map<string, number>();
 
-interface Fence {
+export interface Fence {
 	lang: string;
 	code: string;
 	/** index of the closing fence line */
@@ -78,10 +79,9 @@ function parseFence(line: string): OpenFence | null {
 	};
 }
 
-/** A closing fence: same char, at least as long, nothing else on the line. */
+/** A CommonMark closing fence matching the open fence's char and length. */
 function closes(line: string, f: OpenFence): boolean {
-	const t = line.trim();
-	return t.length >= f.len && t === f.char.repeat(t.length);
+	return isClosingFence(line, f);
 }
 
 /**
@@ -91,7 +91,7 @@ function closes(line: string, f: OpenFence): boolean {
  * Nested blocks are emitted before their container (closing order), so
  * `out` is sorted by closeLine — splicing labels bottom-up stays valid.
  */
-function scanFences(markdown: string): Fence[] {
+export function scanFences(markdown: string): Fence[] {
 	const lines = markdown.split("\n");
 	const out: Fence[] = [];
 	const stack: OpenFence[] = [];
