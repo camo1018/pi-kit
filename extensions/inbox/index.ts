@@ -8,7 +8,7 @@
  *   /pin              toggle pin on the current session
  *   /archive          toggle archive on the current session
  *   /bookmark         return to the transcript row saved by the inbox
- *                     (also: ctrl+shift+b; fullscreen mode)
+ *                     (also: ctrl+b / ctrl+shift+b; fullscreen mode)
  *
  * Inside the inbox:
  *   ↑/↓ ←/→ PgUp/PgDn  move (←/→ = 5 rows)   enter       agent view: live transcript (r there = reply)
@@ -4657,10 +4657,14 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => restoreScrollBookmark(ctx),
 	});
 
-	pi.registerShortcut("ctrl+shift+b", {
-		description: "Return to the last place read in this session",
-		handler: async (ctx) => restoreScrollBookmark(ctx),
-	});
+	// Ctrl+B works in legacy terminals that cannot distinguish Ctrl+Shift+B.
+	// It overrides cursor-left in the main editor; Left Arrow still moves left.
+	for (const key of ["ctrl+b", "ctrl+shift+b"] as const) {
+		pi.registerShortcut(key, {
+			description: "Return to the last place read in this session",
+			handler: async (ctx) => restoreScrollBookmark(ctx),
+		});
+	}
 
 	// ctrl+w while a new agent's prompt is pending (or on orchestrator home): pick the
 	// directory that agent will run in. Not registered as a plain extension shortcut: ctrl+w is the
