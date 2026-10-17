@@ -40,7 +40,7 @@ Source: `~/Code/pi-kit/extensions/inbox/index.ts` (background agents: `~/Code/pi
 | `n` | New background agent in the current directory, using this window's model. You type its prompt in pi's editor |
 | `N` | Same, picking its model first |
 | `g` | Select/manage the group view (`ctrl+g` remains an alias) |
-| `ctrl+g` | While composing a new agent, choose its destination group |
+| `ctrl+g` | Choose a new agent's destination or move the session on screen |
 | `b` | Move the selected session into a group or Ungrouped, without stopping it |
 | `s` | All groups: toggle flat list / grouped sections |
 | `f` | Choose the persistent new-agent default group; Ungrouped clears it |
@@ -236,8 +236,10 @@ Starting an agent with **n/N** while viewing a named group automatically puts
 it in that group. Ungrouped explicitly creates ungrouped agents. All groups
 uses the configured new-agent default, or Ungrouped if none is configured. During
 composition, **Ctrl+G** changes the destination, which is shown in the banner.
-Outside the inbox and new-agent composition, Ctrl+G keeps Pi's external-editor
-behavior. Existing replies never change membership or receive templates.
+In an existing session (including a busy visit), **Ctrl+G** opens the same
+move-to-group picker as `/group`, replacing Pi's external-editor shortcut.
+Moving a session changes only membership, preserving its draft and runtime;
+existing replies never receive templates.
 
 ### Default group for new agents
 

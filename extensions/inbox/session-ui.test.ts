@@ -1233,7 +1233,13 @@ test("Ctrl+G changes groups without clobbering edited drafts", async (t) => {
 	await nextTick();
 	assert.equal(f.ui.getEditorText(), "second + URL");
 	assert.deepEqual(f.key("\x1b"), { consume: true });
-	assert.equal(f.key("\x07"), undefined);
+	f.ui.setEditorText("existing session draft");
+	assert.deepEqual(f.key("\x07"), { consume: true });
+	f.overlay().handleInput("B");
+	f.overlay().handleInput("1");
+	await nextTick();
+	assert.equal(groups.load().sessions[f.main.getSessionId()], b.id);
+	assert.equal(f.ui.getEditorText(), "existing session draft");
 });
 
 test("/group moves a busy visit without touching its runtime", async (t) => {
@@ -1255,7 +1261,17 @@ test("/group moves a busy visit without touching its runtime", async (t) => {
 	assert.equal(readFileSync(a.sessionFile!, "utf8"), before);
 	assert.equal(readFileSync(f.main.getSessionFile()!, "utf8"), mainBefore);
 	assert.equal((proc!.kill as any).mock.calls.length, 0);
-	assert.equal(f.key("\x07"), undefined);
+	assert.deepEqual(f.key("\x07"), { consume: true });
+	f.overlay().handleInput("Ungrouped");
+	f.overlay().handleInput("1");
+	await nextTick();
+	assert.equal(groups.load().sessions[a.id], undefined);
+	assert.equal(f.ui.getEditorText(), "");
+	assert.equal(a.proc, proc);
+	assert.equal(a.state, "working");
+	assert.equal(readFileSync(a.sessionFile!, "utf8"), before);
+	assert.equal(readFileSync(f.main.getSessionFile()!, "utf8"), mainBefore);
+	assert.equal((proc!.kill as any).mock.calls.length, 0);
 });
 
 test("membership is saved before starting a new agent", async (t) => {
