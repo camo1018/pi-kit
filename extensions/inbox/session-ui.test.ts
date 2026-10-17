@@ -12,17 +12,20 @@ import {
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import {
+	CombinedAutocompleteProvider,
 	Container,
 	getKeybindings,
 	KeybindingsManager,
 	matchesKey,
 	setKeybindings,
 	TUI_KEYBINDINGS,
+	type AutocompleteProvider,
 	type TUI,
 } from "@earendil-works/pi-tui";
 import type { BgAgent } from "../../lib/inbox-agents.ts";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { InboxGroups } from "./groups.ts";
+import inlineSkills from "../inline-skills/index.ts";
 
 // Import only after isolating every inbox write from the operator's data.
 const dir = mkdtempSync(join(tmpdir(), "pi-queue-test-"));
@@ -146,6 +149,10 @@ async function setup(t: TestContext, takenOver = true) {
 		registerFlag() {},
 		getFlag: () => false,
 		getSessionName: () => "taken-over main",
+		getCommands: () => [...commands.keys()].map((name) => ({
+			name, description: name, source: "extension",
+			sourceInfo: { path: "test" },
+		})),
 		getThinkingLevel: () => "off",
 		sendUserMessage: mock.fn(),
 	} as unknown as ExtensionAPI;
@@ -157,8 +164,22 @@ async function setup(t: TestContext, takenOver = true) {
 		bg: (_color: string, text: string) => text,
 		bold: (text: string) => text,
 	};
+	const autocompleteWrappers: Array<
+		(current: AutocompleteProvider) => AutocompleteProvider
+	> = [];
+	let autocomplete: AutocompleteProvider;
 	const ui = {
 		tui,
+		addAutocompleteProvider(factory: typeof autocompleteWrappers[number]) {
+			autocompleteWrappers.push(factory);
+			autocomplete = new CombinedAutocompleteProvider([
+				{ name: "help", description: "Help" },
+				...pi.getCommands(),
+			], dir);
+			for (const wrap of autocompleteWrappers) {
+				autocomplete = wrap(autocomplete);
+			}
+		},
 		theme,
 		notify: mock.fn(),
 		setStatus() {},
@@ -290,6 +311,7 @@ async function setup(t: TestContext, takenOver = true) {
 		editor,
 		visit,
 		widgets,
+		autocomplete: () => autocomplete,
 		key: (data: string) => {
 			for (const handler of terminalInputs) {
 				const result = handler(data);
@@ -927,6 +949,136 @@ test("single-group filters retain the layout preference", async (t) => {
 	assert.match(reopened.list.render(120).join("\n"), /Layout: by group/);
 	closeList(reopened.list);
 	await reopened.done;
+});
+
+test("g opens groups; Home jumps top; search g stays text", async (t) => {
+	const f = await setup(t);
+	await f.visit("navigation target");
+	const { list, done } = await f.openInbox();
+	list.handleInput("\x1b[F");
+	assert.equal(list.selected, list.visible.length - 1);
+	list.handleInput("\x1b[H");
+	assert.equal(list.selected, 0);
+	list.handleInput("G");
+	assert.equal(list.selected, 0, "uppercase G no longer jumps to bottom");
+	list.handleInput("/");
+	list.handleInput("g");
+	assert.equal(list.state.query, "g");
+	assert.equal(f.overlay(), list);
+	list.handleInput("\x1b");
+	list.handleInput("g");
+	await nextTick();
+	assert.equal(f.overlay().constructor.name, "GroupSelector");
+	f.overlay().handleInput("\x1b");
+	await nextTick();
+	f.overlay().handleInput("\x1b");
+	await done;
+});
+
+test("default picker updates the header and new-agent template", async (t) => {
+	const f = await setup(t);
+	const groups = new InboxGroups(dir);
+	const reviews = await groups.create("Reviews");
+	await groups.setTemplate(reviews.id, "review template", true);
+	const { list, done } = await f.openInbox();
+	const initial = list.render(120);
+	assert.match(initial[0], /orchestrator.*default: Ungrouped/);
+	assert.match(initial[2], /Group: All groups.*f to change default group/);
+	assert.match(initial[3], /^├/);
+	assert.equal(initial.some((line: string) =>
+		line.includes("New-agent default:")), false);
+	list.handleInput("f");
+	await nextTick();
+	assert.match(f.overlay().render(100).join("\n"), /Default group for/);
+	f.overlay().handleInput("Rev");
+	f.overlay().handleInput("1");
+	await nextTick();
+	assert.equal(groups.load().defaultGroupId, reviews.id);
+	assert.match(f.overlay().render(120)[0], /default: Reviews/);
+	f.overlay().handleInput("n");
+	await done;
+	assert.equal((globalThis as any)[Symbol.for("pi.inbox.reply-target")]
+		.groupId, reviews.id);
+	assert.equal(f.ui.getEditorText(), "review template");
+});
+
+test("view and one-shot Ungrouped choices override the default", async (t) => {
+	const f = await setup(t);
+	const groups = new InboxGroups(dir);
+	const reviews = await groups.create("Reviews");
+	const bugs = await groups.create("Bugs");
+	await groups.setDefaultGroup(reviews.id);
+	(globalThis as any)[Symbol.for("pi.inbox.group-view")] = bugs.id;
+	const { list, done } = await f.openInbox();
+	list.handleInput("n");
+	await done;
+	const target = () =>
+		(globalThis as any)[Symbol.for("pi.inbox.reply-target")];
+	assert.equal(target().groupId, bugs.id);
+	assert.deepEqual(f.key("\x07"), { consume: true });
+	f.overlay().handleInput("U");
+	f.overlay().handleInput("1");
+	await nextTick();
+	assert.equal(target().groupId, undefined);
+	assert.deepEqual(f.key("\x07"), { consume: true });
+	const picker = f.overlay();
+	assert.equal(picker.matches()[picker.selected].scope, "ungrouped");
+	picker.handleInput("\x1b");
+	await nextTick();
+	f.key("\x1b");
+	(globalThis as any)[Symbol.for("pi.inbox.group-view")] = "ungrouped";
+	const next = await f.openInbox();
+	next.list.handleInput("n");
+	await next.done;
+	assert.equal(target().groupId, undefined);
+});
+
+test("template editor shares slash and inline-skill completion", async (t) => {
+	const f = await setup(t);
+	const original = f.pi.getCommands;
+	f.pi.getCommands = () => [...original(), {
+		name: "skill:reviewer", description: "Sample review skill",
+		source: "skill",
+		sourceInfo: { path: join(dir, "reviewer", "SKILL.md"), baseDir: dir },
+	}];
+	// Install the real $skill wrapper BEFORE opening the template editor.
+	inlineSkills(f.pi);
+	await f.emit("session_start");
+	const groups = new InboxGroups(dir);
+	const reviews = await groups.create("Reviews");
+	const { list, done } = await f.openInbox();
+	list.handleInput("\x07");
+	await nextTick();
+	const picker = f.overlay();
+	picker.handleInput("Rev");
+	f.key("\x05");
+	assert.equal(picker.editor.autocompleteProvider, f.autocomplete());
+	picker.handleInput("/he");
+	await nextTick();
+	assert.equal(picker.editor.isShowingAutocomplete(), true);
+	picker.handleInput("\t");
+	assert.match(picker.editor.getExpandedText(), /^\/help\s?$/);
+	// Start a new inline editor with empty text for an in-place $skill token.
+	picker.handleInput("\x1b");
+	f.key("\x05");
+	picker.handleInput("Use $rev");
+	// Inline triggers use the normal editor's attachment debounce.
+	for (let i = 0; i < 100 && !picker.editor.isShowingAutocomplete(); i++) {
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	assert.equal(picker.editor.isShowingAutocomplete(), true);
+	picker.handleInput("\t");
+	assert.equal(picker.editor.getExpandedText(), "Use $reviewer ");
+	f.key("\x13");
+	await nextTick();
+	assert.equal(groups.load().groups[0].template, "Use $reviewer ");
+	assert.equal(groups.load().groups[0].id, reviews.id);
+	assert.equal(picker.editor, undefined);
+	assert.equal(f.ui.getEditorText(), "");
+	picker.handleInput("\x1b");
+	await nextTick();
+	f.overlay().handleInput("\x1b");
+	await done;
 });
 
 test("group view filters sessions and prefills new agents", async (t) => {

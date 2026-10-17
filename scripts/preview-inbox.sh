@@ -58,7 +58,9 @@ if (path.resolve(getAgentDir()) !== path.resolve(dir)) {
 fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({
   packages: [{
     source: root,
-    extensions: ["extensions/inbox/index.ts"],
+    extensions: [
+      "extensions/inbox/index.ts", "extensions/inline-skills/index.ts",
+    ],
     skills: [],
   }],
   extensions: [path.join(root, "scripts/inbox-preview.ts")],
@@ -68,6 +70,12 @@ fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({
   theme: "dark",
 }));
 fs.writeFileSync(path.join(dir, "notify.json"), '{"enabled":false}');
+const skill = path.join(dir, "skills", "preview-review");
+fs.mkdirSync(skill, { recursive: true });
+fs.writeFileSync(path.join(skill, "SKILL.md"), [
+  "---", "name: preview-review", "description: UI preview skill", "---",
+  "Preview only. No real task should run.",
+].join("\n"));
 const usage = {
   input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
@@ -92,4 +100,5 @@ printf 'Tools are disabled; no credentials are copied.\n'
 "$RUNTIME" --no-extensions \
   -e "$ROOT/scripts/inbox-preview.ts" \
   -e "$ROOT/extensions/inbox/index.ts" \
+  -e "$ROOT/extensions/inline-skills/index.ts" \
   --no-tools --orchestrator --no-approve "$@"

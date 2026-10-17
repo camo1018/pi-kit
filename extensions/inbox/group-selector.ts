@@ -11,6 +11,7 @@ import {
 	matchesKey,
 	truncateToWidth,
 	wrapTextWithAnsi,
+	type AutocompleteProvider,
 	type Focusable,
 	type KeybindingsManager,
 	type TUI,
@@ -23,9 +24,11 @@ export type GroupSelection =
 	| { action: "rename" | "delete"; id: string }
 	| undefined;
 
-export interface TemplateActions {
+export interface GroupActions {
 	toggle(id: string): Promise<InboxGroup>;
 	save(id: string, text: string): Promise<InboxGroup>;
+	setDefault(id?: string): Promise<string | undefined>;
+	autocomplete?(): AutocompleteProvider | undefined;
 }
 
 interface Choice {
@@ -37,6 +40,7 @@ interface Choice {
 export function isGroupShortcut(data: string) {
 	const keys = [
 		"ctrl+a", "ctrl+r", "ctrl+t", "ctrl+d", "ctrl+n", "ctrl+e", "ctrl+s",
+		"ctrl+f",
 	] as const;
 	return keys.some((key) => matchesKey(data, key));
 }
@@ -67,9 +71,10 @@ export class GroupSelector implements Focusable {
 		private kb: KeybindingsManager,
 		private done: (result: GroupSelection) => void,
 		groups: InboxGroup[],
-		private mode: "view" | "assign",
-		private templates: TemplateActions,
+		private mode: "view" | "assign" | "default",
+		private templates: GroupActions,
 		initial: GroupScope = "ungrouped",
+		private defaultId?: string,
 	) {
 		this.input = new Input({ prompt: theme.fg("accent", "Prefix: ") });
 		this.choices = [
@@ -124,18 +129,16 @@ export class GroupSelector implements Focusable {
 			choice.scope === this.editingId)?.group;
 	}
 
-	private async changeTemplate(update: () => Promise<InboxGroup>) {
+	private async change<T>(
+		update: () => Promise<T>, apply: (value: T) => void,
+	) {
 		this.busy = true;
 		this.error = undefined;
 		this.tui.requestRender();
 		try {
 			const updated = await update();
 			if (this.disposed) return false;
-			const choice = this.choices.find((item) => item.scope === updated.id);
-			if (choice) {
-				choice.group = updated;
-				choice.name = updated.name;
-			}
+			apply(updated);
 			return true;
 		} catch (error) {
 			if (!this.disposed) this.error = String(error);
@@ -144,6 +147,28 @@ export class GroupSelector implements Focusable {
 			this.busy = false;
 			if (!this.disposed) this.tui.requestRender();
 		}
+	}
+
+	private changeTemplate(update: () => Promise<InboxGroup>) {
+		return this.change(update, (updated) => {
+			const choice = this.choices.find((item) => item.scope === updated.id);
+			if (choice) {
+				choice.group = updated;
+				choice.name = updated.name;
+			}
+		});
+	}
+
+	private setDefault() {
+		const choice = this.matches()[this.selected];
+		if (!choice || choice.scope === "all") {
+			this.error = "Choose a named group or Ungrouped for the default.";
+			return;
+		}
+		const id = choice.group?.id;
+		void this.change(() => this.templates.setDefault(id), (saved) => {
+			this.defaultId = saved;
+		});
 	}
 
 	private startEditing(group: InboxGroup) {
@@ -156,6 +181,8 @@ export class GroupSelector implements Focusable {
 		// Handle saving ourselves so trailing spaces/newlines and failed-save
 		// drafts aren't lost to Editor's normal submit-and-clear behavior.
 		this.editor.disableSubmit = true;
+		const provider = this.templates.autocomplete?.();
+		if (provider) this.editor.setAutocompleteProvider(provider);
 		this.editor.setText(group.template);
 		this.syncFocus();
 	}
@@ -189,6 +216,19 @@ export class GroupSelector implements Focusable {
 			(isGroupShortcut(data) || submit)) return;
 		if (this.busy) return;
 		if (this.editor) {
+			// Completion menus own Escape/Enter/Tab/navigation first, just
+			// like the normal prompt. They never execute a slash command.
+			const menuKeys = [
+				"tui.select.cancel", "tui.select.confirm", "tui.input.tab",
+				"tui.select.up", "tui.select.down",
+				"tui.select.pageUp", "tui.select.pageDown",
+			] as const;
+			const menuKey = menuKeys.some((key) => this.kb.matches(data, key));
+			if (this.editor.isShowingAutocomplete() && menuKey) {
+				this.editor.handleInput(data);
+				this.tui.requestRender();
+				return;
+			}
 			if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
 				this.stopEditing();
 			} else if (matchesKey(data, "ctrl+s") ||
@@ -210,6 +250,8 @@ export class GroupSelector implements Focusable {
 		}
 		if (matchesKey(data, "ctrl+n")) {
 			this.digitsAsText = !this.digitsAsText;
+		} else if (matchesKey(data, "ctrl+f")) {
+			this.setDefault();
 		} else if (matchesKey(data, "ctrl+t")) {
 			const group = this.highlightedGroup();
 			if (group) void this.changeTemplate(() =>
@@ -259,9 +301,13 @@ export class GroupSelector implements Focusable {
 			// On tiny terminals clip around the public cursor marker, not the
 			// end of the text, so the active edit cursor always stays visible.
 			const cursor = lines.findIndex((line) => line.includes(CURSOR_MARKER));
-			const start = Math.max(0, Math.min(
+			let start = Math.max(0, Math.min(
 				Math.max(0, cursor) - Math.floor(height / 2), lines.length - height,
 			));
+			const tail = Math.max(0, lines.length - height);
+			if (this.editor.isShowingAutocomplete() && tail <= cursor) {
+				start = tail; // Keep suggestions and the edit cursor visible.
+			}
 			return lines.slice(start, start + height);
 		}
 		const group = this.highlightedGroup();
@@ -286,7 +332,9 @@ export class GroupSelector implements Focusable {
 		const shown = matches.slice(page * size, (page + 1) * size);
 		const lines = [
 			th.bold(th.fg("accent", this.mode === "view"
-				? "Inbox group view" : "Group for this session / new agent")),
+				? "Inbox group view" : this.mode === "default"
+					? "Default group for new agents"
+					: "Group for this session / new agent")),
 			...this.input.render(Math.max(1, width)),
 			th.fg("dim", this.digitsAsText
 				? "Digits: text · Ctrl+N switches to shortcuts"
@@ -301,7 +349,10 @@ export class GroupSelector implements Focusable {
 			}
 			const selected = page * size + i === this.selected;
 			const hint = choice.group?.templateEnabled ? " · template on" : "";
-			const row = `${selected ? "▶" : " "} ${i + 1} ${choice.name}${hint}`;
+			const isDefault = choice.scope === (this.defaultId ?? "ungrouped");
+			const marker = isDefault ? " · default" : "";
+			const row = `${selected ? "▶" : " "} ${i + 1} ` +
+				`${choice.name}${hint}${marker}`;
 			lines.push(selected ? th.fg("accent", row) : row);
 		}
 		lines.push(th.fg("dim",
@@ -321,9 +372,12 @@ export class GroupSelector implements Focusable {
 		lines.push(status ? th.fg(this.error ? "error" : "dim", status)
 			: th.fg("dim", help));
 		if (!compact) {
-			lines.push(th.fg("dim", "↑↓ / PgUp PgDn · Enter choose · Esc cancel"));
-			lines.push(th.fg("dim",
-				"Ctrl+A create · Ctrl+R rename · Ctrl+D delete"));
+			lines.push(th.fg("dim", this.editor
+				? "Tab / Enter complete · Esc closes suggestions first"
+				: "↑↓ / PgUp PgDn · Enter choose · Esc cancel"));
+			lines.push(th.fg("dim", this.editor
+				? "Normal cursor, paste and multiline editor keys work here."
+				: "Ctrl+A create · Ctrl+R rename · Ctrl+D delete · Ctrl+F default"));
 		}
 		return lines.map((line) => truncateToWidth(line, width));
 	}

@@ -14,6 +14,8 @@ export interface GroupStore {
 	version: 1;
 	groups: InboxGroup[];
 	sessions: Record<string, string>;
+	/** Persistent fallback used when viewing All groups. */
+	defaultGroupId?: string;
 }
 
 export type GroupScope = "all" | "ungrouped" | string;
@@ -27,6 +29,16 @@ export function sessionGroup(store: GroupStore, id: string) {
 		? store.sessions[id]
 		: undefined;
 	return store.groups.find((group) => group.id === groupId);
+}
+
+export function defaultGroup(store: GroupStore) {
+	return store.groups.find((group) => group.id === store.defaultGroupId);
+}
+
+export function newAgentGroupForScope(store: GroupStore, scope: GroupScope) {
+	if (scope === "all") return defaultGroup(store)?.id;
+	if (scope === "ungrouped") return undefined;
+	return store.groups.find((group) => group.id === scope)?.id;
 }
 
 export function inGroup(store: GroupStore, scope: GroupScope, id: string) {
@@ -94,6 +106,12 @@ export class InboxGroups {
 		if (Object.values(data.sessions).some((id) => typeof id !== "string")) {
 			throw new Error("Invalid membership in inbox-groups.json");
 		}
+		if (data.defaultGroupId !== undefined &&
+			(typeof data.defaultGroupId !== "string" || !data.defaultGroupId)) {
+			throw new Error("Invalid default group in inbox-groups.json");
+		}
+		// Older windows may delete a group without clearing its default id.
+		// defaultGroup() treats a stale id as Ungrouped rather than failing.
 		return data;
 	}
 
@@ -211,6 +229,16 @@ export class InboxGroups {
 		});
 	}
 
+	setDefaultGroup(id?: string) {
+		return this.mutate((store) => {
+			if (id) {
+				this.required(store, id);
+				store.defaultGroupId = id;
+			} else delete store.defaultGroupId;
+			return id;
+		});
+	}
+
 	toggleTemplate(id: string) {
 		return this.mutate((store) => {
 			const group = this.required(store, id);
@@ -231,6 +259,7 @@ export class InboxGroups {
 		return this.mutate((store) => {
 			this.required(store, id);
 			store.groups = store.groups.filter((group) => group.id !== id);
+			if (store.defaultGroupId === id) delete store.defaultGroupId;
 			for (const [session, group] of Object.entries(store.sessions)) {
 				if (group === id) delete store.sessions[session];
 			}

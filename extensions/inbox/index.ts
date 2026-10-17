@@ -50,14 +50,17 @@
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { sectionByGroup } from "./group-layout.ts";
+import { promptAutocomplete } from "../../lib/prompt-autocomplete.ts";
 import {
 	GroupSelector, isGroupShortcut, type GroupSelection,
 } from "./group-selector.ts";
 import {
+	defaultGroup,
 	emptyGroups,
 	groupLabel,
 	InboxGroups,
 	inGroup,
+	newAgentGroupForScope,
 	sessionGroup,
 	templateDraft,
 	type GroupScope,
@@ -178,8 +181,7 @@ function groupView(): GroupScope {
 }
 
 function newAgentGroup() {
-	const scope = groupView();
-	return readGroups().groups.find((group) => group.id === scope)?.id;
+	return newAgentGroupForScope(readGroups(), groupView());
 }
 const README_PATH = path.join(path.dirname(new URL(import.meta.url).pathname), "README.md");
 
@@ -1134,6 +1136,7 @@ type InboxResult =
 	| { action: "queue"; row: Row }
 	| { action: "movedir"; row: Row }
 	| { action: "groupView" }
+	| { action: "defaultGroup" }
 	| { action: "movegroup"; row: Row }
 	| { action: "home" }
 	| { action: "exitMode" }
@@ -1315,7 +1318,7 @@ class InboxComponent {
 
 	private toggleGroupLayout() {
 		if (groupView() !== "all") {
-			return this.say("Choose All groups (Ctrl+G) to group the list.");
+			return this.say("Choose All groups (g) to group the list.");
 		}
 		const next = groupLayout() === "flat" ? "groups" : "flat";
 		(globalThis as any)[GROUP_LAYOUT_KEY] = next;
@@ -1469,8 +1472,10 @@ class InboxComponent {
 		const row = this.visible[this.selected];
 		const ch = printable(data);
 
-		if (matchesKey(data, "ctrl+g")) {
-			this.done({ action: "groupView" });
+		if (ch === "g" || matchesKey(data, "ctrl+g")) {
+			if (!isKeyRepeat(data)) this.done({ action: "groupView" });
+		} else if (ch === "f") {
+			if (!isKeyRepeat(data)) this.done({ action: "defaultGroup" });
 		} else if (ch === "b") {
 			if (row) this.done({ action: "movegroup", row });
 		} else if (ch === "s") {
@@ -1481,8 +1486,8 @@ class InboxComponent {
 		else if (matchesKey(data, "right")) this.move(5);
 		else if (kb.matches(data, "tui.select.pageUp")) this.move(-this.listHeight());
 		else if (kb.matches(data, "tui.select.pageDown")) this.move(this.listHeight());
-		else if (matchesKey(data, "home") || ch === "g") this.move(-1e9);
-		else if (matchesKey(data, "end") || ch === "G") this.move(1e9);
+		else if (matchesKey(data, "home")) this.move(-1e9);
+		else if (matchesKey(data, "end")) this.move(1e9);
 		else if (kb.matches(data, "tui.select.confirm")) {
 			// Orchestrator: enter takes the session over full-screen (no preview).
 			if (row) this.done(orchestrating() ? { action: "open", row } : { action: "view", row });
@@ -1613,7 +1618,13 @@ class InboxComponent {
 		const preview = process.env.PI_INBOX_PREVIEW_DIR === AGENT_DIR;
 		const heading = orchestrating()
 			? "📥 Pi Inbox · orchestrator" : "📥 Pi Inbox";
+		const fallback = defaultGroup(this.groups)?.name ?? "Ungrouped";
+		const nameWidth = Math.max(1, Math.min(24,
+			innerW - visibleWidth(heading) - (preview ? 10 : 0) - 16));
+		const defaultName = truncateToWidth(fallback, nameWidth);
 		const title = ` ${th.bold(th.fg("accent", heading))}` +
+			th.fg("muted", " · default: ") +
+			th.bold(th.fg("accent", defaultName)) +
 			(preview ? th.bold(th.fg("warning", " · PREVIEW")) : "") +
 			(summary ? th.fg("dim", `  ${summary}`) : "") + " ";
 		const spin = this.loading ? th.fg("dim", " ⟳ ") : "";
@@ -1640,7 +1651,7 @@ class InboxComponent {
 				" · s toggle"
 			: "";
 		out.push(line(` Group: ${groupLabel(this.groups, scope)}${layout}` +
-			" · Ctrl+G groups · b move"));
+			" · f to change default group · g groups · b move"));
 		out.push(sep());
 
 		// list
@@ -3401,7 +3412,7 @@ export default function (pi: ExtensionAPI) {
 
 	async function pickGroup(
 		ctx: ExtensionContext,
-		mode: "view" | "assign",
+		mode: "view" | "assign" | "default",
 		initial: GroupScope,
 	): Promise<GroupScope | undefined> {
 		if (ctx.mode !== "tui") return undefined;
@@ -3415,7 +3426,9 @@ export default function (pi: ExtensionAPI) {
 							tui, theme, kb, done, store.groups, mode, {
 								toggle: (id) => inboxGroups.toggleTemplate(id),
 								save: (id, text) => inboxGroups.saveTemplate(id, text),
-							}, initial,
+								setDefault: (id) => inboxGroups.setDefaultGroup(id),
+								autocomplete: () => promptAutocomplete(ctx.ui),
+							}, initial, defaultGroup(store)?.id,
 						);
 						// Claim scoped Ctrl keys before Pi's global shortcuts
 						// (e.g. thinking toggle and rename-chat) can take them.
@@ -3475,6 +3488,19 @@ export default function (pi: ExtensionAPI) {
 		if (scope === undefined) return;
 		(globalThis as any)[GROUP_VIEW_KEY] = scope;
 		uiState.selectedId = undefined;
+	}
+
+	async function chooseDefaultGroup(ctx: ExtensionContext) {
+		const current = defaultGroup(readGroups())?.id ?? "ungrouped";
+		const scope = await pickGroup(ctx, "default", current);
+		if (scope === undefined) return;
+		try {
+			await inboxGroups.setDefaultGroup(
+				scope === "ungrouped" ? undefined : scope,
+			);
+		} catch (error) {
+			ctx.ui.notify(`Default group: ${String(error)}`, "error");
+		}
 	}
 
 	async function moveToGroup(ctx: ExtensionContext, id: string) {
@@ -4309,6 +4335,11 @@ export default function (pi: ExtensionAPI) {
 				continue;
 			}
 
+			if (result.action === "defaultGroup") {
+				await chooseDefaultGroup(ctx);
+				continue;
+			}
+
 			if (result.action === "movegroup") {
 				await moveToGroup(ctx, result.row.info.id);
 				continue;
@@ -4979,8 +5010,10 @@ export default function (pi: ExtensionAPI) {
 		const target = getReplyTarget();
 		if (target?.kind === "agent") return;
 		const composing = target?.kind === "new" ? target : undefined;
-		const scope = await pickGroup(ctx, "assign",
-			composing?.groupId ?? newAgentGroup() ?? "ungrouped");
+		const initial = composing
+			? composing.groupId ?? "ungrouped"
+			: newAgentGroup() ?? "ungrouped";
+		const scope = await pickGroup(ctx, "assign", initial);
 		if (scope === undefined || getReplyTarget() !== target) return;
 		const next: Extract<ReplyTarget, { kind: "new" }> = composing ?? {
 			kind: "new", cwd: ctx.cwd, model: currentModel(ctx),
