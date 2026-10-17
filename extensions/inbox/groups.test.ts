@@ -61,6 +61,23 @@ test("templates retain their contents when disabled", async (t) => {
 	});
 });
 
+test("inline toggle/save change independent template fields", async (t) => {
+	const groups = fixture(t);
+	const a = await groups.create("Reviews");
+	await Promise.all([
+		groups.saveTemplate(a.id, "draft\nURL: "),
+		groups.toggleTemplate(a.id),
+	]);
+	assert.equal(groups.load().groups[0].template, "draft\nURL: ");
+	assert.equal(groups.load().groups[0].templateEnabled, true);
+	const toggled = await groups.toggleTemplate(a.id);
+	assert.equal(toggled.templateEnabled, false);
+	assert.equal(toggled.template, "draft\nURL: ");
+	const saved = await groups.saveTemplate(a.id, "updated");
+	assert.equal(saved.templateEnabled, false);
+	assert.equal(saved.template, "updated");
+});
+
 test("rejects duplicate, reserved and invalid names", async (t) => {
 	const groups = fixture(t);
 	const a = await groups.create("PR reviews");

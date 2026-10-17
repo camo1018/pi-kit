@@ -41,6 +41,7 @@ Source: `~/Code/pi-kit/extensions/inbox/index.ts` (background agents: `~/Code/pi
 | `N` | Same, picking its model first |
 | `ctrl+g` | Select/manage the group view; while composing a new agent, choose its destination group instead |
 | `b` | Move the selected session into a group or Ungrouped, without stopping it |
+| `s` | All groups: toggle flat list / grouped sections |
 | `ctrl+w` | (while typing a new agent's prompt) pick a different directory for it — a live path picker with suggestions as you type (see [Directories](#directories)) |
 | `d` | Orchestrator mode: move the selected session to a different directory (see [Directories](#directories)) |
 | `c` | Cancel a running background agent |
@@ -166,6 +167,25 @@ Open the group selector with **Ctrl+G** inside the inbox, or `/inbox groups`.
 Select **All groups**, **Ungrouped**, or a named group. The view is window-local
 and survives session switches and `/reload`; a new window starts on All groups.
 
+### Group-by layout
+
+While viewing **All groups**, press **s** to toggle **flat** / **by group**.
+The group row shows the active layout. Grouped mode creates a section for each
+nonempty group, ordered alphabetically, with **Ungrouped last**. Section counts
+reflect the current tab and search; empty groups are omitted.
+
+In Inbox, pinned sessions appear first **within their group**, followed by the
+usual last-activity ordering. Archived keeps newest-archive-first ordering
+within each group; All and Filtered keep their existing activity ordering.
+Headers are not selectable: navigation, opening, pinning and moving still
+operate on sessions, and switching layouts preserves the selected session.
+
+The layout choice is window-local and survives closing/reopening the inbox,
+session switches and `/reload`. A new window starts flat. Named-group and
+Ungrouped filters omit redundant group headers; returning to All groups
+restores your layout choice. In search/rename, typing s remains ordinary text.
+This changes presentation only, not membership or the new-agent destination.
+
 ### Selector keys
 
 | Key | Action |
@@ -178,7 +198,9 @@ and survives session switches and `/reload`; a new window starts on All groups.
 | `esc` | Cancel without changing the view, destination, or draft |
 | `ctrl+a` | Create a group |
 | `ctrl+r` | Rename the highlighted group |
-| `ctrl+t` | Edit its multiline prompt template or enable/disable it |
+| `ctrl+t` | Toggle the highlighted group's template on/off in place |
+| `ctrl+e` | Edit its multiline template in the same picker panel |
+| `ctrl+s` / submit | While editing: save and return to group search |
 | `ctrl+d` | Delete it after confirmation; its sessions become Ungrouped |
 
 Pasted text, including digits, always filters rather than selecting a row.
@@ -186,6 +208,15 @@ Ctrl+N and management actions ignore reported key-repeat and key-release events;
 one key press triggers one action. Arrow-key repeat still navigates the list.
 Management keys affect the highlighted real group, not the special views.
 Names must be unique ignoring case; All groups and Ungrouped are reserved.
+
+Search, results, template status and template preview share one screen.
+Highlight a group to inspect its template; Ctrl+T toggles it without leaving the
+picker. Ctrl+E focuses the inline template editor while keeping the prefix and
+results visible. Ctrl+S or your normal submit key saves; Escape cancels only the
+edit and returns focus to search. Another Escape closes the picker. Search text,
+numeric-input mode and selection are preserved. Numbers typed into a template
+are ordinary text, never group-selection shortcuts. Failed saves retain your
+draft for retry instead of clearing it.
 
 ### Membership and creation
 
@@ -203,9 +234,9 @@ behavior. Existing replies never change membership or receive templates.
 
 ### Templates
 
-Templates are off by default. **Ctrl+T** in the selector opens options to edit
-the text or enable/disable it; disabling retains the text. When enabled, n/N
-prefills Pi's normal editor. Nothing is submitted until you submit it yourself.
+Templates are off by default. **Ctrl+T** in the selector toggles the template;
+**Ctrl+E** edits it in the same panel. Disabling retains the text. When enabled,
+n/N prefills Pi's normal editor. Nothing is submitted until you submit it.
 For a PR reviews group, for example:
 
 ```text
