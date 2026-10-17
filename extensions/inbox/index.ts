@@ -5261,16 +5261,21 @@ export default function (pi: ExtensionAPI) {
 				}
 				return undefined;
 			}
-			// Only new-agent composition claims Ctrl+G. Normal sessions and
-			// replies retain Pi's external-editor shortcut.
+			// Ctrl+G picks a new agent's destination or moves the session
+			// on screen. Metadata-only moves are safe even during a run.
 			if (matchesKey(data, "ctrl+g")) {
 				const target = getReplyTarget();
 				const home = orchestrating() && isHome(current);
-				if (editorFocused() && !modeState().inLoop &&
-					(target?.kind === "new" || (!target && home)) &&
-					(current.isIdle() || isStickyMain(current))) {
-					void pickNewAgentGroup(current);
-					return { consume: true };
+				if (editorFocused() && !modeState().inLoop) {
+					if (target?.kind === "new" || (!target && home)) {
+						if (current.isIdle() || isStickyMain(current)) {
+							void pickNewAgentGroup(current);
+							return { consume: true };
+						}
+					} else if (current.sessionManager.getSessionFile()) {
+						void moveToGroup(current, viewedSession(current).id);
+						return { consume: true };
+					}
 				}
 				return undefined;
 			}
