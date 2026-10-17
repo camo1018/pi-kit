@@ -389,7 +389,13 @@ Other markers: `⚑` (before the status) = the session this window runs interact
 
 **Unread (`•`):** a session that finished (`◆ your turn`) or failed (`✗ error`) after you last looked at it. Running sessions and the one you're in are never unread. Opening a session, peeking with `v`, watching it finish while attached, or leaving it marks it read (stored as `seenAt` in `~/.pi/agent/inbox.json`). History from before unread tracking started counts as read. Press `u` to toggle it by hand: marking read clears the dot (and a background agent's "needs you"); marking unread keeps a reminder dot on it, even while it runs, until you next open or peek at it (stored as `unreadAt`).
 
-Columns: status · title (session name in **bold** if set, else the first message) · latest (`↳` last line of the latest reply, or `▸` what a running agent is doing right now; hidden on narrow terminals) · project dir · last activity · message count.
+Columns: status · title (session name in **bold** if set, else the first message) · latest (`↳` last line of the latest reply, or `▸` what a running agent is doing right now; hidden on narrow terminals) · group (flat views only) · project dir · last activity · message count.
+
+Flat views show each session's group name, or **Ungrouped**, in a fixed-width
+column beside the project directory. Long group names are truncated to fit.
+Grouped layout omits the redundant column because section headers identify
+membership. This applies to Inbox, Archived, All and Filtered tabs; scoped
+single-group views remain flat and show the column too.
 
 The preview pane under the list shows the dir, created/updated/pinned/archived times, which process has it open, and the last assistant reply.
 

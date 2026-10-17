@@ -19,6 +19,7 @@ import {
 	matchesKey,
 	setKeybindings,
 	TUI_KEYBINDINGS,
+	visibleWidth,
 	type AutocompleteProvider,
 	type TUI,
 } from "@earendil-works/pi-tui";
@@ -851,6 +852,91 @@ function sectionLabels(list: any): string[] {
 function rowIds(list: any): string[] {
 	return list.visible.map((row: any) => row.info.id);
 }
+
+function renderedRows(list: any, width: number): Map<string, string> {
+	const lines = list.render(width);
+	const rows = new Map<string, string>();
+	for (let i = 0; i < list.listHeight(); i++) {
+		const item = list.display[list.scroll + i];
+		if (item?.kind === "item") rows.set(item.row.info.id, lines[4 + i]);
+	}
+	return rows;
+}
+
+test("flat rows show aligned group names and Ungrouped", async (t) => {
+	const f = await layoutFixture(t);
+	const selected = f.list.state.selectedId;
+	const rows = renderedRows(f.list, 180);
+	assert.match(rows.get(f.a.id)!, /Z Reviews/);
+	assert.match(rows.get(f.b.id)!, /Z Reviews/);
+	assert.match(rows.get(f.c.id)!, /A Bugs/);
+	assert.match(rows.get(f.main.getSessionId())!, /Ungrouped/);
+	const groupColumn = (line: string, name: string) =>
+		visibleWidth(line.slice(0, line.indexOf(name)));
+	const column = groupColumn(rows.get(f.a.id)!, "Z Reviews");
+	assert.equal(groupColumn(rows.get(f.c.id)!, "A Bugs"), column);
+	assert.equal(groupColumn(rows.get(f.main.getSessionId())!, "Ungrouped"),
+		column);
+	assert.equal(f.list.state.selectedId, selected);
+	f.list.handleInput("s");
+	const grouped = renderedRows(f.list, 180);
+	assert.doesNotMatch(grouped.get(f.a.id)!, /Z Reviews/);
+	assert.doesNotMatch(grouped.get(f.c.id)!, /A Bugs/);
+	assert.doesNotMatch(grouped.get(f.main.getSessionId())!, /Ungrouped/);
+	assert.equal(f.list.state.selectedId, selected);
+	closeList(f.list);
+	await f.done;
+});
+
+test("scoped flat views show groups despite grouped preference", async (t) => {
+	const f = await layoutFixture(t);
+	f.list.handleInput("s");
+	f.list.handleInput("g");
+	await nextTick();
+	f.overlay().handleInput("Z");
+	f.overlay().handleInput("1");
+	await nextTick();
+	const list = f.overlay();
+	await waitForList(list);
+	for (const row of renderedRows(list, 180).values()) {
+		assert.match(row, /Z Reviews/);
+	}
+	closeList(list);
+	await f.done;
+});
+
+test("flat group columns work in Archived, All and Filtered", async (t) => {
+	const f = await layoutFixture(t, true);
+	f.list.handleInput("2");
+	await waitForList(f.list);
+	for (const row of renderedRows(f.list, 180).values()) {
+		assert.match(row, /Z Reviews/);
+	}
+	f.list.handleInput("3");
+	const all = renderedRows(f.list, 180);
+	assert.match(all.get(f.c.id)!, /A Bugs/);
+	assert.match(all.get(f.a.id)!, /Z Reviews/);
+	f.list.handleInput("4");
+	assert.match(renderedRows(f.list, 180).get(f.filtered!.id)!, /A Bugs/);
+	closeList(f.list);
+	await f.done;
+});
+
+test("long and wide group names fit narrow terminals", async (t) => {
+	const f = await layoutFixture(t);
+	await f.groups.rename(f.reviews.id, "安全🔎 Reviews with a very long name");
+	f.list.handleInput("R");
+	await waitForList(f.list);
+	const wide = renderedRows(f.list, 180).get(f.a.id)!;
+	assert.match(wide, /安全🔎/);
+	assert.doesNotMatch(wide, /安全🔎 Reviews with a very long name/);
+	for (const width of [40, 60, 80, 120, 180]) {
+		assert.ok(f.list.render(width).every((line: string) =>
+			visibleWidth(line) <= width));
+	}
+	closeList(f.list);
+	await f.done;
+});
 
 test("pins-first group layout preserves selection", async (t) => {
 	const f = await layoutFixture(t);

@@ -1670,6 +1670,11 @@ class InboxComponent {
 		// The ⚑ slot only exists while takeover is possible (orchestrator mode).
 		const wTake = orchestrating() ? 2 : 0;
 		const wProj = Math.min(22, Math.max(10, Math.floor(innerW * 0.18)));
+		// Group sections already supply membership; effective flat views need
+		// a per-row column, including when scoped to one group/Ungrouped.
+		const showGroup = !(scope === "all" && groupLayout() === "groups");
+		const wGroup = showGroup
+			? Math.min(18, Math.max(9, Math.floor(innerW * 0.13))) : 0;
 		const wAge = 5;
 		const wMsgs = 5;
 		const wFixed =
@@ -1679,6 +1684,7 @@ class InboxComponent {
 			wTake +
 			wStatus +
 			1 +
+			(wGroup ? wGroup + 1 : 0) +
 			wProj +
 			1 +
 			wAge +
@@ -1746,6 +1752,10 @@ class InboxComponent {
 				const textCells = editing
 					? fit(editing.render(wText)[0] ?? "", wText)
 					: fit(t, wTitle) + (wLast ? " " + fit(this.latestCell(r), wLast) : "");
+				const groupName = sessionGroup(this.groups, r.info.id)?.name
+					?? "Ungrouped";
+				const groupCell = wGroup
+					? fit(th.fg("muted", groupName), wGroup) + " " : "";
 				let content =
 					cursor +
 					pin +
@@ -1755,6 +1765,7 @@ class InboxComponent {
 					" " +
 					textCells +
 					" " +
+					groupCell +
 					fit(th.fg("muted", shortCwd(r.info.cwd)), wProj) +
 					" " +
 					th.fg("dim", fit(age.padStart(wAge), wAge)) +
