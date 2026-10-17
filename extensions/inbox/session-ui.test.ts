@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, mock, test, type TestContext } from "node:test";
 import {
+	CustomEditor,
+	getSelectListTheme,
 	initTheme,
 	SessionManager,
 	type ExtensionAPI,
@@ -13,6 +15,7 @@ import {
 	Container,
 	getKeybindings,
 	KeybindingsManager,
+	matchesKey,
 	setKeybindings,
 	TUI_KEYBINDINGS,
 	type TUI,
@@ -610,7 +613,7 @@ test(
 		);
 
 		viewport.viewportTop = 91;
-		await f.shortcuts.get("ctrl+shift+b").handler(f.ctx);
+		await f.shortcuts.get("ctrl+b").handler(f.ctx);
 		assert.equal(viewport.viewportTop, 37);
 
 		await f.visit("another reading position");
@@ -624,11 +627,47 @@ test(
 
 		assert.deepEqual(f.key("\x1b"), { consume: true });
 		viewport.viewportTop = 91;
-		await f.shortcuts.get("ctrl+shift+b").handler(f.ctx);
+		await f.shortcuts.get("ctrl+b").handler(f.ctx);
 		assert.equal(viewport.viewportTop, 37);
 		assert.equal(viewport.flash.mock.calls.length, 3);
 	},
 );
+
+test("Ctrl+B restores a bookmark before editor cursor movement", async (t) => {
+	const f = await setup(t);
+	const viewport = f.tui as TUI & { viewportTop: number };
+	viewport.viewportTop = 37;
+	const { list, done } = await f.openInbox();
+	list.handleInput("\x1b");
+	await done;
+
+	const editor = new CustomEditor(f.tui, {
+		borderColor: (text) => text,
+		selectList: getSelectListTheme(),
+	}, getKeybindings());
+	editor.onExtensionShortcut = (data) => {
+		for (const [key, shortcut] of f.shortcuts) {
+			if (!matchesKey(data, key)) continue;
+			void shortcut.handler(f.ctx);
+			return true;
+		}
+		return false;
+	};
+	for (const data of ["\x02", "\x1b[98;5u", "\x1b[27;5;98~"]) {
+		editor.setText("draft");
+		viewport.viewportTop = 91;
+		editor.handleInput(data);
+		assert.equal(viewport.viewportTop, 37);
+		editor.insertTextAtCursor("!");
+		assert.equal(editor.getText(), "draft!");
+	}
+
+	// The replacement does not take away normal arrow-key editing.
+	editor.setText("draft");
+	editor.handleInput("\x1b[D");
+	editor.insertTextAtCursor("!");
+	assert.equal(editor.getText(), "draf!t");
+});
 
 test("cached inbox rows follow each visit and can still reveal the main", async (t) => {
 	const f = await setup(t);
