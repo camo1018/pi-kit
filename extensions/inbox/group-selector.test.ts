@@ -44,6 +44,34 @@ test("Ctrl+N makes digits searchable instead of selecting rows", () => {
 	assert.deepEqual(f.result(), { action: "select", scope: "2026" });
 });
 
+test("Ctrl+N toggles once per Kitty key press, not repeat or release", () => {
+	const f = selector();
+	f.ui.handleInput("\x1b[110;5:1u");
+	assert.match(f.ui.render(100).join("\n"), /Digits: text/);
+	f.ui.handleInput("\x1b[110;5:2u");
+	assert.match(f.ui.render(100).join("\n"), /Digits: text/);
+	f.ui.handleInput("\x1b[110;5:3u");
+	assert.match(f.ui.render(100).join("\n"), /Digits: text/);
+	f.ui.handleInput("\x1b[110;5:1u");
+	assert.match(f.ui.render(100).join("\n"), /Digits: select/);
+});
+
+test("release events cannot edit the prefix or invoke management", () => {
+	const f = selector();
+	for (const ch of "PR") f.ui.handleInput(ch);
+	f.ui.handleInput("\x1b[127;1:3u");
+	f.ui.handleInput("\x1b[97;5:3u");
+	assert.match(f.ui.render(100).join("\n"), /Prefix: PR/);
+	assert.equal(f.result(), "waiting");
+});
+
+test("arrow key repeat still navigates the selector", () => {
+	const f = selector();
+	f.ui.handleInput("\x1b[1;1:2B");
+	f.ui.handleInput("\r");
+	assert.deepEqual(f.result(), { action: "select", scope: "2026" });
+});
+
 test("Ctrl+N can switch back to shortcuts for an alphanumeric prefix", () => {
 	const f = selector();
 	f.ui.handleInput("\x0e");

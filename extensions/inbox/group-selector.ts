@@ -2,6 +2,8 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import {
 	decodeKittyPrintable,
 	Input,
+	isKeyRelease,
+	isKeyRepeat,
 	matchesKey,
 	truncateToWidth,
 	type Focusable,
@@ -74,6 +76,10 @@ export class GroupSelector implements Focusable {
 	}
 
 	handleInput(data: string) {
+		// The scoped terminal listener runs before Pi's release-event filter.
+		// Ignore key-up everywhere, and repeats of one-shot Ctrl actions.
+		if (isKeyRelease(data) ||
+			(isKeyRepeat(data) && isGroupShortcut(data))) return;
 		const matches = this.matches();
 		const ch = decodeKittyPrintable(data) ??
 			(data.length === 1 && data.charCodeAt(0) >= 32 ? data : undefined);
