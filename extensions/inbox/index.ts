@@ -49,6 +49,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { sectionByGroup } from "./group-layout.ts";
 import {
 	GroupSelector, isGroupShortcut, type GroupSelection,
 } from "./group-selector.ts";
@@ -89,6 +90,8 @@ import {
 	type Focusable,
 	getKeybindings,
 	Input,
+	isKeyRelease,
+	isKeyRepeat,
 	Markdown,
 	Text,
 	wrapTextWithAnsi,
@@ -146,6 +149,12 @@ const STORE_PATH = path.join(AGENT_DIR, "inbox.json");
 const FILTERS_PATH = path.join(AGENT_DIR, "inbox-filters.json");
 const inboxGroups = new InboxGroups(AGENT_DIR);
 const GROUP_VIEW_KEY = Symbol.for("pi.inbox.group-view");
+const GROUP_LAYOUT_KEY = Symbol.for("pi.inbox.group-layout");
+
+function groupLayout(): "flat" | "groups" {
+	return (globalThis as any)[GROUP_LAYOUT_KEY] === "groups"
+		? "groups" : "flat";
+}
 
 function readGroups() {
 	try {
@@ -1222,14 +1231,23 @@ class InboxComponent {
 		const match = (r: Row) => terms.every((t) => r.searchText.includes(t) || r.title.toLowerCase().includes(t));
 		const byModified = (a: Row, b: Row) => b.info.modified.getTime() - a.info.modified.getTime();
 
+		const scope = groupView();
+		const grouped = scope === "all" && groupLayout() === "groups";
 		this.display = [];
 		const push = (label: string | undefined, list: Row[]) => {
 			if (list.length === 0) return;
 			if (label) this.display.push({ kind: "header", label });
 			for (const row of list) this.display.push({ kind: "item", row, idx: 0 });
 		};
+		const pushList = (list: Row[]) => {
+			if (!grouped) return push(undefined, list);
+			for (const section of sectionByGroup(
+				list, this.groups, (row) => row.info.id,
+			)) {
+				push(`${section.name} (${section.rows.length})`, section.rows);
+			}
+		};
 
-		const scope = groupView();
 		const matched = this.rows.filter((row) =>
 			inGroup(this.groups, scope, row.info.id) && match(row));
 		// Filtered-out sessions appear only in their own tab, never in Inbox / Archived / All.
@@ -1239,18 +1257,28 @@ class InboxComponent {
 			const live = shown.filter((r) => !r.meta.archivedAt);
 			const pinned = live.filter((r) => r.meta.pinnedAt).sort((a, b) => (b.meta.pinnedAt ?? 0) - (a.meta.pinnedAt ?? 0));
 			const rest = live.filter((r) => !r.meta.pinnedAt).sort(byModified);
-			const sectioned = pinned.length > 0;
-			push(pinned.length ? `★ PINNED (${pinned.length})` : undefined, pinned);
-			push(sectioned ? `INBOX (${rest.length})` : undefined, rest);
+			if (grouped) {
+				// Bucketing preserves pinned-first and activity ordering per group.
+				pushList([...pinned, ...rest]);
+			} else {
+				const sectioned = pinned.length > 0;
+				push(
+					pinned.length ? `★ PINNED (${pinned.length})` : undefined,
+					pinned,
+				);
+				push(sectioned ? `INBOX (${rest.length})` : undefined, rest);
+			}
 		} else if (this.state.view === "archived") {
-			push(undefined, shown.filter((r) => r.meta.archivedAt).sort((a, b) => (b.meta.archivedAt ?? 0) - (a.meta.archivedAt ?? 0)));
+			pushList(shown.filter((r) => r.meta.archivedAt).sort(
+				(a, b) => (b.meta.archivedAt ?? 0) - (a.meta.archivedAt ?? 0),
+			));
 		} else if (this.state.view === "filtered") {
 			const errors = loadFilters().errors.length;
 			const list = matched.filter((r) => r.filtered).sort(byModified);
 			if (errors && list.length) this.display.push({ kind: "header", label: `⚠ ${errors} filter rule error(s), see /inbox filters` });
-			push(undefined, list);
+			pushList(list);
 		} else {
-			push(undefined, shown.sort(byModified));
+			pushList(shown.sort(byModified));
 		}
 
 		this.visible = [];
@@ -1283,6 +1311,17 @@ class InboxComponent {
 		// triggers the load (cached afterwards; refresh keeps them warm from then on).
 		if (viewWantsArchived(v) && !this.archivedLoaded) void this.refresh(true);
 		this.rebuild();
+	}
+
+	private toggleGroupLayout() {
+		if (groupView() !== "all") {
+			return this.say("Choose All groups (Ctrl+G) to group the list.");
+		}
+		const next = groupLayout() === "flat" ? "groups" : "flat";
+		(globalThis as any)[GROUP_LAYOUT_KEY] = next;
+		this.scroll = 0;
+		this.rebuild();
+		this.say(next === "groups" ? "Grouped by group" : "Flat session list");
 	}
 
 	private togglePin(row: Row) {
@@ -1391,6 +1430,7 @@ class InboxComponent {
 	}
 
 	handleInput(data: string): void {
+		if (isKeyRelease(data)) return;
 		const kb = this.kb;
 
 		if (this.renaming) {
@@ -1433,6 +1473,8 @@ class InboxComponent {
 			this.done({ action: "groupView" });
 		} else if (ch === "b") {
 			if (row) this.done({ action: "movegroup", row });
+		} else if (ch === "s") {
+			if (!isKeyRepeat(data)) this.toggleGroupLayout();
 		} else if (kb.matches(data, "tui.select.up") || ch === "k") this.move(-1);
 		else if (kb.matches(data, "tui.select.down") || ch === "j") this.move(1);
 		else if (matchesKey(data, "left")) this.move(-5);
@@ -1593,8 +1635,12 @@ class InboxComponent {
 		tabs = gap > 1 ? tabs + " ".repeat(gap) + q : `${tabs}  ${q}`;
 		out.push(line(tabs));
 		const scope = groupView();
-		out.push(line(` Group: ${groupLabel(this.groups, scope)}` +
-			" · Ctrl+G select/manage · b move session"));
+		const layout = scope === "all"
+			? ` · Layout: ${groupLayout() === "groups" ? "by group" : "flat"}` +
+				" · s toggle"
+			: "";
+		out.push(line(` Group: ${groupLabel(this.groups, scope)}${layout}` +
+			" · Ctrl+G groups · b move"));
 		out.push(sep());
 
 		// list
@@ -3366,7 +3412,10 @@ export default function (pi: ExtensionAPI) {
 					(tui, theme, kb, done) => {
 						coverImagesUnderOverlays(tui);
 						const selector = new GroupSelector(
-							tui, theme, kb, done, store.groups, mode, initial,
+							tui, theme, kb, done, store.groups, mode, {
+								toggle: (id) => inboxGroups.toggleTemplate(id),
+								save: (id, text) => inboxGroups.saveTemplate(id, text),
+							}, initial,
 						);
 						// Claim scoped Ctrl keys before Pi's global shortcuts
 						// (e.g. thinking toggle and rename-chat) can take them.
@@ -3375,7 +3424,8 @@ export default function (pi: ExtensionAPI) {
 							selector.handleInput(data);
 							return { consume: true };
 						});
-						return Object.assign(selector, { dispose: unsubscribe });
+						selector.onDispose = unsubscribe;
+						return selector;
 					},
 					{ overlay: true, overlayOptions: overlayOpts() },
 				);
@@ -3411,29 +3461,6 @@ export default function (pi: ExtensionAPI) {
 						"Nothing is stopped or deleted.")) {
 						await inboxGroups.remove(group.id);
 						initial = "ungrouped";
-					}
-				} else if (result.action === "template") {
-					const toggle = group.templateEnabled ? "Disable" : "Enable";
-					const action = await ctx.ui.select(
-						`Prompt template · ${group.name}`,
-						["Edit template", `${toggle} template`],
-					);
-					if (action === "Edit template") {
-						const text = await ctx.ui.editor(
-							`Prompt template · ${group.name}`, group.template,
-						);
-						if (text !== undefined) {
-							await inboxGroups.setTemplate(
-								group.id, text, group.templateEnabled,
-							);
-						}
-					} else if (action === `${toggle} template`) {
-						const latest = inboxGroups.load().groups.find(
-							(item) => item.id === group.id,
-						);
-						if (latest) await inboxGroups.setTemplate(
-							group.id, latest.template, !group.templateEnabled,
-						);
 					}
 				}
 			}

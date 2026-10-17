@@ -232,6 +232,7 @@ async function setup(t: TestContext, takenOver = true) {
 		delete globals[modeKey];
 		delete globals[Symbol.for("pi.inbox.reply-target")];
 		delete globals[Symbol.for("pi.inbox.group-view")];
+		delete globals[Symbol.for("pi.inbox.group-layout")];
 		registry().agents.clear();
 	});
 
@@ -771,6 +772,163 @@ test("new-agent composition inherits the viewed directory", async (t) => {
 	);
 });
 
+async function waitForList(list: any) {
+	for (let i = 0; i < 200 && list.loading; i++) {
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	assert.equal(list.loading, false);
+}
+
+function searchList(list: any, query: string) {
+	list.handleInput("/");
+	for (const char of query) list.handleInput(char);
+	list.handleInput("\r");
+}
+
+function closeList(list: any) {
+	if (list.state.query) list.handleInput("\x1b");
+	list.handleInput("\x1b");
+}
+
+async function layoutFixture(t: TestContext, archived = false) {
+	const f = await setup(t);
+	const tag = `layout-${f.main.getSessionId()}`;
+	f.main.appendSessionInfo(`${tag} ungrouped`);
+	const a = await f.visit(`${tag} review normal`);
+	const b = await f.visit(`${tag} review pinned`);
+	const c = await f.visit(`${tag} bug`);
+	const filtered = archived ? await f.visit(`${tag} hidden`) : undefined;
+	const groups = new InboxGroups(dir);
+	const reviews = await groups.create("Z Reviews");
+	const bugs = await groups.create("A Bugs");
+	await groups.create("Empty group");
+	await groups.assign(a.id, reviews.id);
+	await groups.assign(b.id, reviews.id);
+	await groups.assign(c.id, bugs.id);
+	if (filtered) await groups.assign(filtered.id, bugs.id);
+	const file = join(dir, "inbox.json");
+	const meta = JSON.parse(readFileSync(file, "utf8"));
+	meta.sessions[b.id] = { ...meta.sessions[b.id], pinnedAt: 1 };
+	if (archived) {
+		meta.sessions[a.id] = { ...meta.sessions[a.id], archivedAt: 200 };
+		meta.sessions[b.id].archivedAt = 100;
+		meta.sessions[filtered!.id] = { filter: "hide", archivedAt: 300 };
+	}
+	writeFileSync(file, JSON.stringify(meta));
+	const { list, done } = await f.openInbox();
+	await waitForList(list);
+	searchList(list, tag);
+	return { ...f, list, done, tag, groups, reviews, bugs, a, b, c, filtered };
+}
+
+function sectionLabels(list: any): string[] {
+	return list.display.filter((item: any) => item.kind === "header")
+		.map((item: any) => item.label);
+}
+
+function rowIds(list: any): string[] {
+	return list.visible.map((row: any) => row.info.id);
+}
+
+test("pins-first group layout preserves selection", async (t) => {
+	const f = await layoutFixture(t);
+	const selected = f.list.state.selectedId;
+	const files = [f.main.getSessionFile()!, f.a.sessionFile!,
+		f.b.sessionFile!, f.c.sessionFile!];
+	const before = files.map((file) => readFileSync(file, "utf8"));
+	const groupsBefore = readFileSync(f.groups.file, "utf8");
+	assert.match(f.list.render(120).join("\n"), /Layout: flat/);
+	assert.deepEqual(sectionLabels(f.list), ["★ PINNED (1)", "INBOX (3)"]);
+	f.list.handleInput("s");
+	assert.match(f.list.render(120).join("\n"), /Layout: by group/);
+	assert.deepEqual(sectionLabels(f.list), [
+		"A Bugs (1)", "Z Reviews (2)", "Ungrouped (1)",
+	]);
+	assert.deepEqual(rowIds(f.list), [
+		f.c.id, f.b.id, f.a.id, f.main.getSessionId(),
+	]);
+	assert.equal(f.list.state.selectedId, selected);
+	f.list.handleInput("\x1b[115;1:2u");
+	f.list.handleInput("\x1b[115;1:3u");
+	assert.match(f.list.render(120).join("\n"), /Layout: by group/);
+	f.list.handleInput("s");
+	assert.equal(f.list.state.selectedId, selected);
+	assert.deepEqual(sectionLabels(f.list), ["★ PINNED (1)", "INBOX (3)"]);
+	assert.deepEqual(files.map((file) => readFileSync(file, "utf8")), before);
+	assert.equal(readFileSync(f.groups.file, "utf8"), groupsBefore);
+	closeList(f.list);
+	await f.done;
+});
+
+test("group sections respect tabs and archive sorting", async (t) => {
+	const f = await layoutFixture(t, true);
+	f.list.handleInput("s");
+	assert.deepEqual(sectionLabels(f.list), [
+		"A Bugs (1)", "Ungrouped (1)",
+	]);
+	f.list.handleInput("2");
+	await waitForList(f.list);
+	assert.deepEqual(sectionLabels(f.list), ["Z Reviews (2)"]);
+	assert.deepEqual(rowIds(f.list), [f.a.id, f.b.id]);
+	f.list.handleInput("3");
+	assert.deepEqual(sectionLabels(f.list), [
+		"A Bugs (1)", "Z Reviews (2)", "Ungrouped (1)",
+	]);
+	assert.equal(rowIds(f.list).includes(f.filtered!.id), false);
+	f.list.handleInput("4");
+	assert.deepEqual(sectionLabels(f.list), ["A Bugs (1)"]);
+	assert.deepEqual(rowIds(f.list), [f.filtered!.id]);
+	closeList(f.list);
+	await f.done;
+});
+
+test("search updates counts; typed s stays search text", async (t) => {
+	const f = await layoutFixture(t);
+	f.list.handleInput("s");
+	f.list.handleInput("/");
+	for (const char of " review") f.list.handleInput(char);
+	f.list.handleInput("\r");
+	assert.deepEqual(sectionLabels(f.list), ["Z Reviews (2)"]);
+	f.list.handleInput("/");
+	f.list.handleInput("s");
+	assert.equal(f.list.state.query, `${f.tag} reviews`);
+	assert.equal((globalThis as any)[Symbol.for("pi.inbox.group-layout")],
+		"groups");
+	f.list.handleInput("\x1b");
+	closeList(f.list);
+	await f.done;
+});
+
+test("single-group filters retain the layout preference", async (t) => {
+	const f = await layoutFixture(t);
+	f.list.handleInput("s");
+	f.list.handleInput("\x07");
+	await nextTick();
+	f.overlay().handleInput("Z");
+	f.overlay().handleInput("1");
+	await nextTick();
+	const single = f.overlay();
+	await waitForList(single);
+	assert.deepEqual(sectionLabels(single), ["★ PINNED (1)", "INBOX (1)"]);
+	single.handleInput("s");
+	assert.equal((globalThis as any)[Symbol.for("pi.inbox.group-layout")],
+		"groups");
+	single.handleInput("\x07");
+	await nextTick();
+	f.overlay().handleInput("All");
+	f.overlay().handleInput("1");
+	await nextTick();
+	const all = f.overlay();
+	assert.match(all.render(120).join("\n"), /Layout: by group/);
+	assert.equal(sectionLabels(all).length, 3);
+	closeList(all);
+	await f.done;
+	const reopened = await f.openInbox();
+	assert.match(reopened.list.render(120).join("\n"), /Layout: by group/);
+	closeList(reopened.list);
+	await reopened.done;
+});
+
 test("group view filters sessions and prefills new agents", async (t) => {
 	const f = await setup(t);
 	const a = await f.visit("in review group");
@@ -925,14 +1083,22 @@ test("selector can create, rename, edit and enable a template", async (t) => {
 	assert.deepEqual(f.key("\x12"), { consume: true });
 	await nextTick();
 	assert.equal(groups.load().groups[0].name, "PR reviews");
-	assert.deepEqual(f.key("\x14"), { consume: true });
+	const picker = f.overlay();
+	picker.handleInput("PR");
+	assert.deepEqual(f.key("\x05"), { consume: true });
+	picker.handleInput("\x1b[200~Use gh-pr-review\n\nPR: \x1b[201~");
+	assert.deepEqual(f.key("\x13"), { consume: true });
 	await nextTick();
+	assert.equal(f.overlay(), picker, "editing stays in the group picker");
+	assert.match(picker.render(100).join("\n"), /Prefix: PR/);
 	assert.equal(groups.load().groups[0].template, "Use gh-pr-review\n\nPR: ");
 	assert.equal(groups.load().groups[0].templateEnabled, false);
-	f.ui.select.mock.mockImplementation(async () => "Enable template");
 	assert.deepEqual(f.key("\x14"), { consume: true });
 	await nextTick();
+	assert.equal(f.overlay(), picker, "toggling stays in the group picker");
 	assert.equal(groups.load().groups[0].templateEnabled, true);
+	assert.equal(f.ui.select.mock.calls.length, 0);
+	assert.equal(f.ui.editor.mock.calls.length, 0);
 	f.overlay().handleInput("\r");
 	await nextTick();
 	f.overlay().handleInput("n");

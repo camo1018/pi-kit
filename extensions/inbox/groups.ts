@@ -211,6 +211,22 @@ export class InboxGroups {
 		});
 	}
 
+	toggleTemplate(id: string) {
+		return this.mutate((store) => {
+			const group = this.required(store, id);
+			group.templateEnabled = !group.templateEnabled;
+			return { ...group };
+		});
+	}
+
+	saveTemplate(id: string, template: string) {
+		return this.mutate((store) => {
+			const group = this.required(store, id);
+			group.template = template;
+			return { ...group };
+		});
+	}
+
 	remove(id: string) {
 		return this.mutate((store) => {
 			this.required(store, id);
