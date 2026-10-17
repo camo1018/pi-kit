@@ -1169,9 +1169,12 @@ function textOf(content: unknown): string {
 // ───────────────────────────── public actions ─────────────────────────────
 
 /** Start a new background agent. */
-export function spawnAgent(opts: { prompt: string; cwd: string; model?: string; title: string }): BgAgent {
+export function spawnAgent(opts: {
+	id?: string; prompt: string; cwd: string; model?: string; title: string;
+}): BgAgent {
 	const a: BgAgent = {
-		id: randomUUID(),
+		// Callers can reserve an id to persist group membership before launch.
+		id: opts.id ?? randomUUID(),
 		cwd: opts.cwd,
 		title: opts.title,
 		model: opts.model,

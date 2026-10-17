@@ -22,6 +22,7 @@ import {
 } from "@earendil-works/pi-tui";
 import type { BgAgent } from "../../lib/inbox-agents.ts";
 import type { Api, Model } from "@earendil-works/pi-ai";
+import { InboxGroups } from "./groups.ts";
 
 // Import only after isolating every inbox write from the operator's data.
 const dir = mkdtempSync(join(tmpdir(), "pi-queue-test-"));
@@ -72,6 +73,7 @@ const models: Model<Api>[] = ["alpha", "beta", "vendor/gamma:free"].map(
 );
 
 async function setup(t: TestContext, takenOver = true) {
+	rmSync(join(dir, "inbox-groups.json"), { force: true });
 	const globals = globalThis as any;
 	const modeKey = Symbol.for("pi.inbox.mode");
 	// Skip the real supervisor: these fixtures never launch agent processes.
@@ -148,7 +150,7 @@ async function setup(t: TestContext, takenOver = true) {
 		sendUserMessage: mock.fn(),
 	} as unknown as ExtensionAPI;
 	const widgets = new Map<string, any>();
-	let terminalInput: (data: string) => any;
+	const terminalInputs = new Set<(data: string) => any>();
 	let overlay: any;
 	const theme = {
 		fg: (_color: string, text: string) => text,
@@ -168,9 +170,11 @@ async function setup(t: TestContext, takenOver = true) {
 			editorText = text;
 		}),
 		input: mock.fn(async () => "renamed via shortcut"),
-		onTerminalInput(fn: typeof terminalInput) {
-			terminalInput = fn;
-			return () => {};
+		select: mock.fn(async () => "Edit template"),
+		editor: mock.fn(async () => "Use gh-pr-review\n\nPR: "),
+		onTerminalInput(fn: (data: string) => any) {
+			terminalInputs.add(fn);
+			return () => { terminalInputs.delete(fn); };
 		},
 		custom(factory: Function) {
 			return new Promise((resolve) => {
@@ -227,6 +231,7 @@ async function setup(t: TestContext, takenOver = true) {
 		delete globals[Symbol.for("pi.inbox.agentChild")];
 		delete globals[modeKey];
 		delete globals[Symbol.for("pi.inbox.reply-target")];
+		delete globals[Symbol.for("pi.inbox.group-view")];
 		registry().agents.clear();
 	});
 
@@ -284,7 +289,13 @@ async function setup(t: TestContext, takenOver = true) {
 		editor,
 		visit,
 		widgets,
-		key: (data: string) => terminalInput(data),
+		key: (data: string) => {
+			for (const handler of terminalInputs) {
+				const result = handler(data);
+				if (result?.consume) return result;
+			}
+			return undefined;
+		},
 		overlay: () => overlay,
 	};
 }
@@ -758,6 +769,198 @@ test("new-agent composition inherits the viewed directory", async (t) => {
 	assert.ok(
 		globals[Symbol.for("pi.inbox.mode")].takenOver.has(f.main.getSessionId()),
 	);
+});
+
+test("group view filters sessions and prefills new agents", async (t) => {
+	const f = await setup(t);
+	const a = await f.visit("in review group");
+	const groups = new InboxGroups(dir);
+	const reviews = await groups.create("PR reviews");
+	await groups.assign(a.id, reviews.id);
+	await groups.setTemplate(reviews.id, "Use gh-pr-review\nPR: ", true);
+	const { list, done } = await f.openInbox();
+	list.handleInput("\x07");
+	await nextTick();
+	assert.equal(f.overlay().constructor.name, "GroupSelector");
+	f.overlay().handleInput("PR");
+	f.overlay().handleInput("1");
+	await nextTick();
+	const scoped = f.overlay();
+	const rendered = scoped.render(120).join("\n");
+	assert.match(rendered, /Group: PR reviews/);
+	assert.match(rendered, /in review group/);
+	assert.doesNotMatch(rendered, /taken-over main/);
+	scoped.handleInput("n");
+	await done;
+	const target = (globalThis as any)[Symbol.for("pi.inbox.reply-target")];
+	assert.equal(target.groupId, reviews.id);
+	assert.equal(f.ui.getEditorText(), "Use gh-pr-review\nPR: ");
+	assert.match(f.widgets.get("inbox-reply").render(200).join("\n"),
+		/group PR reviews/);
+});
+
+test("Ctrl+G changes groups without clobbering edited drafts", async (t) => {
+	const f = await setup(t);
+	const groups = new InboxGroups(dir);
+	const a = await groups.create("A");
+	const b = await groups.create("B");
+	await groups.setTemplate(a.id, "first", true);
+	await groups.setTemplate(b.id, "second", true);
+	(globalThis as any)[Symbol.for("pi.inbox.group-view")] = a.id;
+	const { list, done } = await f.openInbox();
+	list.handleInput("n");
+	await done;
+	assert.equal(f.ui.getEditorText(), "first");
+	assert.deepEqual(f.key("\x07"), { consume: true });
+	f.overlay().handleInput("B");
+	f.overlay().handleInput("1");
+	await nextTick();
+	assert.equal(f.ui.getEditorText(), "second");
+	f.ui.setEditorText("second + URL");
+	assert.deepEqual(f.key("\x07"), { consume: true });
+	f.overlay().handleInput("A");
+	f.overlay().handleInput("1");
+	await nextTick();
+	assert.equal(f.ui.getEditorText(), "second + URL");
+	assert.equal((globalThis as any)[Symbol.for("pi.inbox.reply-target")]
+		.groupId, a.id);
+	assert.deepEqual(f.key("\x07"), { consume: true });
+	f.overlay().handleInput("\x1b");
+	await nextTick();
+	assert.equal(f.ui.getEditorText(), "second + URL");
+	assert.deepEqual(f.key("\x1b"), { consume: true });
+	assert.equal(f.key("\x07"), undefined);
+});
+
+test("/group moves a busy visit without touching its runtime", async (t) => {
+	const f = await setup(t);
+	const a = await f.visit("running review");
+	const groups = new InboxGroups(dir);
+	const group = await groups.create("Reviews");
+	const before = readFileSync(a.sessionFile!, "utf8");
+	const mainBefore = readFileSync(f.main.getSessionFile()!, "utf8");
+	const proc = a.proc;
+	const done = f.commands.get("group").handler("", f.ctx);
+	f.overlay().handleInput("Rev");
+	f.overlay().handleInput("1");
+	await done;
+	assert.equal(groups.load().sessions[a.id], group.id);
+	assert.equal(groups.load().sessions[f.main.getSessionId()], undefined);
+	assert.equal(a.proc, proc);
+	assert.equal(a.state, "working");
+	assert.equal(readFileSync(a.sessionFile!, "utf8"), before);
+	assert.equal(readFileSync(f.main.getSessionFile()!, "utf8"), mainBefore);
+	assert.equal((proc!.kill as any).mock.calls.length, 0);
+	assert.equal(f.key("\x07"), undefined);
+});
+
+test("membership is saved before starting a new agent", async (t) => {
+	const f = await setup(t);
+	const groups = new InboxGroups(dir);
+	const group = await groups.create("Reviews");
+	(globalThis as any)[Symbol.for("pi.inbox.group-view")] = group.id;
+	const { list, done } = await f.openInbox();
+	list.handleInput("n");
+	await done;
+	// Occupy all slots using fake process handles: NEVER launch real children.
+	const busy = await f.visit("slot blocker");
+	for (let i = 0; i < 6; i++) {
+		registry().agents.set(`blocker-${i}`, { ...busy, id: `blocker-${i}` });
+	}
+	// Avoid the interactive auto-open watcher; test only the routing boundary.
+	(globalThis as any)[Symbol.for("pi.inbox.mode")].on = false;
+	const result = await f.emit("input", {
+		source: "interactive", text: "review URL",
+	});
+	assert.deepEqual(result, [{ action: "handled" }]);
+	const agent = [...registry().agents.values()].find(
+		(agent) => agent.title === "review URL",
+	)!;
+	assert.ok(agent);
+	assert.equal(agent.proc, undefined);
+	assert.equal(groups.load().sessions[agent.id], group.id);
+	assert.deepEqual(agent.pending, ["review URL"]);
+	assert.equal((globalThis as any)[Symbol.for("pi.inbox.reply-target")],
+		undefined);
+});
+
+test("deleted destinations preserve the draft and start no agent", async (t) => {
+	const f = await setup(t);
+	const groups = new InboxGroups(dir);
+	const group = await groups.create("Reviews");
+	(globalThis as any)[Symbol.for("pi.inbox.group-view")] = group.id;
+	const { list, done } = await f.openInbox();
+	list.handleInput("n");
+	await done;
+	await groups.remove(group.id);
+	const result = await f.emit("input", {
+		source: "interactive", text: "review URL",
+	});
+	assert.deepEqual(result, [{ action: "handled" }]);
+	assert.equal(registry().agents.size, 0);
+	assert.equal(f.ui.getEditorText(), "review URL");
+	assert.match(f.ui.notify.mock.calls.at(-1)!.arguments[0],
+		/Agent not started/);
+});
+
+test("selector can create, rename, edit and enable a template", async (t) => {
+	const f = await setup(t);
+	const groups = new InboxGroups(dir);
+	const { list, done } = await f.openInbox();
+	list.handleInput("\x07");
+	await nextTick();
+	f.ui.input.mock.mockImplementation(async () => "Reviews");
+	f.overlay().handleInput("\x01");
+	await nextTick();
+	assert.equal(groups.load().groups[0].name, "Reviews");
+	f.ui.input.mock.mockImplementation(async () => "PR reviews");
+	assert.deepEqual(f.key("\x12"), { consume: true });
+	await nextTick();
+	assert.equal(groups.load().groups[0].name, "PR reviews");
+	assert.deepEqual(f.key("\x14"), { consume: true });
+	await nextTick();
+	assert.equal(groups.load().groups[0].template, "Use gh-pr-review\n\nPR: ");
+	assert.equal(groups.load().groups[0].templateEnabled, false);
+	f.ui.select.mock.mockImplementation(async () => "Enable template");
+	assert.deepEqual(f.key("\x14"), { consume: true });
+	await nextTick();
+	assert.equal(groups.load().groups[0].templateEnabled, true);
+	f.overlay().handleInput("\r");
+	await nextTick();
+	f.overlay().handleInput("n");
+	await done;
+	assert.equal(f.ui.getEditorText(), "Use gh-pr-review\n\nPR: ");
+	assert.equal(f.key("\x14"), undefined, "picker shortcuts are released");
+});
+
+test("deletion requires confirmation and never deletes a session", async (t) => {
+	const f = await setup(t);
+	const a = await f.visit("session to keep");
+	const before = readFileSync(a.sessionFile!, "utf8");
+	const groups = new InboxGroups(dir);
+	const group = await groups.create("Reviews");
+	await groups.assign(a.id, group.id);
+	const { list, done } = await f.openInbox();
+	list.handleInput("\x07");
+	await nextTick();
+	f.overlay().handleInput("Rev");
+	f.overlay().handleInput("\x04");
+	await nextTick();
+	assert.equal(f.overlay().constructor.name, "ConfirmComponent");
+	f.overlay().handleInput("n");
+	await nextTick();
+	assert.equal(groups.load().groups.length, 1);
+	f.overlay().handleInput("\x04");
+	await nextTick();
+	f.overlay().handleInput("y");
+	await nextTick();
+	assert.equal(groups.load().groups.length, 0);
+	assert.equal(groups.load().sessions[a.id], undefined);
+	assert.equal(readFileSync(a.sessionFile!, "utf8"), before);
+	f.overlay().handleInput("\x1b");
+	await nextTick();
+	f.overlay().handleInput("\x1b");
+	await done;
 });
 
 test("completion is read only for the session actually on screen", async (t) => {

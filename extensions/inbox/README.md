@@ -16,6 +16,8 @@ Source: `~/Code/pi-kit/extensions/inbox/index.ts` (background agents: `~/Code/pi
 | `/queue` or `alt+up` | Orchestrator mode: manage this attached session's queued messages; send one now or remove it |
 | `/inbox help` | Show this doc (also `?` inside the inbox) |
 | `/inbox filters` | Show the active filter rules, how many sessions each hides, and any rule errors |
+| `/inbox groups` | Select the group view and create/manage groups |
+| `/group` | Move the session on screen into a group (including busy sessions) |
 | `/pin` | Toggle pin on the current session |
 | `/archive` | Toggle archive (done) on the current session |
 | `/rename [title]` | Rename the current session (no title: auto-title from its first user message). Also available to the agent as the `rename-chat` tool — same naming, works on background-agent sessions too via its `session` param |
@@ -37,6 +39,8 @@ Source: `~/Code/pi-kit/extensions/inbox/index.ts` (background agents: `~/Code/pi
 | `Q` | Orchestrator mode: leave the mode |
 | `n` | New background agent in the current directory, using this window's model. You type its prompt in pi's editor |
 | `N` | Same, picking its model first |
+| `ctrl+g` | Select/manage the group view; while composing a new agent, choose its destination group instead |
+| `b` | Move the selected session into a group or Ungrouped, without stopping it |
 | `ctrl+w` | (while typing a new agent's prompt) pick a different directory for it — a live path picker with suggestions as you type (see [Directories](#directories)) |
 | `d` | Orchestrator mode: move the selected session to a different directory (see [Directories](#directories)) |
 | `c` | Cancel a running background agent |
@@ -151,6 +155,119 @@ A new background agent runs in this window's directory by default — that's whe
 - **All**: every session except filtered ones. Archived ones are dimmed and tagged `[archived]`.
 - **Filtered**: sessions hidden by a filter rule or by `x`. Each row leads with the reason (`⊘ <rule name>` or `⊘ hidden manually`). They never appear in the other three tabs, including in search results.
 
+## Groups and prompt templates
+
+Each session belongs to **one optional group**. Ungrouped is the default.
+Groups are independent of project directories and the Inbox / Archived / All /
+Filtered tabs. The group row above the session list shows the current scope;
+tab counts and full-text search are scoped to that group too.
+
+Open the group selector with **Ctrl+G** inside the inbox, or `/inbox groups`.
+Select **All groups**, **Ungrouped**, or a named group. The view is window-local
+and survives session switches and `/reload`; a new window starts on All groups.
+
+### Selector keys
+
+| Key | Action |
+|---|---|
+| Type | Filter by case-insensitive name prefix |
+| `1`–`9` | Immediately select the correspondingly numbered visible result |
+| `ctrl+n` | Toggle digits-as-text for prefixes like `2026` or `PR2` |
+| `↑` `↓`, `PgUp` `PgDn` | Navigate; numbers always refer to the visible page |
+| `enter` | Select the highlighted result |
+| `esc` | Cancel without changing the view, destination, or draft |
+| `ctrl+a` | Create a group |
+| `ctrl+r` | Rename the highlighted group |
+| `ctrl+t` | Edit its multiline prompt template or enable/disable it |
+| `ctrl+d` | Delete it after confirmation; its sessions become Ungrouped |
+
+Pasted text, including digits, always filters rather than selecting a row.
+Management keys affect the highlighted real group, not the special views.
+Names must be unique ignoring case; All groups and Ungrouped are reserved.
+
+### Membership and creation
+
+Press **b** on an inbox row, or run `/group` while viewing a session, to move it.
+The destination selector excludes All groups because it is a view, not a group.
+Moving a running session changes only metadata: no signals, transcript edits,
+directory changes, queue changes, or process restarts. `/group` targets a visited
+session, never the taken-over main behind it.
+
+Starting an agent with **n/N** while viewing a named group automatically puts
+it in that group. All groups and Ungrouped default to no membership. During
+composition, **Ctrl+G** changes the destination, which is shown in the banner.
+Outside the inbox and new-agent composition, Ctrl+G keeps Pi's external-editor
+behavior. Existing replies never change membership or receive templates.
+
+### Templates
+
+Templates are off by default. **Ctrl+T** in the selector opens options to edit
+the text or enable/disable it; disabling retains the text. When enabled, n/N
+prefills Pi's normal editor. Nothing is submitted until you submit it yourself.
+For a PR reviews group, for example:
+
+```text
+Use the gh-pr-review skill to review this PR:
+
+```
+
+You can add the URL and edit anything. Changing groups replaces an empty draft
+or the exact untouched previous prefill, but **never overwrites an edited draft**.
+Moving existing sessions does not inject the template into their history, and
+later replies are not prefixed. These are editor prefills, not system prompts or
+Pi's slash-command template files.
+
+Definitions, templates and session memberships live together in
+`<agent-dir>/inbox-groups.json` (normally `~/.pi/agent/inbox-groups.json`).
+Writes are locked across windows and atomically replaced; older inbox extensions
+do not touch this separate file. A group deleted in another window becomes
+Ungrouped on refresh. A pending agent whose destination was deleted is not
+started: the draft stays available for choosing another destination.
+
+## Development and testing
+
+Develop in a feature worktree, not the checkout loaded by your live Pi settings.
+Do not run `install.sh`, modify live settings, or load both live and worktree
+inbox extensions into one process. A worktree isolates code, not runtime data.
+
+Automated tests use temporary state and mock process handles; they never run
+real background agents. From the repository root (Node 22.7+ and local Pi SDK
+packages in `node_modules`):
+
+```bash
+node --experimental-transform-types --test \
+  extensions/inbox/*.test.ts \
+  lib/background-mcp-approval.test.ts \
+  lib/visit-runtime.test.ts \
+  scripts/preview-inbox.test.ts
+```
+
+For an optional **one-shot UI preview**, no persistent profile or separate
+working directory needs to be maintained:
+
+```bash
+./scripts/preview-inbox.sh
+```
+
+It runs in the feature worktree and invokes `node_modules/.bin/pi` explicitly,
+not the `pi` command on PATH (which may be a wrapper using live configuration).
+It creates temporary configuration/state and two synthetic sessions, and loads
+only this worktree's inbox plus a preview identity guard. The header says
+**PREVIEW**; `/preview-info` shows the temporary data directory. The guard aborts
+during extension loading if Pi does not honor that directory, before starting
+an inbox supervisor. No live sessions, agent registries, MCP setup or credentials
+are copied. Tools are disabled and
+Cmd/Ctrl+Enter submits; Enter inserts a newline. New agents may report missing
+model credentials: this is a grouping/UI preview, not a production PR review.
+Temporary state is removed on exit unless preview agents or queued work remain;
+in that case the script prints the preserved path. Stop preview agents before
+removing that directory. `--help` can be passed to smoke-test extension loading
+without opening an interactive window.
+
+Try creating PR reviews, editing and enabling its template, moving a demo
+session with b, selecting the group, and pressing n. Then use Ctrl+G to change
+the new agent's destination and verify that edited draft text is preserved.
+
 ## Filters
 
 Filters are a blocklist for *kinds* of sessions, such as automated jobs, so they never clutter the inbox. Matching sessions move to the **Filtered** tab instead of being deleted.
@@ -220,6 +337,7 @@ The preview pane under the list shows the dir, created/updated/pinned/archived t
 ## How it works
 
 - **Pin, archive, filter-override, and scroll-bookmark state**: `~/.pi/agent/inbox.json`, keyed by session id. Every Pi process re-reads it before writing, so they don't overwrite each other.
+- **Groups and templates**: `<agent-dir>/inbox-groups.json`, separate from session transcripts and legacy inbox metadata. Group views are window-local.
 - **Filter rules**: `~/.pi/agent/inbox-filters.json`, matched against each session's `SessionInfo` on every refresh and cached by file mtime.
 - **Live status**: each Pi process writes `~/.pi/agent/inbox-live/<pid>.json` with its session and `working`/`idle` state. It updates on `session_start`, `agent_start` and `agent_settled`, and deletes the file on shutdown. Files for dead PIDs are pruned when the inbox reads them.
 - **Session status**: parsed from the tail of each session `.jsonl`: the last message's role and `stopReason`. Results are cached by file mtime and size.

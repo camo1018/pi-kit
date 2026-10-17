@@ -48,6 +48,19 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import {
+	GroupSelector, isGroupShortcut, type GroupSelection,
+} from "./group-selector.ts";
+import {
+	emptyGroups,
+	groupLabel,
+	InboxGroups,
+	inGroup,
+	sessionGroup,
+	templateDraft,
+	type GroupScope,
+} from "./groups.ts";
 import * as fs from "node:fs";
 import * as readline from "node:readline";
 import {
@@ -131,6 +144,34 @@ import {
 const AGENT_DIR = getAgentDir();
 const STORE_PATH = path.join(AGENT_DIR, "inbox.json");
 const FILTERS_PATH = path.join(AGENT_DIR, "inbox-filters.json");
+const inboxGroups = new InboxGroups(AGENT_DIR);
+const GROUP_VIEW_KEY = Symbol.for("pi.inbox.group-view");
+
+function readGroups() {
+	try {
+		return inboxGroups.load();
+	} catch {
+		// Broken group data mustn't make the rest of the inbox inaccessible.
+		// Mutations still fail closed and report errors in the selector.
+		return emptyGroups();
+	}
+}
+
+function groupView(): GroupScope {
+	const global = globalThis as any;
+	const scope = global[GROUP_VIEW_KEY] ?? "all";
+	if (scope !== "all" && scope !== "ungrouped" &&
+		!readGroups().groups.some((group) => group.id === scope)) {
+		global[GROUP_VIEW_KEY] = "ungrouped";
+		return "ungrouped";
+	}
+	return scope;
+}
+
+function newAgentGroup() {
+	const scope = groupView();
+	return readGroups().groups.find((group) => group.id === scope)?.id;
+}
 const README_PATH = path.join(path.dirname(new URL(import.meta.url).pathname), "README.md");
 
 function readReadme(): string {
@@ -1083,6 +1124,8 @@ type InboxResult =
 	| { action: "cancel"; row: Row }
 	| { action: "queue"; row: Row }
 	| { action: "movedir"; row: Row }
+	| { action: "groupView" }
+	| { action: "movegroup"; row: Row }
 	| { action: "home" }
 	| { action: "exitMode" }
 	| { action: "quit" }
@@ -1090,6 +1133,7 @@ type InboxResult =
 
 class InboxComponent {
 	private rows: Row[];
+	private groups = readGroups();
 	private visible: Row[] = [];
 	private display: Array<{ kind: "header"; label: string } | { kind: "item"; row: Row; idx: number }> = [];
 	private selected = 0;
@@ -1157,7 +1201,9 @@ class InboxComponent {
 		let inbox = 0;
 		let archived = 0;
 		let filtered = 0;
+		const scope = groupView();
 		for (const r of this.rows) {
+			if (!inGroup(this.groups, scope, r.info.id)) continue;
 			if (r.filtered) filtered++;
 			else if (r.meta.archivedAt) archived++;
 			else inbox++;
@@ -1171,6 +1217,7 @@ class InboxComponent {
 	}
 
 	private rebuild() {
+		this.groups = readGroups();
 		const terms = this.state.query.toLowerCase().split(/\s+/).filter(Boolean);
 		const match = (r: Row) => terms.every((t) => r.searchText.includes(t) || r.title.toLowerCase().includes(t));
 		const byModified = (a: Row, b: Row) => b.info.modified.getTime() - a.info.modified.getTime();
@@ -1182,7 +1229,9 @@ class InboxComponent {
 			for (const row of list) this.display.push({ kind: "item", row, idx: 0 });
 		};
 
-		const matched = this.rows.filter(match);
+		const scope = groupView();
+		const matched = this.rows.filter((row) =>
+			inGroup(this.groups, scope, row.info.id) && match(row));
 		// Filtered-out sessions appear only in their own tab, never in Inbox / Archived / All.
 		const shown = matched.filter((r) => !r.filtered);
 		if (this.state.view === "inbox") {
@@ -1380,7 +1429,11 @@ class InboxComponent {
 		const row = this.visible[this.selected];
 		const ch = printable(data);
 
-		if (kb.matches(data, "tui.select.up") || ch === "k") this.move(-1);
+		if (matchesKey(data, "ctrl+g")) {
+			this.done({ action: "groupView" });
+		} else if (ch === "b") {
+			if (row) this.done({ action: "movegroup", row });
+		} else if (kb.matches(data, "tui.select.up") || ch === "k") this.move(-1);
 		else if (kb.matches(data, "tui.select.down") || ch === "j") this.move(1);
 		else if (matchesKey(data, "left")) this.move(-5);
 		else if (matchesKey(data, "right")) this.move(5);
@@ -1466,7 +1519,7 @@ class InboxComponent {
 
 	private listHeight(): number {
 		// border(1) tabs(1) sep(1) | list | sep(1) preview(3) sep(1) help(1) border(1)
-		return Math.max(3, this.height() - 10);
+		return Math.max(3, this.height() - 11);
 	}
 
 	/** Latest-line column: the user's latest prompt or the agent's final reply, whichever is newer (no tool calls / thinking). */
@@ -1515,7 +1568,12 @@ class InboxComponent {
 
 		// top border with title
 		const summary = orchestrating() ? agentsSummary() : undefined;
-		const title = ` ${th.bold(th.fg("accent", orchestrating() ? "📥 Pi Inbox · orchestrator" : "📥 Pi Inbox"))}${summary ? th.fg("dim", `  ${summary}`) : ""} `;
+		const preview = process.env.PI_INBOX_PREVIEW_DIR === AGENT_DIR;
+		const heading = orchestrating()
+			? "📥 Pi Inbox · orchestrator" : "📥 Pi Inbox";
+		const title = ` ${th.bold(th.fg("accent", heading))}` +
+			(preview ? th.bold(th.fg("warning", " · PREVIEW")) : "") +
+			(summary ? th.fg("dim", `  ${summary}`) : "") + " ";
 		const spin = this.loading ? th.fg("dim", " ⟳ ") : "";
 		out.push(b("╭─") + title + spin + b("─".repeat(Math.max(0, innerW - 1 - visibleWidth(title) - visibleWidth(spin)))) + b("╮"));
 
@@ -1534,6 +1592,9 @@ class InboxComponent {
 		const gap = innerW - visibleWidth(tabs) - visibleWidth(q) - 1;
 		tabs = gap > 1 ? tabs + " ".repeat(gap) + q : `${tabs}  ${q}`;
 		out.push(line(tabs));
+		const scope = groupView();
+		out.push(line(` Group: ${groupLabel(this.groups, scope)}` +
+			" · Ctrl+G select/manage · b move session"));
 		out.push(sep());
 
 		// list
@@ -1653,6 +1714,8 @@ class InboxComponent {
 		if (r) {
 			const meta: string[] = [];
 			meta.push(shortCwd(r.info.cwd));
+			meta.push(`group: ${sessionGroup(this.groups, r.info.id)?.name
+				?? "Ungrouped"}`);
 			meta.push(`created ${ago(r.info.created)}`);
 			meta.push(`updated ${ago(r.info.modified)}`);
 			if (r.meta.pinnedAt) meta.push(`pinned ${ago(r.meta.pinnedAt)}`);
@@ -2347,7 +2410,12 @@ function moveSessionDir(file: string, newCwd: string): string {
 type ReplyTarget =
 	/** model: set once you change the model while this reply is pending; agentModel: what the agent uses otherwise. */
 	| { kind: "agent"; id: string; title: string; cwd: string; sessionFile?: string; model?: string; agentModel?: string }
-	| { kind: "new"; cwd: string; model?: string };
+	| {
+		kind: "new"; cwd: string; model?: string;
+		groupId?: string;
+		/** Exact prefill last placed in the editor; used to protect edits. */
+		templateText?: string;
+	};
 
 const REPLY_KEY = Symbol.for("pi.inbox.reply-target");
 function getReplyTarget(): ReplyTarget | undefined {
@@ -2360,7 +2428,23 @@ function setReplyTarget(t: ReplyTarget | undefined, ctx?: ExtensionContext) {
 		setNextAgentName(undefined);
 		setNextAgentDir(undefined);
 	}
-	if (ctx) showReplyWidget(ctx);
+	if (ctx) {
+		if (t?.kind === "new") prefillNewAgent(ctx, t);
+		showReplyWidget(ctx);
+	}
+}
+
+function prefillNewAgent(
+	ctx: ExtensionContext,
+	target: Extract<ReplyTarget, { kind: "new" }>,
+) {
+	const group = readGroups().groups.find((g) => g.id === target.groupId);
+	const template = group?.templateEnabled ? group.template : "";
+	const draft = ctx.ui.getEditorText();
+	const next = templateDraft(draft, target.templateText, template);
+	const untouched = !draft || draft === target.templateText;
+	if (next !== draft) ctx.ui.setEditorText(next);
+	target.templateText = untouched ? template : undefined;
 }
 
 /** Name for the next new background agent, set with ctrl+r before sending its first prompt. */
@@ -2413,9 +2497,15 @@ function showReplyWidget(ctx: ExtensionContext) {
 				? `${th.fg("dim", " · dir ")}${th.bold(prettyDir(nextDir).slice(0, 50))}`
 				: th.fg("dim", " · ctrl+w to change dir")
 			: "";
+	const group = t.kind === "new"
+		? ` · group ${groupLabel(readGroups(), t.groupId ?? "ungrouped")}` +
+			" · Ctrl+G to change group"
+		: "";
 	const text =
 		t.kind === "new"
-			? `${th.fg("accent", "＋ Your next message starts a new background agent")}${th.fg("dim", ` · ${shortCwd(nextDir ?? t.cwd)} · ${t.model ?? "default model"}`)}${named}${dir}`
+			? th.fg("accent", "＋ Your next message starts a new background agent") +
+				th.fg("dim", ` · ${shortCwd(nextDir ?? t.cwd)}` +
+					` · ${t.model ?? "default model"}`) + named + dir + group
 			: `${th.fg("accent", "↪ Your next message goes to ")}${th.bold(th.fg(nameColor(t.id), t.title.slice(0, 50)))}${th.fg(
 					"dim",
 					` · ${t.model ? `${t.model} (changed)` : (t.agentModel ?? "its current model")}${isRunning(getAgent(t.id)) ? " · queued: it's working" : ""}`,
@@ -3263,6 +3353,115 @@ export default function (pi: ExtensionAPI) {
 	const uiState: UIState = { view: "inbox", query: "" };
 	let rowCache: Row[] = [];
 
+	async function pickGroup(
+		ctx: ExtensionContext,
+		mode: "view" | "assign",
+		initial: GroupScope,
+	): Promise<GroupScope | undefined> {
+		if (ctx.mode !== "tui") return undefined;
+		try {
+			for (;;) {
+				const store = inboxGroups.load();
+				const result = await ctx.ui.custom<GroupSelection>(
+					(tui, theme, kb, done) => {
+						coverImagesUnderOverlays(tui);
+						const selector = new GroupSelector(
+							tui, theme, kb, done, store.groups, mode, initial,
+						);
+						// Claim scoped Ctrl keys before Pi's global shortcuts
+						// (e.g. thinking toggle and rename-chat) can take them.
+						const unsubscribe = ctx.ui.onTerminalInput((data) => {
+							if (!isGroupShortcut(data)) return undefined;
+							selector.handleInput(data);
+							return { consume: true };
+						});
+						return Object.assign(selector, { dispose: unsubscribe });
+					},
+					{ overlay: true, overlayOptions: overlayOpts() },
+				);
+				if (!result) return undefined;
+				if (result.action === "select") return result.scope;
+				if (result.action === "create") {
+					const name = await ctx.ui.input("Create inbox group");
+					if (name === undefined) continue;
+					try {
+						initial = (await inboxGroups.create(name)).id;
+					} catch (error) {
+						ctx.ui.notify(String(error), "warning");
+					}
+					continue;
+				}
+				const group = inboxGroups.load().groups.find(
+					(group) => group.id === result.id,
+				);
+				if (!group) continue;
+				initial = group.id;
+				if (result.action === "rename") {
+					const name = await ctx.ui.input("Rename inbox group", group.name);
+					if (name !== undefined) {
+						try {
+							await inboxGroups.rename(group.id, name);
+						} catch (error) {
+							ctx.ui.notify(String(error), "warning");
+						}
+					}
+				} else if (result.action === "delete") {
+					if (await ask(ctx, `Delete group "${group.name}"?`,
+						"Sessions will become Ungrouped. " +
+						"Nothing is stopped or deleted.")) {
+						await inboxGroups.remove(group.id);
+						initial = "ungrouped";
+					}
+				} else if (result.action === "template") {
+					const toggle = group.templateEnabled ? "Disable" : "Enable";
+					const action = await ctx.ui.select(
+						`Prompt template · ${group.name}`,
+						["Edit template", `${toggle} template`],
+					);
+					if (action === "Edit template") {
+						const text = await ctx.ui.editor(
+							`Prompt template · ${group.name}`, group.template,
+						);
+						if (text !== undefined) {
+							await inboxGroups.setTemplate(
+								group.id, text, group.templateEnabled,
+							);
+						}
+					} else if (action === `${toggle} template`) {
+						const latest = inboxGroups.load().groups.find(
+							(item) => item.id === group.id,
+						);
+						if (latest) await inboxGroups.setTemplate(
+							group.id, latest.template, !group.templateEnabled,
+						);
+					}
+				}
+			}
+		} catch (error) {
+			ctx.ui.notify(`Groups: ${String(error)}`, "error");
+			return undefined;
+		}
+	}
+
+	async function selectGroupView(ctx: ExtensionContext) {
+		const scope = await pickGroup(ctx, "view", groupView());
+		if (scope === undefined) return;
+		(globalThis as any)[GROUP_VIEW_KEY] = scope;
+		uiState.selectedId = undefined;
+	}
+
+	async function moveToGroup(ctx: ExtensionContext, id: string) {
+		const current = sessionGroup(readGroups(), id)?.id ?? "ungrouped";
+		const scope = await pickGroup(ctx, "assign", current);
+		if (scope === undefined) return;
+		try {
+			await inboxGroups.assign(id, scope === "ungrouped" ? undefined : scope);
+			refreshFooter(ctx);
+		} catch (error) {
+			ctx.ui.notify(`Group move failed: ${String(error)}`, "error");
+		}
+	}
+
 	const refreshFooter = (ctx: ExtensionContext) => {
 		if (!ctx.hasUI) return;
 		const id = viewedSession(ctx).id;
@@ -3271,6 +3470,8 @@ export default function (pi: ExtensionAPI) {
 		if (meta.pinnedAt) parts.push(ctx.ui.theme.fg("warning", "★ pinned"));
 		if (meta.archivedAt) parts.push("archived");
 		if (meta.filter === "hide") parts.push("filtered");
+		const group = sessionGroup(readGroups(), id);
+		if (group) parts.push(`group: ${group.name}`);
 		ctx.ui.setStatus("inbox", parts.length ? parts.join(" · ") : undefined);
 	};
 
@@ -3598,7 +3799,9 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/** Confirm that stays full-screen in orchestrator mode. */
-	async function ask(ctx: ExtensionCommandContext, title: string, body: string): Promise<boolean> {
+	async function ask(
+		ctx: ExtensionContext, title: string, body: string,
+	): Promise<boolean> {
 		if (!orchestrating() || ctx.mode !== "tui") return ctx.ui.confirm(title, body);
 		const ok = await ctx.ui.custom<boolean>((tui, theme, _kb, done) => (coverImagesUnderOverlays(tui), new ConfirmComponent(tui, theme, done, title, body)), {
 			overlay: true,
@@ -4074,6 +4277,16 @@ export default function (pi: ExtensionAPI) {
 				continue;
 			}
 
+			if (result.action === "groupView") {
+				await selectGroupView(ctx);
+				continue;
+			}
+
+			if (result.action === "movegroup") {
+				await moveToGroup(ctx, result.row.info.id);
+				continue;
+			}
+
 			if (result.action === "new") {
 				let model = isVisiting()
 					? nextSessionModel(viewed.id, viewed.file)
@@ -4092,11 +4305,15 @@ export default function (pi: ExtensionAPI) {
 						if (tui) closeVisit(tui);
 						showLiveStream(ctx);
 					}
-					setReplyTarget({ kind: "new", cwd: viewed.cwd, model }, ctx);
+					setReplyTarget({
+						kind: "new", cwd: viewed.cwd, model, groupId: newAgentGroup(),
+					}, ctx);
 					return;
 				}
 				// No sticky main: retain the existing blank-home compose flow.
-				setReplyTarget({ kind: "new", cwd: viewed.cwd, model }, ctx);
+				setReplyTarget({
+					kind: "new", cwd: viewed.cwd, model, groupId: newAgentGroup(),
+				}, ctx);
 				if (orchestrating() && !isHome(ctx) && !(await goHome(ctx, { reopen: false }))) {
 					setReplyTarget(undefined, ctx);
 					continue;
@@ -4392,17 +4609,36 @@ export default function (pi: ExtensionAPI) {
 			const items = [
 				{ value: "help", label: "help", description: "Show the Inbox README" },
 				{ value: "filters", label: "filters", description: "Show the session filter rules and what they hide" },
+				{
+					value: "groups", label: "groups",
+					description: "Select or manage inbox groups",
+				},
 			].filter((i) => i.value.startsWith(p));
 			return items.length ? items : null;
 		},
 		handler: async (args, ctx) => {
 			const a = args.trim().toLowerCase();
 			if (["help", "?", "docs", "readme"].includes(a)) return showHelp(ctx);
+			if (a === "groups") {
+				await selectGroupView(ctx);
+				return openInbox(ctx);
+			}
 			if (["filters", "filter", "blocklist"].includes(a)) {
 				const rows = await loadRows(viewedSession(ctx).id, true);
 				return showHelp(ctx, filtersReport(rows), "filters");
 			}
 			return openInbox(ctx);
+		},
+	});
+
+	pi.registerCommand("group", {
+		description: "Move the session on screen into an inbox group",
+		handler: async (_args, ctx) => {
+			if (ctx.mode !== "tui") return;
+			if (orchestrating() && isHome(ctx) && !isVisiting()) {
+				return ctx.ui.notify("Pick a session first.", "info");
+			}
+			await moveToGroup(ctx, viewedSession(ctx).id);
 		},
 	});
 
@@ -4712,6 +4948,20 @@ export default function (pi: ExtensionAPI) {
 		);
 	}
 
+	async function pickNewAgentGroup(ctx: ExtensionContext) {
+		const target = getReplyTarget();
+		if (target?.kind === "agent") return;
+		const composing = target?.kind === "new" ? target : undefined;
+		const scope = await pickGroup(ctx, "assign",
+			composing?.groupId ?? newAgentGroup() ?? "ungrouped");
+		if (scope === undefined || getReplyTarget() !== target) return;
+		const next: Extract<ReplyTarget, { kind: "new" }> = composing ?? {
+			kind: "new", cwd: ctx.cwd, model: currentModel(ctx),
+		};
+		next.groupId = scope === "ungrouped" ? undefined : scope;
+		setReplyTarget(next, ctx);
+	}
+
 	// ── Reply routing: when a reply target is set, the next message typed in pi's own editor
 	// goes to that background agent (or starts a new one) instead of the foreground session.
 	// Extension and built-in slash commands run before this hook, so they are never captured.
@@ -4767,7 +5017,10 @@ export default function (pi: ExtensionAPI) {
 			showStartingPrompt(ctx, pending);
 			return { action: "handled" };
 		}
-		if (!t && orchestrating() && isHome(ctx)) t = { kind: "new", cwd: ctx.cwd, model: currentModel(ctx) };
+		if (!t && orchestrating() && isHome(ctx)) t = {
+			kind: "new", cwd: ctx.cwd, model: currentModel(ctx),
+			groupId: newAgentGroup(),
+		};
 		// Orchestrator, attached session: the message runs as a background agent on this session, so
 		// you can switch away mid-run. The chat view reloads from disk when the run finishes.
 		if (!t && text && isAttached(ctx)) {
@@ -4799,13 +5052,27 @@ export default function (pi: ExtensionAPI) {
 				return { action: "handled" };
 			}
 		}
+		// Save membership before launching; failed saves leave the draft intact.
+		const newId = t.kind === "new" ? randomUUID() : undefined;
+		if (t.kind === "new" && t.groupId) {
+			try {
+				await inboxGroups.assign(newId!, t.groupId);
+			} catch (error) {
+				ctx.ui.notify(`Agent not started: ${String(error)}`, "error");
+				ctx.ui.setEditorText(event.text);
+				return { action: "handled" };
+			}
+		}
 		const preName = t.kind === "new" ? getNextAgentName() : undefined;
 		const preDir = t.kind === "new" ? getNextAgentDir() : undefined; // ctrl+w pick; captured before the target drops
 		setReplyTarget(undefined, ctx); // one message per target (also drops the pre-name/pre-dir)
 		if (event.images?.length) ctx.ui.notify("Images can't be sent to background agents yet — sent the text only.", "warning");
 
 		if (t.kind === "new") {
-			const a = spawnAgent({ prompt: text, cwd: preDir ?? t.cwd, model: t.model, title: preName ?? cleanTitle(text).slice(0, 120) });
+			const a = spawnAgent({
+				id: newId, prompt: text, cwd: preDir ?? t.cwd, model: t.model,
+				title: preName ?? cleanTitle(text).slice(0, 120),
+			});
 			// ctrl+r pre-name: the child applies it as its session name (works before the file exists).
 			if (preName) renameAgent(a.id, preName);
 			uiState.view = "inbox";
@@ -4881,6 +5148,10 @@ export default function (pi: ExtensionAPI) {
 			setNextAgentDir(undefined);
 			showReplyWidget(ctx);
 		}
+		if (rt?.kind === "new" && getReplyTarget() === rt) {
+			prefillNewAgent(ctx, rt);
+			showReplyWidget(ctx);
+		}
 		// A real switch away cancels auto-open. Remaining on the sticky main does not.
 		if (
 			orchestrating() &&
@@ -4915,6 +5186,19 @@ export default function (pi: ExtensionAPI) {
 					(isVisiting() || !!getAgent(id))
 				) {
 					void manageQueue(c);
+					return { consume: true };
+				}
+				return undefined;
+			}
+			// Only new-agent composition claims Ctrl+G. Normal sessions and
+			// replies retain Pi's external-editor shortcut.
+			if (matchesKey(data, "ctrl+g")) {
+				const target = getReplyTarget();
+				const home = orchestrating() && isHome(current);
+				if (editorFocused() && !modeState().inLoop &&
+					(target?.kind === "new" || (!target && home)) &&
+					(current.isIdle() || isStickyMain(current))) {
+					void pickNewAgentGroup(current);
 					return { consume: true };
 				}
 				return undefined;
