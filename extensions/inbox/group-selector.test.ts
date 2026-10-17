@@ -1,19 +1,24 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-	getKeybindings, visibleWidth, type TUI,
+	CombinedAutocompleteProvider, getKeybindings, visibleWidth, type TUI,
 } from "@earendil-works/pi-tui";
-import type { Theme } from "@earendil-works/pi-coding-agent";
+import { initTheme, type Theme } from "@earendil-works/pi-coding-agent";
 import {
-	GroupSelector, type GroupSelection, type TemplateActions,
+	GroupSelector, type GroupActions, type GroupSelection,
 } from "./group-selector.ts";
 import type { InboxGroup } from "./groups.ts";
+
+initTheme("dark");
 
 const groups: InboxGroup[] = ["PR reviews", "PR2", "2026", "Bugs"].map(
 	(name) => ({ id: name, name, template: "", templateEnabled: false }),
 );
 
-function selector(mode: "view" | "assign" = "view", rows = 30) {
+function selector(
+	mode: "view" | "assign" | "default" = "view", rows = 30,
+	defaultId?: string,
+) {
 	let result: GroupSelection | "waiting" = "waiting";
 	const theme = {
 		fg: (_color: string, text: string) => text,
@@ -21,7 +26,7 @@ function selector(mode: "view" | "assign" = "view", rows = 30) {
 		bold: (text: string) => text,
 	} as Theme;
 	const templates = new Map(groups.map((group) => [group.id, { ...group }]));
-	const actions: TemplateActions = {
+	const actions: GroupActions = {
 		async toggle(id) {
 			const group = templates.get(id)!;
 			group.templateEnabled = !group.templateEnabled;
@@ -32,13 +37,18 @@ function selector(mode: "view" | "assign" = "view", rows = 30) {
 			group.template = text;
 			return { ...group };
 		},
+		async setDefault(id) {
+			defaultId = id;
+			return id;
+		},
 	};
 	const ui = new GroupSelector(
 		{ terminal: { rows }, requestRender() {} } as unknown as TUI,
 		theme, getKeybindings(), (value) => { result = value; }, groups, mode,
-		actions,
+		actions, undefined, defaultId,
 	);
-	return { ui, actions, templates, result: () => result };
+	return { ui, actions, templates, result: () => result,
+		defaultId: () => defaultId };
 }
 
 test("prefix matching ignores case and numbers pick filtered rows", () => {
@@ -138,6 +148,68 @@ test("management keys target the highlighted group, not special views", () => {
 });
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+test("Ctrl+F sets and clears the default in the same picker", async () => {
+	const f = selector();
+	for (const char of "PR") f.ui.handleInput(char);
+	f.ui.handleInput("\x06");
+	await tick();
+	assert.equal(f.defaultId(), "PR reviews");
+	assert.equal(f.result(), "waiting");
+	assert.match(f.ui.render(100).join("\n"), /PR reviews · default/);
+	assert.match(f.ui.render(100).join("\n"), /Prefix: PR/);
+	f.ui.handleInput("\x1b[110;5:1u");
+	f.ui.handleInput("\x15");
+	for (const char of "Ungrouped") f.ui.handleInput(char);
+	f.ui.handleInput("\x06");
+	await tick();
+	assert.equal(f.defaultId(), undefined);
+});
+
+test("default mode excludes All groups and shows the current default", () => {
+	const f = selector("default", 30, "Bugs");
+	const rendered = f.ui.render(100).join("\n");
+	assert.match(rendered, /Default group for new agents/);
+	assert.match(rendered, /Bugs · default/);
+	assert.doesNotMatch(rendered, /All groups/);
+});
+
+test("slash completion inserts text without executing it", async () => {
+	const f = selector();
+	const provider = new CombinedAutocompleteProvider([
+		{ name: "help", description: "Help" },
+	], process.cwd());
+	f.actions.autocomplete = () => provider;
+	for (const char of "Bug") f.ui.handleInput(char);
+	f.ui.handleInput("\x05");
+	f.ui.handleInput("/he");
+	await tick();
+	assert.equal((f.ui as any).editor.isShowingAutocomplete(), true);
+	f.ui.handleInput("\t");
+	assert.match((f.ui as any).editor.getExpandedText(), /^\/help\s?$/);
+	assert.equal(f.result(), "waiting");
+	f.ui.handleInput("\x13");
+	await tick();
+	assert.match(f.templates.get("Bugs")!.template, /^\/help\s?$/);
+});
+
+test("Escape closes suggestions before cancelling edit", async () => {
+	const f = selector();
+	f.actions.autocomplete = () => new CombinedAutocompleteProvider([
+		{ name: "help", description: "Help" },
+	], process.cwd());
+	for (const char of "Bug") f.ui.handleInput(char);
+	f.ui.handleInput("\x05");
+	f.ui.handleInput("/he");
+	await tick();
+	f.ui.handleInput("\x1b");
+	assert.ok((f.ui as any).editor);
+	assert.equal((f.ui as any).editor.isShowingAutocomplete(), false);
+	assert.equal((f.ui as any).editor.getExpandedText(), "/he");
+	f.ui.handleInput("\x1b");
+	assert.equal((f.ui as any).editor, undefined);
+	assert.equal(f.result(), "waiting");
+});
 
 test("Ctrl+T toggles inline and preserves search/selection", async () => {
 	const f = selector();

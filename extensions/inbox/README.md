@@ -30,7 +30,7 @@ Source: `~/Code/pi-kit/extensions/inbox/index.ts` (background agents: `~/Code/pi
 |---|---|
 | `↑` `↓` / `j` `k` | Move |
 | `←` `→` | Move up / down 5 rows |
-| `PgUp` `PgDn`, `g` `G` | Page / jump to top or bottom |
+| `PgUp` `PgDn`, `home` `end` | Page / jump to top or bottom |
 | `enter` | **Agent view**: live transcript of the session; `r` there to reply (see [Background agents](#background-agents)) |
 | `o` | Open (switch to) the selected session in this window. In orchestrator mode: open it attached (same as `enter`) |
 | `t` | Orchestrator mode: take the session over (it runs here, like plain pi) |
@@ -39,9 +39,11 @@ Source: `~/Code/pi-kit/extensions/inbox/index.ts` (background agents: `~/Code/pi
 | `Q` | Orchestrator mode: leave the mode |
 | `n` | New background agent in the current directory, using this window's model. You type its prompt in pi's editor |
 | `N` | Same, picking its model first |
-| `ctrl+g` | Select/manage the group view; while composing a new agent, choose its destination group instead |
+| `g` | Select/manage the group view (`ctrl+g` remains an alias) |
+| `ctrl+g` | While composing a new agent, choose its destination group |
 | `b` | Move the selected session into a group or Ungrouped, without stopping it |
 | `s` | All groups: toggle flat list / grouped sections |
+| `f` | Choose the persistent new-agent default group; Ungrouped clears it |
 | `ctrl+w` | (while typing a new agent's prompt) pick a different directory for it — a live path picker with suggestions as you type (see [Directories](#directories)) |
 | `d` | Orchestrator mode: move the selected session to a different directory (see [Directories](#directories)) |
 | `c` | Cancel a running background agent |
@@ -163,7 +165,9 @@ Groups are independent of project directories and the Inbox / Archived / All /
 Filtered tabs. The group row above the session list shows the current scope;
 tab counts and full-text search are scoped to that group too.
 
-Open the group selector with **Ctrl+G** inside the inbox, or `/inbox groups`.
+Open the group selector with **g** inside the inbox, or `/inbox groups`.
+Ctrl+G remains an inbox alias and the shortcut while composing new prompts;
+plain g in editors, search and rename stays ordinary text.
 Select **All groups**, **Ungrouped**, or a named group. The view is window-local
 and survives session switches and `/reload`; a new window starts on All groups.
 
@@ -202,6 +206,7 @@ This changes presentation only, not membership or the new-agent destination.
 | `ctrl+e` | Edit its multiline template in the same picker panel |
 | `ctrl+s` / submit | While editing: save and return to group search |
 | `ctrl+d` | Delete it after confirmation; its sessions become Ungrouped |
+| `ctrl+f` | Set the highlighted group as the new-agent default; Ungrouped clears it |
 
 Pasted text, including digits, always filters rather than selecting a row.
 Ctrl+N and management actions ignore reported key-repeat and key-release events;
@@ -212,8 +217,9 @@ Names must be unique ignoring case; All groups and Ungrouped are reserved.
 Search, results, template status and template preview share one screen.
 Highlight a group to inspect its template; Ctrl+T toggles it without leaving the
 picker. Ctrl+E focuses the inline template editor while keeping the prefix and
-results visible. Ctrl+S or your normal submit key saves; Escape cancels only the
-edit and returns focus to search. Another Escape closes the picker. Search text,
+results visible. Ctrl+S or your normal submit key saves. Escape closes any
+completion menu first, then cancels the edit and returns focus to search.
+Another Escape closes the picker. Search text,
 numeric-input mode and selection are preserved. Numbers typed into a template
 are ordinary text, never group-selection shortcuts. Failed saves retain your
 draft for retry instead of clearing it.
@@ -227,10 +233,28 @@ directory changes, queue changes, or process restarts. `/group` targets a visite
 session, never the taken-over main behind it.
 
 Starting an agent with **n/N** while viewing a named group automatically puts
-it in that group. All groups and Ungrouped default to no membership. During
+it in that group. Ungrouped explicitly creates ungrouped agents. All groups
+uses the configured new-agent default, or Ungrouped if none is configured. During
 composition, **Ctrl+G** changes the destination, which is shown in the banner.
 Outside the inbox and new-agent composition, Ctrl+G keeps Pi's external-editor
 behavior. Existing replies never change membership or receive templates.
+
+### Default group for new agents
+
+The inbox title shows **default: <group>** beside orchestrator. The hint
+**f to change default group** sits on the existing group/layout line instead of
+taking another header row.
+Press **f** to select the default, or **Ctrl+F** on a highlighted group in the
+regular group picker to set it without leaving that screen. Select Ungrouped to
+clear it. The picker marks the current default; All groups cannot be a default
+because it is a view, not a destination.
+
+This preference is saved in `inbox-groups.json` and shared across windows and
+restarts. Priority is: explicit Ctrl+G composition choice, then the selected
+named-group/Ungrouped filter, then the default when viewing All groups. The
+default group's enabled template prefills new agents normally. Changing the
+default does not move existing sessions or retarget a prompt already being
+composed. Deleting the default group clears it safely.
 
 ### Templates
 
@@ -249,6 +273,13 @@ or the exact untouched previous prefill, but **never overwrites an edited draft*
 Moving existing sessions does not inject the template into their history, and
 later replies are not prefixed. These are editor prefills, not system prompts or
 Pi's slash-command template files.
+
+The inline template editor uses the normal prompt's completion provider: slash
+commands/templates, `/skill:name`, `$skill` (when inline-skills is loaded), and
+file references have the same suggestions. Tab or Enter accepts a suggestion;
+Escape closes the suggestion menu without cancelling your edit. Saving stores
+the text literally: commands and skill bodies are not executed or expanded while
+editing. Normal prompt/skill processing applies when the template is used.
 
 Definitions, templates and session memberships live together in
 `<agent-dir>/inbox-groups.json` (normally `~/.pi/agent/inbox-groups.json`).
@@ -272,6 +303,7 @@ node --experimental-transform-types --test \
   extensions/inbox/*.test.ts \
   lib/background-mcp-approval.test.ts \
   lib/visit-runtime.test.ts \
+  lib/prompt-autocomplete.test.ts \
   scripts/preview-inbox.test.ts
 ```
 
@@ -285,7 +317,9 @@ working directory needs to be maintained:
 It runs in the feature worktree and invokes `node_modules/.bin/pi` explicitly,
 not the `pi` command on PATH (which may be a wrapper using live configuration).
 It creates temporary configuration/state and two synthetic sessions, and loads
-only this worktree's inbox plus a preview identity guard. The header says
+this worktree's inbox, inline-skills and a preview identity guard. A synthetic
+`preview-review` skill is included for trying `/skill:preview-review` and
+`$preview-review` completion. The header says
 **PREVIEW**; `/preview-info` shows the temporary data directory. The guard aborts
 during extension loading if Pi does not honor that directory, before starting
 an inbox supervisor. No live sessions, agent registries, MCP setup or credentials

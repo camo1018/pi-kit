@@ -8,7 +8,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import {
-	InboxGroups, groupLabel, inGroup, sessionGroup, templateDraft,
+	InboxGroups, defaultGroup, groupLabel, inGroup, newAgentGroupForScope,
+	sessionGroup, templateDraft,
 } from "./groups.ts";
 
 function fixture(t: TestContext) {
@@ -48,6 +49,44 @@ test("deleting a group ungroups only its sessions", async (t) => {
 	assert.equal(sessionGroup(groups.load(), "two")?.id, b.id);
 	assert.deepEqual(groups.load().sessions, { two: b.id });
 	await assert.rejects(groups.assign("one", a.id), /no longer exists/);
+});
+
+test("default persists and explicit views override it", async (t) => {
+	const groups = fixture(t);
+	const reviews = await groups.create("Reviews");
+	const bugs = await groups.create("Bugs");
+	await groups.setDefaultGroup(reviews.id);
+	const reopened = new InboxGroups(join(groups.file, ".."));
+	assert.equal(defaultGroup(reopened.load())?.id, reviews.id);
+	assert.equal(newAgentGroupForScope(reopened.load(), "all"), reviews.id);
+	assert.equal(newAgentGroupForScope(reopened.load(), bugs.id), bugs.id);
+	assert.equal(newAgentGroupForScope(reopened.load(), "ungrouped"), undefined);
+	await groups.saveTemplate(bugs.id, "unrelated setting");
+	assert.equal(defaultGroup(groups.load())?.id, reviews.id);
+	await groups.setDefaultGroup();
+	assert.equal(defaultGroup(groups.load()), undefined);
+	await assert.rejects(groups.setDefaultGroup("unknown"));
+});
+
+test("removing the default group clears its setting atomically", async (t) => {
+	const groups = fixture(t);
+	const group = await groups.create("Reviews");
+	await groups.setDefaultGroup(group.id);
+	await groups.remove(group.id);
+	assert.equal(groups.load().defaultGroupId, undefined);
+	assert.equal(newAgentGroupForScope(groups.load(), "all"), undefined);
+});
+
+test("stale default ids safely resolve to Ungrouped", (t) => {
+	const groups = fixture(t);
+	writeFileSync(groups.file, JSON.stringify({
+		version: 1, groups: [], sessions: {}, defaultGroupId: "deleted",
+	}));
+	assert.equal(newAgentGroupForScope(groups.load(), "all"), undefined);
+	writeFileSync(groups.file, JSON.stringify({
+		version: 1, groups: [], sessions: {}, defaultGroupId: 1,
+	}));
+	assert.throws(() => groups.load(), /Invalid default group/);
 });
 
 test("templates retain their contents when disabled", async (t) => {
