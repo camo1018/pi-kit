@@ -182,6 +182,8 @@ and survives session switches and `/reload`; a new window starts on All groups.
 | `ctrl+d` | Delete it after confirmation; its sessions become Ungrouped |
 
 Pasted text, including digits, always filters rather than selecting a row.
+Ctrl+N and management actions ignore reported key-repeat and key-release events;
+one key press triggers one action. Arrow-key repeat still navigates the list.
 Management keys affect the highlighted real group, not the special views.
 Names must be unique ignoring case; All groups and Ungrouped are reserved.
 

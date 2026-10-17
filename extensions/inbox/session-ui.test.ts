@@ -782,6 +782,14 @@ test("group view filters sessions and prefills new agents", async (t) => {
 	list.handleInput("\x07");
 	await nextTick();
 	assert.equal(f.overlay().constructor.name, "GroupSelector");
+	assert.deepEqual(f.key("\x1b[110;5:1u"), { consume: true });
+	assert.match(f.overlay().render(100).join("\n"), /Digits: text/);
+	assert.deepEqual(f.key("\x1b[110;5:2u"), { consume: true });
+	assert.match(f.overlay().render(100).join("\n"), /Digits: text/);
+	assert.deepEqual(f.key("\x1b[110;5:3u"), { consume: true });
+	assert.match(f.overlay().render(100).join("\n"), /Digits: text/);
+	assert.deepEqual(f.key("\x1b[110;5:1u"), { consume: true });
+	assert.match(f.overlay().render(100).join("\n"), /Digits: select/);
 	f.overlay().handleInput("PR");
 	f.overlay().handleInput("1");
 	await nextTick();
