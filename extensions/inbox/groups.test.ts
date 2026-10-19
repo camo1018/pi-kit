@@ -89,6 +89,22 @@ test("stale default ids safely resolve to Ungrouped", (t) => {
 	assert.throws(() => groups.load(), /Invalid default group/);
 });
 
+test("layout preference persists across stores", async (t) => {
+	const groups = fixture(t);
+	assert.equal(groups.load().layout, undefined);
+	await groups.setLayout("groups");
+	assert.equal(groups.load().layout, "groups");
+	await groups.setLayout("flat");
+	assert.equal(groups.load().layout, "flat");
+	// The layout survives unrelated group mutations.
+	await groups.create("Reviews");
+	assert.equal(groups.load().layout, "flat");
+	writeFileSync(groups.file, JSON.stringify({
+		version: 1, groups: [], sessions: {}, layout: "sectioned",
+	}));
+	assert.throws(() => groups.load(), /Invalid layout/);
+});
+
 test("templates retain their contents when disabled", async (t) => {
 	const groups = fixture(t);
 	const a = await groups.create("Reviews");

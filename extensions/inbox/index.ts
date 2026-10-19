@@ -159,6 +159,16 @@ function groupLayout(): "flat" | "groups" {
 		? "groups" : "flat";
 }
 
+// Seed this window from the persisted choice once, so new pi sessions and
+// new windows start where you left off. Later toggles stay window-local in
+// memory (so two windows can diverge mid-run) but are persisted for next time.
+try {
+	(globalThis as any)[GROUP_LAYOUT_KEY] =
+		readGroups().layout === "groups" ? "groups" : "flat";
+} catch {
+	// A broken group store defaults to flat; the selector reports the error.
+}
+
 function readGroups() {
 	try {
 		return inboxGroups.load();
@@ -1322,9 +1332,20 @@ class InboxComponent {
 		}
 		const next = groupLayout() === "flat" ? "groups" : "flat";
 		(globalThis as any)[GROUP_LAYOUT_KEY] = next;
+		let saved = true;
+		try {
+			// Persist so new windows and future pi sessions keep the choice.
+			// A failed write leaves this window on the new layout anyway.
+			inboxGroups.setLayout(next);
+		} catch {
+			saved = false;
+		}
 		this.scroll = 0;
 		this.rebuild();
-		this.say(next === "groups" ? "Grouped by group" : "Flat session list");
+		this.say(
+			next === "groups" ? "Grouped by group" : "Flat session list",
+			+ (saved ? "" : " (not saved: groups busy in another window)"),
+		);
 	}
 
 	private togglePin(row: Row) {

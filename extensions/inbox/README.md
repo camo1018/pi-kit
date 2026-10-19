@@ -184,8 +184,11 @@ within each group; All and Filtered keep their existing activity ordering.
 Headers are not selectable: navigation, opening, pinning and moving still
 operate on sessions, and switching layouts preserves the selected session.
 
-The layout choice is window-local and survives closing/reopening the inbox,
-session switches and `/reload`. A new window starts flat. Named-group and
+The layout choice survives closing/reopening the inbox, session switches
+and `/reload`, and is persisted in `inbox-groups.json` so new windows and
+future pi sessions start on your chosen layout. While a window is open,
+toggles stay window-local in memory (two windows can diverge until one
+reloads). Named-group and
 Ungrouped filters omit redundant group headers; returning to All groups
 restores your layout choice. In search/rename, typing s remains ordinary text.
 This changes presentation only, not membership or the new-agent destination.
@@ -283,7 +286,8 @@ Escape closes the suggestion menu without cancelling your edit. Saving stores
 the text literally: commands and skill bodies are not executed or expanded while
 editing. Normal prompt/skill processing applies when the template is used.
 
-Definitions, templates and session memberships live together in
+Definitions, templates, session memberships and the All-groups layout
+preference live together in
 `<agent-dir>/inbox-groups.json` (normally `~/.pi/agent/inbox-groups.json`).
 Writes are locked across windows and atomically replaced; older inbox extensions
 do not touch this separate file. A group deleted in another window becomes
@@ -412,7 +416,7 @@ The preview pane under the list shows the dir, created/updated/pinned/archived t
 ## How it works
 
 - **Pin, archive, filter-override, and scroll-bookmark state**: `~/.pi/agent/inbox.json`, keyed by session id. Every Pi process re-reads it before writing, so they don't overwrite each other.
-- **Groups and templates**: `<agent-dir>/inbox-groups.json`, separate from session transcripts and legacy inbox metadata. Group views are window-local.
+- **Groups and templates**: `<agent-dir>/inbox-groups.json`, separate from session transcripts and legacy inbox metadata. Group views are window-local; the All-groups layout preference is persisted here and restored by new windows.
 - **Filter rules**: `~/.pi/agent/inbox-filters.json`, matched against each session's `SessionInfo` on every refresh and cached by file mtime.
 - **Live status**: each Pi process writes `~/.pi/agent/inbox-live/<pid>.json` with its session and `working`/`idle` state. It updates on `session_start`, `agent_start` and `agent_settled`, and deletes the file on shutdown. Files for dead PIDs are pruned when the inbox reads them.
 - **Session status**: parsed from the tail of each session `.jsonl`: the last message's role and `stopReason`. Results are cached by file mtime and size.
