@@ -3569,7 +3569,7 @@ export default function (pi: ExtensionAPI) {
 	/** The session this interactive window is showing (unset in background-agent subprocesses). */
 	let viewing: string | undefined;
 
-	pi.on("session_start", async (_e, ctx) => {
+	pi.on("session_start", async (e, ctx) => {
 		writeLive(ctx, "idle");
 		// Background agent: persist a `--model x:level` override pi applied but didn't record, so the
 		// next run / any window opening this session doesn't restore a stale level (e.g. `off`).
@@ -3598,6 +3598,25 @@ export default function (pi: ExtensionAPI) {
 		if (isVisiting()) {
 			const tui = activeInboxTui(ctx);
 			if (tui) closeVisit(tui);
+		}
+		// A fork (/fork, /clone, navigate-and-fork) starts from a copy of this session, so it
+		// lands in the same group. Fires only on pi's "fork" reason: /resume fires "resume",
+		// and switching to an unrelated session must never steal the original's membership.
+		// The source id comes from the previous session file's header (this session's own id
+		// is already the fork's). Best effort: a busy group store just leaves it Ungrouped.
+		if (e?.reason === "fork" && typeof e.previousSessionFile === "string") {
+			try {
+				const header = readSessionHeaderLine(e.previousSessionFile);
+				if (header) {
+					const group = sessionGroup(readGroups(), header.id);
+					if (group) {
+						await inboxGroups.assign(ctx.sessionManager.getSessionId(), group.id);
+						refreshFooter(ctx);
+					}
+				}
+			} catch {
+				// best effort — the fork still works, just Ungrouped
+			}
 		}
 		showModeWidget(ctx);
 		// Orchestrator: whenever the window lands on a blank session (startup, hand-back, /new,
@@ -4911,8 +4930,13 @@ export default function (pi: ExtensionAPI) {
 			updateMeta(cloneId, (m) => {
 				m.clonedAt = Date.now();
 			});
+			// The clone inherits the original's group. This switch fires session_start with
+			// reason "resume" (not "fork"), where native fork inheritance can't see it.
+			const sourceId = ctx.sessionManager.getSessionId();
+			const group = sessionGroup(readGroups(), sourceId);
+			if (group) await inboxGroups.assign(cloneId, group.id);
 		} catch {
-			// best effort — only the status badge is affected
+			// best effort — only the status badge and the clone's group are affected
 		}
 		await ctx.switchSession(cloned, {
 			withSession: async (c) => {

@@ -131,6 +131,7 @@ Orchestrator mode turns the window you're in into a full-screen control panel fo
   - `ctrl+shift+s` (or `/stop`) stops the background run and clears its queue. esc only interrupts runs in this window.
   - `/compact` and `/tree` are refused while the background run is going, because they would write to the session at the same time. They work normally once it's idle.
   - `/fork` and `/clone` work mid-run, because they only create a new session. `/clone` copies the session from disk up to the agent's last completed step, not the on-screen snapshot. The step in flight (an unanswered tool call or a prompt still being worked on) is left out. The background run carries on in the original session. The clone is listed as `◆ your turn` (not `● working`/`⚠ stalled`) until it has activity of its own: its tail ends at a tool result, but nothing is running on it.
+  - A fork or clone lands in the same group as the session it came from (and stays Ungrouped when the original has no group). Switching to an unrelated session with `/resume` never inherits anything.
   - Model changes (`ctrl+p`, `ctrl+l`, `/model`, `shift+tab`) apply to the next background run.
   - While visiting with a taken-over main, the normal model picker (`ctrl+l` / `/model`), model cycling (`ctrl+p` / `ctrl+shift+p`), and thinking controls (`shift+tab` / `/thinking`) target the visited session only. The footer reflects the choice immediately. If the agent is busy, the choice is saved for its next run without interrupting it or writing to its active transcript. The main's model and thinking level stay unchanged; cancelling a picker changes neither session.
 - **Take over:** `t` on a session (or `/takeover` from an attached session) makes it run here, like plain pi: streaming, esc to interrupt, steering, every command. Only a taken-over session gets a mode banner: `Orchestrator - taken over`. Attached and visited sessions use their normal UI without an orchestrator banner. If its background run is still going, it takes over automatically when that run finishes.
@@ -164,6 +165,9 @@ Each session belongs to **one optional group**. Ungrouped is the default.
 Groups are independent of project directories and the Inbox / Archived / All /
 Filtered tabs. The group row above the session list shows the current scope;
 tab counts and full-text search are scoped to that group too.
+
+A fork or clone of a session joins the original's group; a new agent's group
+follows the destination picked for it (see the default group below).
 
 Open the group selector with **g** inside the inbox, or `/inbox groups`.
 Ctrl+G remains an inbox alias and the shortcut while composing new prompts;

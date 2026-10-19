@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, mock, test, type TestContext } from "node:test";
@@ -227,6 +233,8 @@ async function setup(t: TestContext, takenOver = true) {
 		},
 		isProjectTrusted: () => false,
 		isIdle: () => false,
+		// Orchestrator clone (cloneLatest) lands here; tests can capture the target.
+		switchSession: mock.fn(async () => ({ cancelled: false })),
 	} as unknown as ExtensionContext;
 
 	async function emit(name: string, event: any = {}) {
@@ -963,7 +971,11 @@ test("pins-first group layout preserves selection", async (t) => {
 	assert.equal(f.list.state.selectedId, selected);
 	assert.deepEqual(sectionLabels(f.list), ["★ PINNED (1)", "INBOX (3)"]);
 	assert.deepEqual(files.map((file) => readFileSync(file, "utf8")), before);
-	assert.equal(readFileSync(f.groups.file, "utf8"), groupsBefore);
+	// Layout toggles legitimately persist to inbox-groups.json; membership must not move.
+	assert.deepEqual(
+		JSON.parse(readFileSync(f.groups.file, "utf8")).sessions,
+		JSON.parse(groupsBefore).sessions,
+	);
 	closeList(f.list);
 	await f.done;
 });
@@ -1302,6 +1314,104 @@ test("membership is saved before starting a new agent", async (t) => {
 	assert.deepEqual(agent.pending, ["review URL"]);
 	assert.equal((globalThis as any)[Symbol.for("pi.inbox.reply-target")],
 		undefined);
+});
+
+test("a native fork lands in the original session's group", async (t) => {
+	const f = await setup(t);
+	const groups = new InboxGroups(dir);
+	const group = await groups.create("Reviews");
+	const sourceId = f.main.getSessionId();
+	await groups.assign(sourceId, group.id);
+	// pi's fork(): createBranchedSession re-points the LIVE SessionManager at the new
+	// file (the on-screen session becomes the fork), then session_start fires with
+	// reason "fork" and previousSessionFile = the source file.
+	const sourceFile = f.main.getSessionFile()!;
+	f.main.createBranchedSession(f.main.getLeafId()!);
+	assert.notEqual(f.main.getSessionFile(), sourceFile);
+	assert.notEqual(f.main.getSessionId(), sourceId);
+	await f.emit("session_start", {
+		reason: "fork",
+		previousSessionFile: sourceFile,
+	});
+	assert.equal(groups.load().sessions[f.main.getSessionId()], group.id);
+	// The source keeps its membership; the fork is a separate member.
+	assert.equal(groups.load().sessions[sourceId], group.id);
+});
+
+test("a fork from an ungrouped session stays Ungrouped", async (t) => {
+	const f = await setup(t);
+	const groups = new InboxGroups(dir);
+	const reviews = await groups.create("Reviews");
+	await f.emit("session_start", {
+		reason: "fork",
+		previousSessionFile: f.main.getSessionFile(),
+	});
+	assert.equal(groups.load().sessions[f.main.getSessionId()], undefined);
+	// And a plain resume never inherits: an unrelated session keeps its group.
+	const other = SessionManager.create(dir);
+	other.appendMessage({ role: "user", content: "other", timestamp: 3 });
+	await groups.assign(other.getSessionId(), reviews.id);
+	await f.emit("session_start", {
+		reason: "resume",
+		previousSessionFile: other.getSessionFile(),
+	});
+	assert.equal(groups.load().sessions[f.main.getSessionId()], undefined);
+	assert.equal(groups.load().sessions[other.getSessionId()], reviews.id);
+});
+
+test("a busy mid-run clone lands in the original session's group", async (t) => {
+	const f = await setup(t);
+	const groups = new InboxGroups(dir);
+	const group = await groups.create("Reviews");
+	// The attached session (here: the fixture's main) needs a completed step:
+	// assistant tool call answered by a tool result, so the clone has a leaf.
+	const main = f.main;
+	main.appendMessage({
+		role: "assistant",
+		content: [{ type: "toolCall", id: "call-1", name: "read", arguments: {} }],
+		api: "openai-responses", provider: "test", model: "alpha",
+		usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+		stopReason: "toolUse", timestamp: 4,
+	});
+	main.appendMessage({
+		role: "toolResult", toolCallId: "call-1", toolName: "read",
+		content: [{ type: "text", text: "ok" }], isError: false, timestamp: 5,
+	});
+	await groups.assign(main.getSessionId(), group.id);
+	const before = readFileSync(main.getSessionFile()!, "utf8");
+	await f.commands.get("orchestrator").handler("clone", f.ctx);
+	const clone = (f.ctx.switchSession as any).mock.calls.at(-1)?.arguments?.[0] as string;
+	assert.match(clone, /\.jsonl$/);
+	assert.ok(existsSync(clone), "the clone session file should exist");
+	assert.notEqual(clone, main.getSessionFile());
+	const cloneId = SessionManager.open(clone).getSessionId();
+	assert.notEqual(cloneId, main.getSessionId());
+	assert.equal(groups.load().sessions[cloneId], group.id);
+	// Cloning must not disturb the original session file.
+	assert.equal(readFileSync(main.getSessionFile()!, "utf8"), before);
+});
+
+test("a clone from an ungrouped session stays Ungrouped", async (t) => {
+	const f = await setup(t);
+	const groups = new InboxGroups(dir);
+	await groups.create("Reviews");
+	const main = f.main;
+	main.appendMessage({
+		role: "assistant",
+		content: [{ type: "toolCall", id: "call-1", name: "read", arguments: {} }],
+		api: "openai-responses", provider: "test", model: "alpha",
+		usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+		stopReason: "toolUse", timestamp: 4,
+	});
+	main.appendMessage({
+		role: "toolResult", toolCallId: "call-1", toolName: "read",
+		content: [{ type: "text", text: "ok" }], isError: false, timestamp: 5,
+	});
+	await f.commands.get("orchestrator").handler("clone", f.ctx);
+	const clone = (f.ctx.switchSession as any).mock.calls.at(-1)?.arguments?.[0] as string;
+	assert.ok(existsSync(clone), "the clone session file should exist");
+	const cloneId = SessionManager.open(clone).getSessionId();
+	assert.equal(groups.load().sessions[cloneId], undefined);
 });
 
 test("deleted destinations preserve the draft and start no agent", async (t) => {
