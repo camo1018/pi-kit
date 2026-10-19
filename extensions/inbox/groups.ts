@@ -16,6 +16,8 @@ export interface GroupStore {
 	sessions: Record<string, string>;
 	/** Persistent fallback used when viewing All groups. */
 	defaultGroupId?: string;
+	/** Persisted All-groups list layout: grouped sections ("groups") or flat ("flat"). */
+	layout?: "flat" | "groups";
 }
 
 export type GroupScope = "all" | "ungrouped" | string;
@@ -109,6 +111,10 @@ export class InboxGroups {
 		if (data.defaultGroupId !== undefined &&
 			(typeof data.defaultGroupId !== "string" || !data.defaultGroupId)) {
 			throw new Error("Invalid default group in inbox-groups.json");
+		}
+		if (data.layout !== undefined &&
+			data.layout !== "flat" && data.layout !== "groups") {
+			throw new Error("Invalid layout in inbox-groups.json");
 		}
 		// Older windows may delete a group without clearing its default id.
 		// defaultGroup() treats a stale id as Ungrouped rather than failing.
@@ -226,6 +232,12 @@ export class InboxGroups {
 			const group = this.required(store, id);
 			group.template = template;
 			group.templateEnabled = enabled;
+		});
+	}
+
+	setLayout(layout: "flat" | "groups") {
+		return this.mutate((store) => {
+			store.layout = layout;
 		});
 	}
 
