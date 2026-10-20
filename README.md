@@ -82,6 +82,7 @@ For a cloned install, `git pull` is equivalent to `pi update --extension`.
 | `voice/` | Local voice dictation via sox + whisper.cpp (`/voice`, `/voice check`). macOS |
 | `notify/` | Sound + macOS notification when a turn finishes (`/notify`, `~/.pi/agent/notify.json`) |
 | `rename-chat/` | `rename-chat` tool so the agent can title sessions |
+| `command-case/` | Slash commands ignore caps-lock casing (`/RELOAD` behaves as `/reload`); args keep their casing
 | `inline-skills/` | `$skill` inline skill references |
 | `session-mention/` | Reference another saved session with `@[id]`; autocomplete shows titles but inserts stable ids, and bounded escaped transcripts expand only in request-time context. [docs](extensions/session-mention/README.md) |
 | `md-fence-render/` | Render ```` ```md ```` blocks as Markdown; `┌─ lang` / `└─` markers instead of ```` ``` ```` fences on code; copy-safe code block prompt rules. ⚠️ [internals](extensions/md-fence-render/README.md) |
