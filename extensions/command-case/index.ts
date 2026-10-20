@@ -45,7 +45,7 @@
  */
 
 import { CustomEditor } from "@earendil-works/pi-coding-agent";
-import type { ExtensionAPI, ExtensionContext, SlashCommandInfo } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 
 /**
@@ -89,26 +89,39 @@ const BUILTIN_COMMANDS = new Set([
 let canonical: Map<string, string> | undefined;
 let getCommands: (() => SlashCommandInfo[]) | undefined;
 
-function refreshCommands(ctx: ExtensionContext): void {
-	getCommands = () => ctx.getCommands();
+function bindCommands(api: ExtensionAPI): void {
+	// getCommands() lives on the ExtensionAPI (pi) object, not on the
+	// event ctx. Fail-soft: if the API is missing or throws, only
+	// builtin commands canonicalize and everything else passes through.
+	try {
+		const fn = (api as any).getCommands?.bind(api);
+		if (typeof fn === "function") getCommands = fn;
+	} catch {
+		// keep previous binding or undefined
+	}
 	canonical = undefined; // invalidate; rebuilt lazily
 }
 
 /**
  * Return the canonical form of a command name, or undefined when no
  * command (builtin, extension, prompt template, or skill) matches the
- * lowercased name.
+ * lowercased name. Fail-soft: a throwing getCommands() leaves the
+ * builtin set intact.
  */
 function canonicalName(name: string): string | undefined {
 	if (canonical === undefined) {
 		canonical = new Map<string, string>();
 		for (const name of BUILTIN_COMMANDS) canonical.set(name, name);
 		if (getCommands) {
-			for (const command of getCommands()) {
-				// First registration wins, matching pi's dispatch order.
-				if (!canonical.has(command.name.toLowerCase())) {
-					canonical.set(command.name.toLowerCase(), command.name);
+			try {
+				for (const command of getCommands()) {
+					// First registration wins, matching pi's dispatch order.
+					if (!canonical.has(command.name.toLowerCase())) {
+						canonical.set(command.name.toLowerCase(), command.name);
+					}
 				}
+			} catch {
+				// fail-soft: builtins still canonicalize
 			}
 		}
 	}
@@ -188,7 +201,7 @@ export default function commandCase(pi: ExtensionAPI) {
 	registerLoadedExtension("command-case");
 	pi.on("session_start", (_event, ctx) => {
 		if (ctx.mode !== "tui") return;
-		refreshCommands(ctx);
+		bindCommands(pi);
 		ctx.ui.setEditorComponent((tui, theme, keybindings) =>
 			new CaseInsensitiveCommandEditor(tui, theme, keybindings, { embedWorkingStatus: true }),
 		);
