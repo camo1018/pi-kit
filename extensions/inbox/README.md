@@ -43,7 +43,8 @@ Source: `~/Code/pi-kit/extensions/inbox/index.ts` (background agents: `~/Code/pi
 | `ctrl+g` | Choose a new agent's destination or move the session on screen |
 | `b` | Move the selected session into a group or Ungrouped, without stopping it |
 | `s` | All groups: toggle flat list / grouped sections |
-| `f` | Choose the persistent new-agent default group; Ungrouped clears it |
+| `f` | One-off: pick the group the next new agent goes to (overrides the default once; see [Groups](#groups-and-prompt-templates)) |
+| `F` | Choose the persistent new-agent default group; Ungrouped clears it |
 | `ctrl+w` | (while typing a new agent's prompt) pick a different directory for it — a live path picker with suggestions as you type (see [Directories](#directories)) |
 | `d` | Orchestrator mode: move the selected session to a different directory (see [Directories](#directories)) |
 | `c` | Cancel a running background agent |
@@ -169,6 +170,15 @@ tab counts and full-text search are scoped to that group too.
 A fork or clone of a session joins the original's group; a new agent's group
 follows the destination picked for it (see the default group below).
 
+**f** in the inbox list pre-picks a one-off group for the *next* new agent —
+like the persistent default (F), but spent once: it applies to the next agent
+you actually start (n, N, or typing at orchestrator home) and then clears
+itself. Choosing Ungrouped forces the next agent Ungrouped even with a default
+set. The pending pick shows as `next: <group>` on the group line, and it
+survives a cancelled compose — only a started agent consumes it. Priority is:
+explicit Ctrl+G choice while composing, then the f one-off, then the selected
+group view / Ungrouped, then the persistent default.
+
 Open the group selector with **g** inside the inbox, or `/inbox groups`.
 Ctrl+G remains an inbox alias and the shortcut while composing new prompts;
 plain g in editors, search and rename stays ordinary text.
@@ -251,17 +261,18 @@ existing replies never receive templates.
 ### Default group for new agents
 
 The inbox title shows **default: <group>** beside orchestrator. The hint
-**f to change default group** sits on the existing group/layout line instead of
-taking another header row.
-Press **f** to select the default, or **Ctrl+F** on a highlighted group in the
+**f next group · F default group** sits on the existing group/layout line
+instead of taking another header row.
+Press **F** to select the default, or **Ctrl+F** on a highlighted group in the
 regular group picker to set it without leaving that screen. Select Ungrouped to
 clear it. The picker marks the current default; All groups cannot be a default
 because it is a view, not a destination.
 
 This preference is saved in `inbox-groups.json` and shared across windows and
-restarts. Priority is: explicit Ctrl+G composition choice, then the selected
-named-group/Ungrouped filter, then the default when viewing All groups. The
-default group's enabled template prefills new agents normally. Changing the
+restarts. Priority is: explicit Ctrl+G composition choice, then the f one-off
+pick, then the selected named-group/Ungrouped filter, then the default when
+viewing All groups. The default group's enabled template prefills new agents
+normally (the F pick's group template prefills too). Changing the
 default does not move existing sessions or retarget a prompt already being
 composed. Deleting the default group clears it safely.
 
