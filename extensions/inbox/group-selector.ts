@@ -45,6 +45,8 @@ export function isGroupShortcut(data: string) {
 	return keys.some((key) => matchesKey(data, key));
 }
 
+export type GroupPickerMode = "view" | "assign" | "default" | "next";
+
 /** Search, selection and template management share one overlay. */
 export class GroupSelector implements Focusable {
 	private input: Input;
@@ -71,7 +73,7 @@ export class GroupSelector implements Focusable {
 		private kb: KeybindingsManager,
 		private done: (result: GroupSelection) => void,
 		groups: InboxGroup[],
-		private mode: "view" | "assign" | "default",
+		private mode: GroupPickerMode,
 		private templates: GroupActions,
 		initial: GroupScope = "ungrouped",
 		private defaultId?: string,
@@ -333,7 +335,9 @@ export class GroupSelector implements Focusable {
 		const lines = [
 			th.bold(th.fg("accent", this.mode === "view"
 				? "Inbox group view" : this.mode === "default"
-					? "Default group for new agents"
+				? "Default group for new agents"
+				: this.mode === "next"
+					? "Group for the next new agent (one-off)"
 					: "Group for this session / new agent")),
 			...this.input.render(Math.max(1, width)),
 			th.fg("dim", this.digitsAsText

@@ -261,6 +261,7 @@ async function setup(t: TestContext, takenOver = true) {
 		delete globals[Symbol.for("pi.inbox.agentChild")];
 		delete globals[modeKey];
 		delete globals[Symbol.for("pi.inbox.reply-target")];
+		delete globals[Symbol.for("pi.inbox.next-agent-group")];
 		delete globals[Symbol.for("pi.inbox.group-view")];
 		delete globals[Symbol.for("pi.inbox.group-layout")];
 		registry().agents.clear();
@@ -1081,11 +1082,11 @@ test("default picker updates the header and new-agent template", async (t) => {
 	const { list, done } = await f.openInbox();
 	const initial = list.render(120);
 	assert.match(initial[0], /orchestrator.*default: Ungrouped/);
-	assert.match(initial[2], /Group: All groups.*f to change default group/);
+	assert.match(initial[2], /Group: All groups.*f next group · F default group/);
 	assert.match(initial[3], /^├/);
 	assert.equal(initial.some((line: string) =>
 		line.includes("New-agent default:")), false);
-	list.handleInput("f");
+	list.handleInput("F");
 	await nextTick();
 	assert.match(f.overlay().render(100).join("\n"), /Default group for/);
 	f.overlay().handleInput("Rev");
@@ -1129,6 +1130,50 @@ test("view and one-shot Ungrouped choices override the default", async (t) => {
 	next.list.handleInput("n");
 	await next.done;
 	assert.equal(target().groupId, undefined);
+});
+
+test("f pre-picks a one-off group for the next new agent", async (t) => {
+	const f = await setup(t);
+	const groups = new InboxGroups(dir);
+	const reviews = await groups.create("Reviews");
+	const bugs = await groups.create("Bugs");
+	// A persistent default exists: the one-off must beat it.
+	await groups.setDefaultGroup(bugs.id);
+	const { done } = await f.openInbox();
+	const list = f.overlay();
+	list.handleInput("f");
+	await nextTick();
+	const picker = f.overlay();
+	assert.match(picker.render(100).join("\n"), /Group for the next new agent/);
+	picker.handleInput("Rev");
+	picker.handleInput("1");
+	await nextTick();
+	// The loop reopened the list; the pending pick shows on the group line.
+	const reopened = f.overlay();
+	assert.match(reopened.render(120)[2], /next: Reviews/);
+	reopened.handleInput("n");
+	await done;
+	const target = (globalThis as any)[Symbol.for("pi.inbox.reply-target")];
+	assert.equal(target.groupId, reviews.id);
+});
+
+test("f Ungrouped forces the next agent out of any default", async (t) => {
+	const f = await setup(t);
+	const groups = new InboxGroups(dir);
+	const bugs = await groups.create("Bugs");
+	await groups.setDefaultGroup(bugs.id);
+	const { done } = await f.openInbox();
+	const list = f.overlay();
+	list.handleInput("f");
+	await nextTick();
+	const picker = f.overlay();
+	picker.handleInput("U");
+	picker.handleInput("1");
+	await nextTick();
+	f.overlay().handleInput("n");
+	await done;
+	const target = (globalThis as any)[Symbol.for("pi.inbox.reply-target")];
+	assert.equal(target.groupId, undefined);
 });
 
 test("template editor shares slash and inline-skill completion", async (t) => {

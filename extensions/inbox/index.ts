@@ -52,7 +52,7 @@ import { randomUUID } from "node:crypto";
 import { sectionByGroup } from "./group-layout.ts";
 import { promptAutocomplete } from "../../lib/prompt-autocomplete.ts";
 import {
-	GroupSelector, isGroupShortcut, type GroupSelection,
+	GroupSelector, isGroupShortcut, type GroupPickerMode, type GroupSelection,
 } from "./group-selector.ts";
 import {
 	defaultGroup,
@@ -1147,6 +1147,7 @@ type InboxResult =
 	| { action: "movedir"; row: Row }
 	| { action: "groupView" }
 	| { action: "defaultGroup" }
+	| { action: "nextGroup" }
 	| { action: "movegroup"; row: Row }
 	| { action: "home" }
 	| { action: "exitMode" }
@@ -1496,6 +1497,8 @@ class InboxComponent {
 		if (ch === "g" || matchesKey(data, "ctrl+g")) {
 			if (!isKeyRepeat(data)) this.done({ action: "groupView" });
 		} else if (ch === "f") {
+			if (!isKeyRepeat(data)) this.done({ action: "nextGroup" });
+		} else if (ch === "F") {
 			if (!isKeyRepeat(data)) this.done({ action: "defaultGroup" });
 		} else if (ch === "b") {
 			if (row) this.done({ action: "movegroup", row });
@@ -1671,8 +1674,14 @@ class InboxComponent {
 			? ` · Layout: ${groupLayout() === "groups" ? "by group" : "flat"}` +
 				" · s toggle"
 			: "";
-		out.push(line(` Group: ${groupLabel(this.groups, scope)}${layout}` +
-			" · f to change default group · g groups · b move"));
+		// F one-off: shows only while a pre-pick is pending, right next to the default it overrides.
+		const preset = getNextAgentGroup();
+		const nextPick = preset
+			? ` · next: ${th.bold(th.fg("warning",
+				groupLabel(this.groups, preset === "all" ? "all" : preset)))}`
+			: "";
+		out.push(line(` Group: ${groupLabel(this.groups, scope)}${layout}${nextPick}` +
+			" · f next group · F default group · g groups · b move"));
 		out.push(sep());
 
 		// list
@@ -2513,6 +2522,8 @@ function getReplyTarget(): ReplyTarget | undefined {
 function setReplyTarget(t: ReplyTarget | undefined, ctx?: ExtensionContext) {
 	(globalThis as any)[REPLY_KEY] = t;
 	// A pre-name / pre-dir only ever belong to the new agent being typed; dropping the target drops them.
+	// (The F pre-group is NOT dropped here: it belongs to the next agent actually started, so it
+	// survives a cancelled compose and is consumed at spawn.)
 	if (!t) {
 		setNextAgentName(undefined);
 		setNextAgentDir(undefined);
@@ -2534,6 +2545,25 @@ function prefillNewAgent(
 	const untouched = !draft || draft === target.templateText;
 	if (next !== draft) ctx.ui.setEditorText(next);
 	target.templateText = untouched ? template : undefined;
+}
+
+/** Group for the next new background agent, set with F in the inbox list (one-off). */
+const NEXT_GROUP_KEY = Symbol.for("pi.inbox.next-agent-group");
+function getNextAgentGroup(): GroupScope | undefined {
+	return (globalThis as any)[NEXT_GROUP_KEY];
+}
+function setNextAgentGroup(scope: GroupScope | undefined) {
+	(globalThis as any)[NEXT_GROUP_KEY] = scope;
+}
+
+/** Group a new agent will join: the f one-off pre-pick wins, then the view/default rules. */
+function nextAgentTargetGroup(): string | undefined {
+	const preset = getNextAgentGroup();
+	if (preset === "ungrouped") return undefined; // forced Ungrouped, overriding any default
+	if (!preset || preset === "all") return newAgentGroup();
+	return readGroups().groups.some((group) => group.id === preset)
+		? preset
+		: newAgentGroup(); // a deleted group mustn't block the next agent
 }
 
 /** Name for the next new background agent, set with ctrl+r before sending its first prompt. */
@@ -3444,7 +3474,7 @@ export default function (pi: ExtensionAPI) {
 
 	async function pickGroup(
 		ctx: ExtensionContext,
-		mode: "view" | "assign" | "default",
+		mode: GroupPickerMode,
 		initial: GroupScope,
 	): Promise<GroupScope | undefined> {
 		if (ctx.mode !== "tui") return undefined;
@@ -3533,6 +3563,19 @@ export default function (pi: ExtensionAPI) {
 		} catch (error) {
 			ctx.ui.notify(`Default group: ${String(error)}`, "error");
 		}
+	}
+
+	/** One-off: the group the NEXT new agent joins (F in the inbox list). */
+	async function chooseNextGroup(ctx: ExtensionContext) {
+		const preset = getNextAgentGroup();
+		const initial = preset ?? (newAgentGroup() ?? "ungrouped");
+		const scope = await pickGroup(ctx, "next", initial);
+		if (scope === undefined) return;
+		setNextAgentGroup(scope);
+		if (scope === "ungrouped")
+			ctx.ui.notify("Next new agent will be Ungrouped (one-off)", "info");
+		else
+			ctx.ui.notify(`Next new agent goes to ${groupLabel(readGroups(), scope)} (one-off)`, "info");
 	}
 
 	async function moveToGroup(ctx: ExtensionContext, id: string) {
@@ -4391,6 +4434,11 @@ export default function (pi: ExtensionAPI) {
 				continue;
 			}
 
+			if (result.action === "nextGroup") {
+				await chooseNextGroup(ctx);
+				continue;
+			}
+
 			if (result.action === "movegroup") {
 				await moveToGroup(ctx, result.row.info.id);
 				continue;
@@ -4415,13 +4463,13 @@ export default function (pi: ExtensionAPI) {
 						showLiveStream(ctx);
 					}
 					setReplyTarget({
-						kind: "new", cwd: viewed.cwd, model, groupId: newAgentGroup(),
+						kind: "new", cwd: viewed.cwd, model, groupId: nextAgentTargetGroup(),
 					}, ctx);
 					return;
 				}
 				// No sticky main: retain the existing blank-home compose flow.
 				setReplyTarget({
-					kind: "new", cwd: viewed.cwd, model, groupId: newAgentGroup(),
+						kind: "new", cwd: viewed.cwd, model, groupId: nextAgentTargetGroup(),
 				}, ctx);
 				if (orchestrating() && !isHome(ctx) && !(await goHome(ctx, { reopen: false }))) {
 					setReplyTarget(undefined, ctx);
@@ -5135,7 +5183,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (!t && orchestrating() && isHome(ctx)) t = {
 			kind: "new", cwd: ctx.cwd, model: currentModel(ctx),
-			groupId: newAgentGroup(),
+			groupId: nextAgentTargetGroup(),
 		};
 		// Orchestrator, attached session: the message runs as a background agent on this session, so
 		// you can switch away mid-run. The chat view reloads from disk when the run finishes.
@@ -5189,6 +5237,8 @@ export default function (pi: ExtensionAPI) {
 				id: newId, prompt: text, cwd: preDir ?? t.cwd, model: t.model,
 				title: preName ?? cleanTitle(text).slice(0, 120),
 			});
+			// The agent is started: the f one-off pre-group (if any) is spent.
+			setNextAgentGroup(undefined);
 			// ctrl+r pre-name: the child applies it as its session name (works before the file exists).
 			if (preName) renameAgent(a.id, preName);
 			uiState.view = "inbox";
