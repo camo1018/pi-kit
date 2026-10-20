@@ -12,6 +12,7 @@
       "extensions/plan-mode/index.ts",
       "extensions/inline-skills/index.ts",
       "extensions/notify/index.ts",
+      "extensions/command-case/index.ts",
       "extensions/rename-chat/index.ts",
       "extensions/click-copy/index.ts",
       "extensions/snippet-copy/index.ts",
