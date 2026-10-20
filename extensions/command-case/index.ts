@@ -186,7 +186,7 @@ class CaseInsensitiveCommandEditor extends CustomEditor {
 
 export default function commandCase(pi: ExtensionAPI) {
 	registerLoadedExtension("command-case");
-	pi.on("session_start", (ctx) => {
+	pi.on("session_start", (_event, ctx) => {
 		if (ctx.mode !== "tui") return;
 		refreshCommands(ctx);
 		ctx.ui.setEditorComponent((tui, theme, keybindings) =>

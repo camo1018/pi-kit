@@ -27,7 +27,7 @@ test("canonicalizes builtin commands regardless of casing", () => {
 	const { pi, handlers } = makePi();
 	commandCase(pi);
 	const ctx = makeCtx("tui");
-	handlers.get("session_start")(ctx);
+	handlers.get("session_start")({ type: "session_start", reason: "startup" }, ctx);
 	assert.equal(canonicalizeCommandText("/RELOAD"), "/reload");
 	assert.equal(canonicalizeCommandText("/QUIT"), "/quit");
 	assert.equal(canonicalizeCommandText("/Model"), "/model");
@@ -36,7 +36,7 @@ test("canonicalizes builtin commands regardless of casing", () => {
 test("keeps args untouched", () => {
 	const { pi, handlers } = makePi();
 	commandCase(pi);
-	handlers.get("session_start")(makeCtx("tui"));
+	handlers.get("session_start")({ type: "session_start", reason: "startup" }, makeCtx("tui"));
 	assert.equal(canonicalizeCommandText("/MODEL Sonnet 4"), "/model Sonnet 4");
 	assert.equal(canonicalizeCommandText("/NAME Keep CAPS"), "/name Keep CAPS");
 });
@@ -45,6 +45,7 @@ test("canonicalizes extension, prompt, and skill commands", () => {
 	const { pi, handlers } = makePi();
 	commandCase(pi);
 	handlers.get("session_start")(
+		{ type: "session_start", reason: "startup" },
 		makeCtx("tui", ["MyCommand", "skill:Grafana"]),
 	);
 	assert.equal(canonicalizeCommandText("/MYCOMMAND"), "/MyCommand");
@@ -54,7 +55,7 @@ test("canonicalizes extension, prompt, and skill commands", () => {
 test("passes unknown commands and non-commands through", () => {
 	const { pi, handlers } = makePi();
 	commandCase(pi);
-	handlers.get("session_start")(makeCtx("tui"));
+	handlers.get("session_start")({ type: "session_start", reason: "startup" }, makeCtx("tui"));
 	assert.equal(canonicalizeCommandText("/NOSUCHCOMMAND"), "/NOSUCHCOMMAND");
 	assert.equal(canonicalizeCommandText("hello /reload"), "hello /reload");
 	assert.equal(canonicalizeCommandText("//host/path"), "//host/path");
@@ -65,7 +66,7 @@ test("passes unknown commands and non-commands through", () => {
 test("only rewrites the first line of multi-line input", () => {
 	const { pi, handlers } = makePi();
 	commandCase(pi);
-	handlers.get("session_start")(makeCtx("tui"));
+	handlers.get("session_start")({ type: "session_start", reason: "startup" }, makeCtx("tui"));
 	const input = "/MODEL pick one\nsecond /RELOAD line";
 	assert.equal(
 		canonicalizeCommandText(input),
@@ -81,7 +82,7 @@ test("installs editor only in tui mode", () => {
 	ctx.ui.setEditorComponent = () => {
 		installed = true;
 	};
-	handlers.get("session_start")(ctx);
+	handlers.get("session_start")({ type: "session_start", reason: "startup" }, ctx);
 	assert.ok(installed, "tui mode installs the editor");
 
 	const { handlers: h2 } = makePi();
@@ -92,6 +93,6 @@ test("installs editor only in tui mode", () => {
 	ctx2.ui.setEditorComponent = () => {
 		installed2 = true;
 	};
-	h2.get("session_start")(ctx2);
+	h2.get("session_start")({ type: "session_start", reason: "startup" }, ctx2);
 	assert.ok(!installed2, "non-tui mode does not install the editor");
 });
