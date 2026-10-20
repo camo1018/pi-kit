@@ -8,6 +8,7 @@ function makePi(commands: string[] = [], handlers = new Map<string, any>()) {
 			handlers.set(event, handler);
 		},
 	};
+	if (commands.length > 0) pi.getCommands = () => commands.map((name) => ({ name, source: "extension" }));
 	return { pi, handlers, commands };
 }
 
@@ -42,11 +43,11 @@ test("keeps args untouched", () => {
 });
 
 test("canonicalizes extension, prompt, and skill commands", () => {
-	const { pi, handlers } = makePi();
+	const { pi, handlers } = makePi(["MyCommand", "skill:Grafana"]);
 	commandCase(pi);
 	handlers.get("session_start")(
 		{ type: "session_start", reason: "startup" },
-		makeCtx("tui", ["MyCommand", "skill:Grafana"]),
+		makeCtx("tui"),
 	);
 	assert.equal(canonicalizeCommandText("/MYCOMMAND"), "/MyCommand");
 	assert.equal(canonicalizeCommandText("/SKILL:GRAFANA"), "/skill:Grafana");
@@ -95,4 +96,24 @@ test("installs editor only in tui mode", () => {
 	};
 	h2.get("session_start")({ type: "session_start", reason: "startup" }, ctx2);
 	assert.ok(!installed2, "non-tui mode does not install the editor");
+});
+
+test("fail-soft: missing or throwing getCommands never breaks submit", () => {
+	// pi without getCommands at all (the crash shape)
+	const handlers = new Map<string, any>();
+	const bare: any = { on: (_: string, h: any) => handlers.set("session_start", h) };
+	commandCase(bare);
+	handlers.get("session_start")({ type: "session_start", reason: "startup" }, makeCtx("tui"));
+	assert.equal(canonicalizeCommandText("/RELOAD"), "/reload", "builtins still work");
+	assert.equal(canonicalizeCommandText("/ORPHAN"), "/ORPHAN", "unknown passes through");
+
+	// pi whose getCommands throws
+	const throwing: any = { on: (_: string, h: any) => handlers.set("session_start", h) };
+	throwing.getCommands = () => {
+		throw new Error("boom");
+	};
+	commandCase(throwing);
+	handlers.get("session_start")({ type: "session_start", reason: "startup" }, makeCtx("tui"));
+	assert.equal(canonicalizeCommandText("/RELOAD"), "/reload", "builtins still work");
+	assert.equal(canonicalizeCommandText("/ORPHAN"), "/ORPHAN", "unknown passes through");
 });
