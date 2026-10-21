@@ -55,6 +55,7 @@ import {
 	GroupSelector, isGroupShortcut, type GroupPickerMode, type GroupSelection,
 } from "./group-selector.ts";
 import {
+	countGroupSessions,
 	defaultGroup,
 	emptyGroups,
 	groupLabel,
@@ -3481,6 +3482,17 @@ export default function (pi: ExtensionAPI) {
 		try {
 			for (;;) {
 				const store = inboxGroups.load();
+				const inboxStore = loadStore();
+				const headers = scanHeaders();
+				const allExistingIds = new Set(headers.map((h) => h.id));
+				for (const a of listAgents()) allExistingIds.add(a.id);
+				const activeIds = new Set<string>();
+				for (const id of allExistingIds) {
+					if (!inboxStore.sessions[id]?.archivedAt) activeIds.add(id);
+				}
+				const counts = countGroupSessions(
+					store.groups, store.sessions, activeIds, allExistingIds,
+				);
 				const result = await ctx.ui.custom<GroupSelection>(
 					(tui, theme, kb, done) => {
 						coverImagesUnderOverlays(tui);
@@ -3490,7 +3502,7 @@ export default function (pi: ExtensionAPI) {
 								save: (id, text) => inboxGroups.saveTemplate(id, text),
 								setDefault: (id) => inboxGroups.setDefaultGroup(id),
 								autocomplete: () => promptAutocomplete(ctx.ui),
-							}, initial, defaultGroup(store)?.id,
+							}, initial, defaultGroup(store)?.id, counts,
 						);
 						// Claim scoped Ctrl keys before Pi's global shortcuts
 						// (e.g. thinking toggle and rename-chat) can take them.
