@@ -22,6 +22,11 @@ export interface GroupStore {
 
 export type GroupScope = "all" | "ungrouped" | string;
 
+export interface GroupCounts {
+	active: number;
+	total: number;
+}
+
 export function emptyGroups(): GroupStore {
 	return { version: 1, groups: [], sessions: {} };
 }
@@ -54,6 +59,29 @@ export function groupLabel(store: GroupStore, scope: GroupScope) {
 	if (scope === "all") return "All groups";
 	return store.groups.find((group) => group.id === scope)?.name
 		?? "Ungrouped";
+}
+
+export function countGroupSessions(
+	groups: InboxGroup[],
+	groupSessions: Record<string, string>,
+	activeIds: Set<string>,
+	allExistingIds: Set<string>,
+): Map<string, GroupCounts> {
+	const counts = new Map<string, GroupCounts>();
+	for (const g of groups) {
+		counts.set(g.id, { active: 0, total: 0 });
+	}
+	for (const [sessionId, groupId] of Object.entries(groupSessions)) {
+		const c = counts.get(groupId);
+		if (!c) continue;
+		if (allExistingIds.has(sessionId)) {
+			c.total++;
+			if (activeIds.has(sessionId)) {
+				c.active++;
+			}
+		}
+	}
+	return counts;
 }
 
 /** Only replace an empty draft or the exact, untouched previous prefill. */

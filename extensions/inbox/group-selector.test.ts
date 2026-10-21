@@ -156,7 +156,7 @@ test("Ctrl+F sets and clears the default in the same picker", async () => {
 	await tick();
 	assert.equal(f.defaultId(), "PR reviews");
 	assert.equal(f.result(), "waiting");
-	assert.match(f.ui.render(100).join("\n"), /PR reviews · default/);
+	assert.match(f.ui.render(100).join("\n"), /PR reviews \(0\) · default/);
 	assert.match(f.ui.render(100).join("\n"), /Prefix: PR/);
 	f.ui.handleInput("\x1b[110;5:1u");
 	f.ui.handleInput("\x15");
@@ -170,7 +170,7 @@ test("default mode excludes All groups and shows the current default", () => {
 	const f = selector("default", 30, "Bugs");
 	const rendered = f.ui.render(100).join("\n");
 	assert.match(rendered, /Default group for new agents/);
-	assert.match(rendered, /Bugs · default/);
+	assert.match(rendered, /Bugs \(0\) · default/);
 	assert.doesNotMatch(rendered, /All groups/);
 });
 
@@ -355,4 +355,57 @@ test("selector fits narrow widths and propagates input focus", () => {
 	for (const width of [1, 20, 40, 80]) {
 		assert.ok(f.ui.render(width).every((line) => visibleWidth(line) <= width));
 	}
+});
+
+test("left and right arrows page skip like page up and page down", () => {
+	const f = selector("view", 18);
+	assert.match(f.ui.render(100).join("\n"), /Page 1\/3/);
+	f.ui.handleInput("\x1b[C"); // Right arrow
+	assert.match(f.ui.render(100).join("\n"), /Page 2\/3/);
+	f.ui.handleInput("\x1b[C"); // Right arrow again
+	assert.match(f.ui.render(100).join("\n"), /Page 3\/3/);
+	f.ui.handleInput("\x1b[D"); // Left arrow
+	assert.match(f.ui.render(100).join("\n"), /Page 2\/3/);
+});
+
+test("Tab toggles count mode between active and all", () => {
+	const counts = new Map([
+		["PR reviews", { active: 3, total: 8 }],
+		["PR2", { active: 0, total: 2 }],
+		["2026", { active: 1, total: 1 }],
+		["Bugs", { active: 0, total: 0 }],
+	]);
+	let result: GroupSelection | "waiting" = "waiting";
+	const theme = {
+		fg: (_color: string, text: string) => text,
+		bg: (_color: string, text: string) => text,
+		bold: (text: string) => text,
+	} as Theme;
+	const ui = new GroupSelector(
+		{ terminal: { rows: 30 }, requestRender() {} } as unknown as TUI,
+		theme, getKeybindings(), (value) => { result = value; }, groups, "view",
+		{
+			async toggle(id) { return groups.find((g) => g.id === id)!; },
+			async save(id, text) { return groups.find((g) => g.id === id)!; },
+			async setDefault(id) { return id; },
+		}, undefined, undefined, counts,
+	);
+	// Default active mode
+	let rendered = ui.render(100).join("\n");
+	assert.match(rendered, /PR reviews \(3\)/);
+	assert.match(rendered, /PR2 \(0\)/);
+	assert.match(rendered, /Tab counts: active/);
+
+	// Toggle to all
+	ui.handleInput("\t");
+	rendered = ui.render(100).join("\n");
+	assert.match(rendered, /PR reviews \(8\)/);
+	assert.match(rendered, /PR2 \(2\)/);
+	assert.match(rendered, /Tab counts: all/);
+
+	// Toggle back to active
+	ui.handleInput("\t");
+	rendered = ui.render(100).join("\n");
+	assert.match(rendered, /PR reviews \(3\)/);
+	assert.match(rendered, /Tab counts: active/);
 });

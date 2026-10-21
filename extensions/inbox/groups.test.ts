@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import {
-	InboxGroups, defaultGroup, groupLabel, inGroup, newAgentGroupForScope,
+	InboxGroups, countGroupSessions, defaultGroup, groupLabel, inGroup, newAgentGroupForScope,
 	sessionGroup, templateDraft,
 } from "./groups.ts";
 
@@ -192,4 +192,23 @@ test("template prefill never clobbers an edited draft", () => {
 	assert.equal(templateDraft("first", "first", ""), "");
 	assert.equal(templateDraft("first + URL", "first", "second"), "first + URL");
 	assert.equal(templateDraft("existing", undefined, "first"), "existing");
+});
+
+test("countGroupSessions counts active and total sessions accurately", () => {
+	const grps = [
+		{ id: "g1", name: "G1", template: "", templateEnabled: false },
+		{ id: "g2", name: "G2", template: "", templateEnabled: false },
+	];
+	const groupSessions = {
+		s1: "g1",
+		s2: "g1",
+		s3: "g2",
+		sOrphan: "g1", // not in allExistingIds
+	};
+	const allExistingIds = new Set(["s1", "s2", "s3"]);
+	const activeIds = new Set(["s1", "s3"]); // s2 is archived
+
+	const counts = countGroupSessions(grps, groupSessions, activeIds, allExistingIds);
+	assert.deepEqual(counts.get("g1"), { active: 1, total: 2 });
+	assert.deepEqual(counts.get("g2"), { active: 1, total: 1 });
 });

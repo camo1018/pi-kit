@@ -16,7 +16,7 @@ import {
 	type KeybindingsManager,
 	type TUI,
 } from "@earendil-works/pi-tui";
-import type { GroupScope, InboxGroup } from "./groups.ts";
+import type { GroupCounts, GroupScope, InboxGroup } from "./groups.ts";
 
 export type GroupSelection =
 	| { action: "select"; scope: GroupScope }
@@ -45,6 +45,8 @@ export function isGroupShortcut(data: string) {
 	return keys.some((key) => matchesKey(data, key));
 }
 
+export type CountMode = "active" | "all";
+
 export type GroupPickerMode = "view" | "assign" | "default" | "next";
 
 /** Search, selection and template management share one overlay. */
@@ -53,6 +55,7 @@ export class GroupSelector implements Focusable {
 	private choices: Choice[];
 	private selected = 0;
 	private digitsAsText = false;
+	private countMode: CountMode = "active";
 	private editor?: Editor;
 	private editingId?: string;
 	private busy = false;
@@ -77,6 +80,7 @@ export class GroupSelector implements Focusable {
 		private templates: GroupActions,
 		initial: GroupScope = "ungrouped",
 		private defaultId?: string,
+		private counts?: Map<string, GroupCounts>,
 	) {
 		this.input = new Input({ prompt: theme.fg("accent", "Prefix: ") });
 		this.choices = [
@@ -278,10 +282,14 @@ export class GroupSelector implements Focusable {
 			this.selected = Math.max(0, this.selected - 1);
 		} else if (this.kb.matches(data, "tui.select.down")) {
 			this.selected = Math.min(matches.length - 1, this.selected + 1);
-		} else if (this.kb.matches(data, "tui.select.pageUp")) {
+		} else if (matchesKey(data, "left") ||
+			this.kb.matches(data, "tui.select.pageUp")) {
 			this.selected = Math.max(0, this.selected - size);
-		} else if (this.kb.matches(data, "tui.select.pageDown")) {
+		} else if (matchesKey(data, "right") ||
+			this.kb.matches(data, "tui.select.pageDown")) {
 			this.selected = Math.min(matches.length - 1, this.selected + size);
+		} else if (matchesKey(data, "tab")) {
+			this.countMode = this.countMode === "active" ? "all" : "active";
 		} else if (!this.digitsAsText && ch && /^[1-9]$/.test(ch)) {
 			const page = Math.floor(this.selected / size);
 			const choice = matches[page * size + Number(ch) - 1];
@@ -352,15 +360,27 @@ export class GroupSelector implements Focusable {
 				continue;
 			}
 			const selected = page * size + i === this.selected;
+			let name = choice.name;
+			if (choice.group) {
+				const c = this.counts?.get(choice.group.id);
+				const count = this.countMode === "active"
+					? (c?.active ?? 0)
+					: (c?.total ?? 0);
+				name = `${choice.name} (${count})`;
+			}
 			const hint = choice.group?.templateEnabled ? " · template on" : "";
 			const isDefault = choice.scope === (this.defaultId ?? "ungrouped");
 			const marker = isDefault ? " · default" : "";
 			const row = `${selected ? "▶" : " "} ${i + 1} ` +
-				`${choice.name}${hint}${marker}`;
+				`${name}${hint}${marker}`;
 			lines.push(selected ? th.fg("accent", row) : row);
 		}
+		const countHint = this.counts
+			? ` · Tab counts: ${this.countMode === "active" ? "active" : "all"}`
+			: "";
 		lines.push(th.fg("dim",
-			`Page ${page + 1}/${Math.max(1, Math.ceil(matches.length / size))}`));
+			`Page ${page + 1}/${Math.max(1, Math.ceil(matches.length / size))}` +
+			countHint));
 		if (!compact) lines.push("");
 		const group = this.editor ? this.editingGroup() : this.highlightedGroup();
 		const state = group?.templateEnabled ? "enabled" : "disabled";
@@ -378,7 +398,7 @@ export class GroupSelector implements Focusable {
 		if (!compact) {
 			lines.push(th.fg("dim", this.editor
 				? "Tab / Enter complete · Esc closes suggestions first"
-				: "↑↓ / PgUp PgDn · Enter choose · Esc cancel"));
+				: "↑↓ / ←→ / PgUp PgDn · Enter choose · Esc cancel"));
 			lines.push(th.fg("dim", this.editor
 				? "Normal cursor, paste and multiline editor keys work here."
 				: "Ctrl+A create · Ctrl+R rename · Ctrl+D delete · Ctrl+F default"));
