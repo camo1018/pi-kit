@@ -5290,7 +5290,7 @@ export default function (pi: ExtensionAPI) {
 		return { action: "handled" };
 	});
 
-	// Changing the model (ctrl+p, ctrl+l, /model) or thinking level (shift+tab) while a reply is
+	// Changing the model or thinking level (ctrl+shift+e) while a reply is
 	// pending applies to that reply too. Note: it also changes this session's model, as usual.
 	const withLevel = (model: string, level: string | undefined) => `${model.replace(/:[a-z]+$/, "")}${level ? `:${level}` : ""}`;
 	pi.on("model_select", async (e: any, ctx) => {
