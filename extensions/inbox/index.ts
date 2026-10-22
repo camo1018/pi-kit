@@ -1142,7 +1142,7 @@ type InboxResult =
 	| { action: "close" }
 	| { action: "open"; row: Row; takeover?: boolean }
 	| { action: "view"; row: Row }
-	| { action: "new"; pickModel: boolean }
+	| { action: "new"; pickModel: boolean; /** Present when started with G on a row: explicit group join (id undefined = Ungrouped). */ rowGroup?: { id?: string } }
 	| { action: "cancel"; row: Row }
 	| { action: "queue"; row: Row }
 	| { action: "movedir"; row: Row }
@@ -1530,6 +1530,11 @@ class InboxComponent {
 			else this.done({ action: "home" });
 		} else if (ch === "n" || ch === "N") {
 			this.done({ action: "new", pickModel: ch === "N" });
+		} else if (ch === "G") {
+			// New agent that joins the selected session's group (explicit choice: an ungrouped row
+			// means Ungrouped, overriding any f pre-pick or default).
+			if (row)
+				this.done({ action: "new", pickModel: false, rowGroup: { id: sessionGroup(this.groups, row.info.id)?.id } });
 		} else if (ch === "c") {
 			if (row && isRunning(row.bg)) this.done({ action: "cancel", row });
 			else this.say("not a running background agent");
@@ -1864,6 +1869,7 @@ class InboxComponent {
 					k("t", "take over"),
 					k("n", "new agent"),
 					k("N", "new (pick model)"),
+					k("G", "new (in this group)"),
 					k("v", "peek"),
 					...(isRunning(r?.bg) ? [k("c", "cancel")] : []),
 					...(r?.bg?.pending.length ? [k("m", "manage queue")] : []),
@@ -1885,6 +1891,7 @@ class InboxComponent {
 						k("enter", "view/reply"),
 						k("o", "open here"),
 						k("n", "new agent"),
+						k("G", "new (in this group)"),
 						...(isRunning(r?.bg) ? [k("c", "cancel")] : []),
 						...(r?.bg?.pending.length
 							? [k("m", "manage queue")]
@@ -4475,13 +4482,15 @@ export default function (pi: ExtensionAPI) {
 						showLiveStream(ctx);
 					}
 					setReplyTarget({
-						kind: "new", cwd: viewed.cwd, model, groupId: nextAgentTargetGroup(),
+						kind: "new", cwd: viewed.cwd, model,
+						groupId: result.rowGroup ? result.rowGroup.id : nextAgentTargetGroup(),
 					}, ctx);
 					return;
 				}
 				// No sticky main: retain the existing blank-home compose flow.
 				setReplyTarget({
-						kind: "new", cwd: viewed.cwd, model, groupId: nextAgentTargetGroup(),
+					kind: "new", cwd: viewed.cwd, model,
+					groupId: result.rowGroup ? result.rowGroup.id : nextAgentTargetGroup(),
 				}, ctx);
 				if (orchestrating() && !isHome(ctx) && !(await goHome(ctx, { reopen: false }))) {
 					setReplyTarget(undefined, ctx);

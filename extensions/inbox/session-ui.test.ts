@@ -1058,8 +1058,8 @@ test("g opens groups; Home jumps top; search g stays text", async (t) => {
 	assert.equal(list.selected, list.visible.length - 1);
 	list.handleInput("\x1b[H");
 	assert.equal(list.selected, 0);
-	list.handleInput("G");
-	assert.equal(list.selected, 0, "uppercase G no longer jumps to bottom");
+	// (G used to be tested here as a no-op jump-to-bottom; it now starts a new
+	// agent in the selected row's group — covered by its own tests below.)
 	list.handleInput("/");
 	list.handleInput("g");
 	assert.equal(list.state.query, "g");
@@ -1155,6 +1155,38 @@ test("f pre-picks a one-off group for the next new agent", async (t) => {
 	await done;
 	const target = (globalThis as any)[Symbol.for("pi.inbox.reply-target")];
 	assert.equal(target.groupId, reviews.id);
+});
+
+test("G starts a new agent in the selected session's group", async (t) => {
+	const f = await setup(t);
+	const groups = new InboxGroups(dir);
+	const reviews = await groups.create("Reviews");
+	const bugs = await groups.create("Bugs");
+	// Both the one-off pre-pick and a persistent default exist: the row's own group must win.
+	await groups.setDefaultGroup(bugs.id);
+	(globalThis as any)[Symbol.for("pi.inbox.next-agent-group")] = bugs.id;
+	const a = await f.visit("grouped session");
+	await groups.assign(a.id, reviews.id);
+	const { list, done } = await f.openInbox();
+	list.handleInput("G");
+	await done;
+	const target = (globalThis as any)[Symbol.for("pi.inbox.reply-target")];
+	assert.equal(target.kind, "new");
+	assert.equal(target.groupId, reviews.id);
+});
+
+test("G on an ungrouped row forces the next agent Ungrouped", async (t) => {
+	const f = await setup(t);
+	const groups = new InboxGroups(dir);
+	const bugs = await groups.create("Bugs");
+	await groups.setDefaultGroup(bugs.id);
+	const a = await f.visit("ungrouped session");
+	const { list, done } = await f.openInbox();
+	list.handleInput("G");
+	await done;
+	const target = (globalThis as any)[Symbol.for("pi.inbox.reply-target")];
+	assert.equal(target.kind, "new");
+	assert.equal(target.groupId, undefined, "the row's Ungrouped beats the default");
 });
 
 test("f Ungrouped forces the next agent out of any default", async (t) => {

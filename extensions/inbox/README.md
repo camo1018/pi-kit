@@ -39,6 +39,7 @@ Source: `~/Code/pi-kit/extensions/inbox/index.ts` (background agents: `~/Code/pi
 | `Q` | Orchestrator mode: leave the mode |
 | `n` | New background agent in the current directory, using this window's model. You type its prompt in pi's editor |
 | `N` | Same, picking its model first |
+| `G` | New background agent that joins the selected session's group (an ungrouped row means Ungrouped). Behaves like `n` otherwise: current directory, this window's model |
 | `g` | Select/manage the group view (`ctrl+g` remains an alias) |
 | `ctrl+g` | Choose a new agent's destination or move the session on screen |
 | `b` | Move the selected session into a group or Ungrouped, without stopping it |
@@ -253,6 +254,9 @@ Starting an agent with **n/N** while viewing a named group automatically puts
 it in that group. Ungrouped explicitly creates ungrouped agents. All groups
 uses the configured new-agent default, or Ungrouped if none is configured. During
 composition, **Ctrl+G** changes the destination, which is shown in the banner.
+**G** in the inbox list starts a new agent that joins the selected row's group
+instead — the group is resolved once at the moment you press it, so the row
+can't be a group header, only a session row.
 In an existing session (including a busy visit), **Ctrl+G** opens the same
 move-to-group picker as `/group`, replacing Pi's external-editor shortcut.
 Moving a session changes only membership, preserving its draft and runtime;
