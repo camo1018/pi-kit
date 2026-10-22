@@ -1,5 +1,6 @@
 {
   "tui.input.submit": ["super+enter", "ctrl+enter"],
   "tui.input.newLine": ["enter"],
-  "tui.editor.cursorLeft": ["left"]
+  "tui.editor.cursorLeft": ["left"],
+  "app.thinking.cycle": ["ctrl+shift+e"]
 }
