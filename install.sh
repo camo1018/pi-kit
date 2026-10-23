@@ -8,7 +8,8 @@ SOURCE="${PI_KIT_SOURCE:-$HERE}"
 
 # All extensions, in canonical order. Keep the string-form name in sync with
 # package.json's pi.extensions paths (extensions/<name>/index.ts).
-ALL_EXTENSIONS=(final-answer-divider inbox plan-mode inline-skills notify
+ALL_EXTENSIONS=(final-answer-divider inbox group-memory plan-mode
+	inline-skills notify
 	rename-chat click-copy snippet-copy md-fence-render tool-output-hide
 	thinking-block-hide voice compat-check session-mention tree-position)
 

@@ -9,6 +9,7 @@
     "extensions": [
       "extensions/final-answer-divider/index.ts",
       "extensions/inbox/index.ts",
+      "extensions/group-memory/index.ts",
       "extensions/plan-mode/index.ts",
       "extensions/inline-skills/index.ts",
       "extensions/notify/index.ts",
