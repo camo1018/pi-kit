@@ -72,6 +72,9 @@ import {
 	installBackgroundMcpAutoApproval,
 } from "../../lib/background-mcp-approval.ts";
 import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
+import {
+	beforeRun, branchName, selectedHistory, sourceName,
+} from "../../lib/session-branch.ts";
 import { handleVisitModelInput } from "./visit-models.ts";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -3667,6 +3670,17 @@ export default function (pi: ExtensionAPI) {
 		// The source id comes from the previous session file's header (this session's own id
 		// is already the fork's). Best effort: a busy group store just leaves it Ungrouped.
 		if (e?.reason === "fork" && typeof e.previousSessionFile === "string") {
+			const key = Symbol.for("pi.inbox.branch-name");
+			const pending = G[key];
+			delete G[key];
+			try {
+				const source = SessionManager.open(e.previousSessionFile);
+				const kind = pending?.file === e.previousSessionFile
+					? pending.kind : "Fork";
+				pi.setSessionName(branchName(sourceName(source), kind));
+			} catch {
+				// A missing source must not prevent opening the new branch.
+			}
 			try {
 				const header = readSessionHeaderLine(e.previousSessionFile);
 				if (header) {
@@ -4959,39 +4973,67 @@ export default function (pi: ExtensionAPI) {
 	};
 	pi.on("session_before_compact", busyGuard("compact"));
 	pi.on("session_before_tree", busyGuard("navigate the tree"));
-	// /fork and /clone only create a new session file, so they're allowed mid-run. /fork branches from an
-	// earlier user message, which is already in the on-screen snapshot. /clone copies "the current
-	// position", but the snapshot is behind the background agent, so we take over: clone from disk up to
-	// the last completed step instead (the in-flight step is left out).
+	// Explicit tree selections always win. Only a live attached snapshot
+	// needs a disk refresh and the pre-prompt cutoff for a busy clone.
 	pi.on("session_before_fork", async (e: any, ctx: ExtensionContext) => {
-		if (!attachedBusy(ctx) || e?.position !== "at") return undefined;
+		G[Symbol.for("pi.inbox.branch-name")] = {
+			file: ctx.sessionManager.getSessionFile(),
+			kind: e?.position === "at" ? "Clone" : "Fork",
+		};
+		if (!attachedBusy(ctx) || e?.position !== "at" ||
+			selectedHistory(ctx.sessionManager)) return undefined;
+		delete G[Symbol.for("pi.inbox.branch-name")];
+		const file = ctx.sessionManager.getSessionFile();
+		const agent = getAgent(ctx.sessionManager.getSessionId());
+		if (file && agent?.state === "working") {
+			G[Symbol.for("pi.inbox.clone-checkpoint")] = {
+				file, leaf: beforeRun(SessionManager.open(file), agent),
+			};
+		}
 		const p = (G.__piInboxPi ?? pi) as ExtensionAPI;
 		setTimeout(() => void Promise.resolve(p.sendUserMessage("/orchestrator clone", { expandPromptTemplates: true })).catch(() => {}), 50);
 		return { cancel: true };
 	});
 
-	/** Orchestrator: clone an attached session that's working in the background, from disk, up to its last completed step. */
+	/** Clone without including any work from the active background prompt. */
 	async function cloneLatest(ctx: ExtensionCommandContext) {
 		const file = ctx.sessionManager.getSessionFile();
 		if (!file || !fs.existsSync(file)) return ctx.ui.notify("Nothing to clone yet.", "info");
 		const sm = SessionManager.open(file, ctx.sessionManager.getSessionDir());
-		// Last point on the branch with no unanswered tool calls, after the agent has said something.
-		// A trailing user message is the prompt still being worked on, so it's left out too.
-		const pending = new Set<string>();
-		let leaf: string | undefined;
-		let sawAssistant = false;
-		for (const entry of sm.getBranch() as any[]) {
-			const m = entry?.type === "message" ? entry.message : undefined;
-			if (m?.role === "assistant") {
-				sawAssistant = true;
-				for (const b of Array.isArray(m.content) ? m.content : []) if (b?.type === "toolCall" && b.id) pending.add(b.id);
-			} else if (m?.role === "toolResult") pending.delete(m.toolCallId);
-			if (sawAssistant && pending.size === 0 && m?.role !== "user") leaf = entry.id;
+		const agent = getAgent(ctx.sessionManager.getSessionId());
+		const historical = selectedHistory(ctx.sessionManager);
+		const key = Symbol.for("pi.inbox.clone-checkpoint");
+		const requested = G[key];
+		delete G[key];
+		// Preserve the click-time cutoff if the run settles before dispatch.
+		const leaf = historical ? ctx.sessionManager.getLeafId()
+			: requested?.file === file ? requested.leaf
+				: agent?.state === "working"
+					? beforeRun(sm, agent) : sm.getLeafId();
+		if (leaf === undefined) {
+			return ctx.ui.notify("Can't locate the run's checkpoint.", "warning");
 		}
-		if (!leaf) return ctx.ui.notify("Nothing to clone yet: the background agent hasn't completed a step.", "info");
+		const name = branchName(sourceName(sm), "Clone");
 		const behind = sm.getLeafId() !== leaf;
-		const cloned = sm.createBranchedSession(leaf);
+		// A first-ever prompt has no parent: produce an empty, named clone.
+		const cloned = leaf === null
+			? (() => {
+				const empty = SessionManager.create(
+					sm.getCwd(), ctx.sessionManager.getSessionDir());
+				empty.newSession({ parentSession: file });
+				empty.appendSessionInfo(name);
+				const destination = empty.getSessionFile()!;
+				// Pi defers saving setup-only sessions until a user prompt.
+				// This explicit empty clone must be reopenable right away.
+				fs.writeFileSync(destination, [
+					empty.getHeader(), ...empty.getEntries(),
+				].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+				{ flag: "wx" });
+				return destination;
+			})()
+			: sm.createBranchedSession(leaf);
 		if (!cloned || !fs.existsSync(cloned)) return ctx.ui.notify("Clone failed: couldn't write the new session.", "error");
+		SessionManager.open(cloned).appendSessionInfo(name);
 		try {
 			// Mark the clone: its tail ends at a tool result, which the inbox would otherwise
 			// call stalled/working until it has activity of its own.
@@ -5011,7 +5053,7 @@ export default function (pi: ExtensionAPI) {
 			withSession: async (c) => {
 				c.ui.notify(
 					behind
-						? "Cloned to new session, up to the agent's last completed step (the step in flight isn't included)."
+						? "Cloned at the selected checkpoint; the active prompt is excluded."
 						: "Cloned to new session.",
 					"info",
 				);
