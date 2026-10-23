@@ -68,6 +68,8 @@ export interface BgAgent {
 	/** Prompt of the in-flight run (persisted so an adopter can show it). */
 	runPrompt?: string;
 	runStartedAt?: number;
+	/** Exact pre-prompt checkpoint, captured before launching the child. */
+	runBaseLeafId?: string | null;
 	/** Bytes of the event file consumed so far. */
 	outOffset?: number;
 	createdAt: number;
@@ -414,6 +416,7 @@ interface SavedAgent {
 	settledAt?: number;
 	runPrompt?: string;
 	runStartedAt?: number;
+	runBaseLeafId?: string | null;
 	createdAt: number;
 	updatedAt: number;
 	runs: number;
@@ -474,6 +477,7 @@ function persist(a: BgAgent) {
 		settledAt: a.settledAt,
 		runPrompt: a.runPrompt,
 		runStartedAt: a.runStartedAt,
+		runBaseLeafId: a.runBaseLeafId,
 		createdAt: a.createdAt,
 		updatedAt: a.updatedAt,
 		runs: a.runs,
@@ -738,6 +742,7 @@ function adopt(s: SavedAgent) {
 		a.settledAt = s.settledAt;
 		a.runPrompt = s.runPrompt;
 		a.runStartedAt = s.runStartedAt;
+		a.runBaseLeafId = s.runBaseLeafId;
 		a.outOffset = 0; // replay the run so far
 		a.liveRun = newLiveRun();
 		if (s.runPrompt) {
@@ -757,6 +762,10 @@ function adopt(s: SavedAgent) {
 }
 
 function run(a: BgAgent) {
+	// Capture before the child can append its prompt or any tool steps.
+	a.runStartedAt = Date.now();
+	a.runBaseLeafId = a.sessionFile && fs.existsSync(a.sessionFile)
+		? SessionManager.open(a.sessionFile).getLeafId() : null;
 	const message = a.pending.shift()!;
 	a.log = [];
 	a.liveText = "";
@@ -826,7 +835,6 @@ function run(a: BgAgent) {
 	a.pid = child.pid;
 	a.settledAt = undefined;
 	a.runPrompt = message;
-	a.runStartedAt = Date.now();
 	a.outOffset = 0;
 	a.runs++;
 	a.state = "working";
@@ -958,6 +966,7 @@ function finishRun(a: BgAgent, code: number, signal?: string) {
 	flushPendingModel(a);
 	a.runPrompt = undefined;
 	a.runStartedAt = undefined;
+	a.runBaseLeafId = undefined;
 	if (!a.sessionFile) a.sessionFile = findSessionFile(a.id);
 	flushPendingName(a);
 	if (a.restartAfterInterrupt) {

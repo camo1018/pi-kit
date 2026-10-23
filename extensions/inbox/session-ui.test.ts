@@ -1491,6 +1491,88 @@ test("a clone from an ungrouped session stays Ungrouped", async (t) => {
 	assert.equal(groups.load().sessions[cloneId], undefined);
 });
 
+test("busy clone excludes the entire active prompt from fresh disk", async (t) => {
+	const f = await setup(t, false);
+	const main = f.main;
+	main.appendSessionInfo("Old name");
+	const base = main.getLeafId()!;
+	const disk = SessionManager.open(main.getSessionFile()!);
+	disk.appendMessage({ role: "user", content: "active", timestamp: 10 });
+	disk.appendCustomEntry("answered-step", {});
+	disk.appendMessage({ role: "user", content: "steering", timestamp: 11 });
+	disk.appendSessionInfo("Latest name");
+	const a: BgAgent = {
+		id: main.getSessionId(), cwd: dir, title: "Latest name",
+		sessionFile: main.getSessionFile(), state: "working",
+		proc: { kill: mock.fn() }, pending: [], createdAt: 0,
+		updatedAt: 0, needsYou: false, runs: 1, log: [], liveText: "",
+		runBaseLeafId: base,
+	};
+	registry().agents.set(a.id, a);
+	const original = readFileSync(main.getSessionFile()!, "utf8");
+	const intercepted = await f.emit("session_before_fork", {
+		entryId: main.getLeafId(), position: "at",
+	});
+	assert.ok(intercepted.some((r) => r?.cancel));
+	// The run finishes between the click and the internal command dispatch.
+	a.state = "idle";
+	a.runBaseLeafId = undefined;
+	await f.commands.get("orchestrator").handler("clone", f.ctx);
+	const file = (f.ctx.switchSession as any).mock.calls.at(-1).arguments[0];
+	const clone = SessionManager.open(file);
+	assert.equal(clone.getSessionName(), "Latest name - Clone");
+	const ids = clone.getBranch().map((e) => e.id);
+	assert.ok(ids.includes(base));
+	assert.ok(!ids.includes(disk.getLeafId()!));
+	assert.equal(clone.getBranch().filter((e) =>
+		e.type === "message" && e.message.role === "user").length, 1);
+	assert.equal(readFileSync(main.getSessionFile()!, "utf8"), original);
+	assert.equal(a.state, "idle");
+	assert.equal((a.proc!.kill as any).mock.calls.length, 0);
+	a.state = "working";
+	// Historical selection is preserved even with a background writer.
+	main.branch(main.getEntries()[0].id);
+	const results = await f.emit("session_before_fork", {
+		entryId: main.getLeafId(), position: "at",
+	});
+	assert.ok(results.every((r) => !r?.cancel));
+	assert.equal((f.pi.sendUserMessage as any).mock.calls.length, 0);
+});
+
+test("native branch titles distinguish Clone and Fork", async (t) => {
+	for (const position of ["at", "before"] as const) {
+		const f = await setup(t);
+		f.main.appendSessionInfo("Latest title");
+		const sourceFile = f.main.getSessionFile()!;
+		await f.emit("session_before_fork", {
+			entryId: f.main.getLeafId(), position,
+		});
+		f.main.createBranchedSession(f.main.getLeafId()!);
+		await f.emit("session_start", {
+			reason: "fork", previousSessionFile: sourceFile,
+		});
+		const kind = position === "at" ? "Clone" : "Fork";
+		assert.equal(f.main.getSessionName(), `Latest title - ${kind}`);
+	}
+});
+
+test("first active prompt clones to empty history", async (t) => {
+	const f = await setup(t, false);
+	const a: BgAgent = {
+		id: f.main.getSessionId(), cwd: dir, title: "First run",
+		sessionFile: f.main.getSessionFile(), state: "working",
+		proc: { kill: mock.fn() }, pending: [], createdAt: 0,
+		updatedAt: 0, needsYou: false, runs: 1, log: [], liveText: "",
+		runBaseLeafId: null,
+	};
+	registry().agents.set(a.id, a);
+	await f.commands.get("orchestrator").handler("clone", f.ctx);
+	const file = (f.ctx.switchSession as any).mock.calls.at(-1)?.arguments[0];
+	assert.ok(file, "empty clone must be persisted");
+	assert.equal(SessionManager.open(file).getBranch()
+		.filter((e) => e.type === "message").length, 0);
+});
+
 test("deleted destinations preserve the draft and start no agent", async (t) => {
 	const f = await setup(t);
 	const groups = new InboxGroups(dir);
