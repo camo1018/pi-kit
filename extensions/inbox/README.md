@@ -123,9 +123,9 @@ competing for top-level inbox rows. Families are **collapsed by default**;
 new workers and finished results never expand them unexpectedly.
 
 ```text
-▸ ● Fix retry bug [2w ●1 •1]    ↳ Fixed the retry handling…
+▸ ● Fix retry bug [2w ↻1 •1]    ↳ Fixed the retry handling…
 
-▾ ● Fix retry bug [2w ●1 •1]    ↳ Fixed the retry handling…
+▾ ● Fix retry bug [2w ↻1 •1]    ↳ Fixed the retry handling…
   ├─ ● Trace callers          ↳ Checking caller compatibility…
   └─ ◆ Check retries          ↳ Added retry edge-case coverage
 ```
@@ -137,10 +137,14 @@ new workers and finished results never expand them unexpectedly.
   live separately in `<agent-dir>/inbox-worker-folds.json`; folded workers keep
   running normally. No process ownership or queue changes occur on folding.
 - The parent retains its own status, unread marker, and latest-message column.
-  Compact worker counts sit beside its title (`[2w ●1 •1]`), using `w`, `●`,
-  `✗`, and `•` for eligible workers, running/queued work, errors, and unread
-  results. The selected-session preview retains the detailed breakdown.
-  Opening a parent does not mark its children read.
+  Compact worker counts sit beside its title (`[2w ↻1 •1]`):
+  - `2w`: two workers included in the current view.
+  - `↻1`: one worker running or queued.
+  - `✗1`: one worker in an error state.
+  - `•1`: one worker with unread results.
+
+  Zero-valued status counters are omitted. The selected-session preview retains
+  the detailed breakdown. Opening a parent does not mark its children read.
 - Disclosure and pin icons are adjacent, separated by one space. Only child
   rows add indentation; a dormant takeover column consumes no space.
 - Children stay in creation order, regardless of progress updates or pins.

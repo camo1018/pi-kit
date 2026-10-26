@@ -2094,13 +2094,13 @@ test("parent rows keep latest messages beside compact worker badges", async (t) 
 	let line = parentLine();
 	assert.ok(line);
 	assert.match(line, /Parent latest sentinel/);
-	assert.match(line, /\[2w ●1 •1\]/);
+	assert.match(line, /\[2w ↻1 •1\]/);
 	assert.equal(line.indexOf("★") - line.indexOf("▸"), 2);
 	list.handleInput(" ");
 	line = parentLine();
 	assert.ok(line);
 	assert.match(line, /Parent latest sentinel/);
-	assert.match(line, /\[2w ●1 •1\]/);
+	assert.match(line, /\[2w ↻1 •1\]/);
 	assert.equal(line.indexOf("★") - line.indexOf("▾"), 2);
 	for (const width of [40, 60, 80, 120, 160, 220]) {
 		assert.ok(

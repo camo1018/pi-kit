@@ -2072,7 +2072,7 @@ class InboxComponent {
 				];
 		if (errors) pieces.push(compact ? `✗${errors}` : `${errors} error`);
 		if (running)
-			pieces.push(compact ? `●${running}` : `${running} running`);
+			pieces.push(compact ? `↻${running}` : `${running} running`);
 		if (unread) pieces.push(compact ? `•${unread}` : `${unread} unread`);
 		return this.theme.fg(
 			errors ? "error" : running ? "warning" : "muted",
