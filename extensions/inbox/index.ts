@@ -137,7 +137,6 @@ import {
 	installAgentChildHooks,
 	isAgentChild,
 	markSeen,
-	nextSessionModel,
 	recordActualThinkingLevel,
 	setAgentDir,
 	startAgentSupervisor,
@@ -5241,9 +5240,11 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (result.action === "new") {
-				let model = isVisiting()
-					? nextSessionModel(viewed.id, viewed.file)
-					: currentModel(ctx);
+				// Always this window's model: a new agent must not inherit the model of
+				// the session being visited (that seeded e.g. frontier-model while the main
+				// stayed on cheap-model, and re-picking the main's model emitted no
+				// model_select since it wasn't a change). `N` still overrides.
+				let model = currentModel(ctx);
 				if (result.pickModel) {
 					const picked = await pickModel(ctx, model);
 					if (!picked) continue;

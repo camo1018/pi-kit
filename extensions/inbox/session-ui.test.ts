@@ -808,7 +808,7 @@ test("pin and archive target the viewed session", async (t) => {
 	assert.equal(store.sessions[f.main.getSessionId()].archivedAt, undefined);
 });
 
-test("new-agent composition inherits the viewed directory", async (t) => {
+test("new-agent composition inherits the viewed directory and window's model", async (t) => {
 	const f = await setup(t);
 	const cwd = join(dir, "another-project");
 	await f.visit("other project", true, cwd);
@@ -819,9 +819,13 @@ test("new-agent composition inherits the viewed directory", async (t) => {
 	await done;
 	const globals = globalThis as any;
 	assert.equal(globals[Symbol.for("pi.inbox.reply-target")].cwd, cwd);
+	// A new agent uses this window's model, NOT the visited session's model:
+	// inheriting the visit's model seeded agents with e.g. frontier-model while the
+	// main stayed on cheap-model, and re-picking the main's model was a no-op (no
+	// model_select for an unchanged model). The main here runs test/alpha:low.
 	assert.equal(
 		globals[Symbol.for("pi.inbox.reply-target")].model,
-		"test/vendor/gamma:free:low",
+		"test/alpha:low",
 	);
 	assert.ok(
 		globals[Symbol.for("pi.inbox.mode")].takenOver.has(f.main.getSessionId()),
