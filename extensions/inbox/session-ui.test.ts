@@ -2071,3 +2071,79 @@ test("family summary preserves parent status and Enter still opens sessions", as
 	list.handleInput("\x1b");
 	await done;
 });
+
+test("parent rows keep latest messages beside compact worker badges", async (t) => {
+	const f = await familyFixture(t);
+	const { list, done } = await f.openInbox();
+	list.state.selectedId = f.parent;
+	list.rebuild();
+	const family = list.families.get(f.parent);
+	const title = `Message family ${f.parent.slice(-8)}`;
+	family.row.title = title;
+	family.row.info.name = title;
+	family.row.tail.lastSaid = {
+		role: "assistant",
+		text: "Parent latest sentinel",
+	};
+	family.row.meta.pinnedAt = 1;
+	family.row.takenOver = false;
+	family.children[0].remoteState = "working";
+	family.children[1].unread = true;
+	const parentLine = () =>
+		list.render(220).find((line: string) => line.includes(title));
+	let line = parentLine();
+	assert.ok(line);
+	assert.match(line, /Parent latest sentinel/);
+	assert.match(line, /\[2w ●1 •1\]/);
+	assert.equal(line.indexOf("★") - line.indexOf("▸"), 2);
+	list.handleInput(" ");
+	line = parentLine();
+	assert.ok(line);
+	assert.match(line, /Parent latest sentinel/);
+	assert.match(line, /\[2w ●1 •1\]/);
+	assert.equal(line.indexOf("★") - line.indexOf("▾"), 2);
+	for (const width of [40, 60, 80, 120, 160, 220]) {
+		assert.ok(
+			list
+				.render(width)
+				.every((text: string) => visibleWidth(text) <= width),
+		);
+	}
+	list.handleInput("\x1b");
+	await done;
+});
+
+test("row marker slots shrink when takeover is absent and keep child alignment", async (t) => {
+	const f = await familyFixture(t);
+	const { list, done } = await f.openInbox();
+	list.state.selectedId = f.parent;
+	list.rebuild();
+	for (const row of list.rows) row.takenOver = false;
+	const family = list.families.get(f.parent);
+	const title = `Marker family ${f.parent.slice(-8)}`;
+	family.row.title = title;
+	family.row.info.name = title;
+	family.row.meta.pinnedAt = 1;
+	family.row.live = { state: "idle", pid: 12345 };
+	let line = list.render(220).find((text: string) => text.includes(title));
+	assert.ok(line);
+	assert.equal(line.indexOf("◉") - line.indexOf("★"), 2);
+	family.row.takenOver = true;
+	line = list.render(220).find((text: string) => text.includes(title));
+	assert.ok(line);
+	assert.equal(line.indexOf("⚑") - line.indexOf("★"), 2);
+	assert.equal(line.indexOf("◉") - line.indexOf("⚑"), 2);
+	family.row.takenOver = false;
+	list.handleInput(" ");
+	const lines: string[] = list.render(220);
+	const parentLine = lines.find((text) => text.includes(title));
+	const childLine = lines.find((text) => text.includes(f.children[0].title));
+	assert.ok(parentLine && childLine);
+	assert.equal(childLine.indexOf("├─") - parentLine.indexOf("▾"), 2);
+	assert.equal(
+		childLine.indexOf("Ungrouped"),
+		parentLine.indexOf("Ungrouped"),
+	);
+	list.handleInput("\x1b");
+	await done;
+});

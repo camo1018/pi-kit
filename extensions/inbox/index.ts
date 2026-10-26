@@ -2207,10 +2207,13 @@ class InboxComponent {
 		const wTree = [...this.families.values()].some(
 			(item) => item.child || item.children.length,
 		)
-			? 4
+			? 2
 			: 0;
-		// The ⚑ slot only exists while takeover is possible (orchestrator mode).
-		const wTake = orchestrating() ? 2 : 0;
+		// Reserve takeover space only when a visible row actually needs it.
+		const wTake =
+			orchestrating() && this.visible.some((row) => row.takenOver)
+				? 2
+				: 0;
 		const wProj = Math.min(22, Math.max(10, Math.floor(innerW * 0.18)));
 		// Group sections already supply membership; effective flat views need
 		// a per-row column, including when scoped to one group/Ungrouped.
@@ -2264,8 +2267,9 @@ class InboxComponent {
 				}
 				const r = d.row;
 				const family = this.families.get(r.info.id);
+				const childIndent = family?.child ? 2 : 0;
 				const tree = family?.child
-					? this.theme.fg("dim", family.lastChild ? " └─ " : " ├─ ")
+					? this.theme.fg("dim", family.lastChild ? "└─" : "├─")
 					: family?.children.length
 						? this.theme.fg("accent", family.expanded ? "▾ " : "▸ ")
 						: "";
@@ -2355,29 +2359,30 @@ class InboxComponent {
 					this.renaming && this.renaming.id === r.info.id
 						? this.renaming.input
 						: undefined;
-				let textCells =
-					fit(t, wTitle) +
-					(wLast ? " " + fit(this.latestCell(r), wLast) : "");
-				if (family?.children.length) {
-					if (wLast)
-						textCells =
-							fit(t, wTitle) +
-							" " +
-							fit(this.workerSummary(family, wLast < 45), wLast);
-					else {
-						const summary = this.workerSummary(family, true);
-						const summaryWidth = Math.min(
-							visibleWidth(summary),
-							Math.max(2, Math.floor(wText * 0.6)),
-						);
-						textCells =
-							fit(t, wText - summaryWidth - 1) +
-							" " +
-							fit(summary, summaryWidth);
-					}
+				const titleWidth = Math.max(1, wTitle - childIndent);
+				let titleCell = fit(t, titleWidth);
+				if (family?.children.length && titleWidth >= 6) {
+					const badge =
+						th.fg("muted", "[") +
+						this.workerSummary(family, true) +
+						th.fg("muted", "]");
+					const badgeWidth = Math.min(
+						visibleWidth(badge),
+						titleWidth - 2,
+						Math.max(3, Math.floor(titleWidth * 0.6)),
+					);
+					titleCell =
+						fit(t, titleWidth - badgeWidth - 1) +
+						" " +
+						fit(badge, badgeWidth);
 				}
-				if (editing)
-					textCells = fit(editing.render(wText)[0] ?? "", wText);
+				let textCells =
+					titleCell +
+					(wLast ? " " + fit(this.latestCell(r), wLast) : "");
+				if (editing) {
+					const width = Math.max(1, wText - childIndent);
+					textCells = fit(editing.render(width)[0] ?? "", width);
+				}
 				const groupName =
 					sessionGroup(this.groups, r.info.id)?.name ?? "Ungrouped";
 				const groupCell = wGroup
@@ -2385,9 +2390,10 @@ class InboxComponent {
 					: "";
 				let content =
 					cursor +
+					" ".repeat(childIndent) +
 					(wTree ? fit(tree, wTree) : "") +
 					pin +
-					takeoverDot +
+					(wTake ? takeoverDot : "") +
 					liveDot +
 					fit(this.statusCell(r), wStatus) +
 					" " +
@@ -4070,10 +4076,7 @@ function showLiveStream(ctx: ExtensionContext) {
 			getKeybindings().getKeys("app.message.dequeue").join("/") ||
 			"alt+up";
 		status.push(
-			th.fg(
-				"warning",
-				`⏳ ${count} · ${queueKey} or /queue to manage`,
-			),
+			th.fg("warning", `⏳ ${count} · ${queueKey} or /queue to manage`),
 		);
 	}
 	ctx.ui.setWidget("inbox-live", status);

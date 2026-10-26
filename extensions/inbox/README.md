@@ -136,10 +136,13 @@ new workers and finished results never expand them unexpectedly.
 - Fold choices survive refresh, reopening, restart, and multiple windows. They
   live separately in `<agent-dir>/inbox-worker-folds.json`; folded workers keep
   running normally. No process ownership or queue changes occur on folding.
-- The parent retains its own status and unread marker. Its worker summary
-  reports eligible workers, running/queued work, errors, and unread results;
-  narrow rows use `w`, `●`, `✗`, and `•` compact counters. Opening a parent does
-  not mark its children read.
+- The parent retains its own status, unread marker, and latest-message column.
+  Compact worker counts sit beside its title (`[2w ●1 •1]`), using `w`, `●`,
+  `✗`, and `•` for eligible workers, running/queued work, errors, and unread
+  results. The selected-session preview retains the detailed breakdown.
+  Opening a parent does not mark its children read.
+- Disclosure and pin icons are adjacent, separated by one space. Only child
+  rows add indentation; a dormant takeover column consumes no space.
 - Children stay in creation order, regardless of progress updates or pins.
   Parent pin/activity ordering remains unchanged. Normal sessions and ordinary
   forks/clones are not nested merely because they share a group or history.
