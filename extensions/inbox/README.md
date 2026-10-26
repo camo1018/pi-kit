@@ -137,14 +137,9 @@ new workers and finished results never expand them unexpectedly.
   live separately in `<agent-dir>/inbox-worker-folds.json`; folded workers keep
   running normally. No process ownership or queue changes occur on folding.
 - The parent retains its own status, unread marker, and latest-message column.
-  Compact worker counts sit beside its title (`[2w ↻1 •1]`):
-  - `2w`: two workers included in the current view.
-  - `↻1`: one worker running or queued.
-  - `✗1`: one worker in an error state.
-  - `•1`: one worker with unread results.
-
-  Zero-valued status counters are omitted. The selected-session preview retains
-  the detailed breakdown. Opening a parent does not mark its children read.
+  A compact worker badge sits beside its title; see the legend below. Select
+  the parent for a detailed worker breakdown. Opening it does not mark its
+  children read.
 - Disclosure and pin icons are adjacent, separated by one space. Only child
   rows add indentation; a dormant takeover column consumes no space.
 - Children stay in creation order, regardless of progress updates or pins.
@@ -167,6 +162,40 @@ new workers and finished results never expand them unexpectedly.
   Archive a child to affect only that child. Archiving is metadata only: it
   does **not** stop running agents or clear queues. Cancellation retains its
   existing selected-session behavior; there is no implicit family-wide stop.
+
+### Reading the worker badge
+
+The badge summarizes **child workers**, not the parent's own status. For
+example, `[2w ↻1 •1]` means two workers are included in this view, one is running
+or queued, and one has an unread result.
+
+| Badge part | Meaning |
+|---|---|
+| `2w` | Total workers included in the current tab, group, and search/filter view |
+| `↻1` | One worker is running or queued; queued work is waiting for a runner slot |
+| `✗1` | One worker is in an error state |
+| `•1` | One worker has unread results or was explicitly marked unread |
+
+The number after each symbol is a count. Status counters appear only when
+nonzero, while the worker total remains:
+
+- `[2w ↻1 •1]`: two workers, one running/queued, one unread.
+- `[3w ✗1 ↻1 •2]`: three workers, one error, one running/queued, two unread.
+- `[2w]`: two workers, with no running/queued, error, or unread counters.
+
+**Counts can overlap.** An errored worker can also be unread, so don't add the
+status counts together to determine the number of workers. The badge is not a
+success indicator: `[2w]` does not prove both tasks succeeded. Expand the family
+and inspect the replies to check findings, validation, or blockers.
+
+Counts follow the current view. A search for one matching child can show `1w`
+even if the parent has other workers elsewhere in the inbox. Collapsing the
+family does not change its counts or stop the workers. The badge updates as
+the inbox refreshes.
+
+The parent's status icon and latest-message column remain independent. On a
+narrow terminal the badge may be shortened; select the parent to read the full
+worker summary in the preview below the list.
 
 ## Orchestrator mode
 
