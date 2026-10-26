@@ -12,7 +12,10 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { registerSessionWorkers } from "./index.ts";
 import { setup } from "./test-utils.ts";
 
-function harness(t: TestContext) {
+function harness(
+	t: TestContext,
+	options: { settings?: Record<string, unknown> } = {},
+) {
 	const s = setup(t);
 	const handlers = new Map<string, unknown>();
 	let tool: ToolDefinition | undefined;
@@ -23,6 +26,7 @@ function harness(t: TestContext) {
 		registerTool(definition: ToolDefinition) {
 			tool = definition;
 		},
+		getSettings: () => options.settings ?? {},
 	} as unknown as ExtensionAPI;
 	registerSessionWorkers(pi, s.team);
 	let caller = "parent";
@@ -32,6 +36,7 @@ function harness(t: TestContext) {
 		hasUI: false,
 		thinkingLevel: "high",
 		model: { provider: "test", id: "model" },
+		scopedModels: [],
 		sessionManager: { getSessionId: () => caller },
 	} as unknown as ExtensionToolContext;
 	const execute = async (
@@ -103,6 +108,71 @@ test("agent tool spawns with parent defaults and follows up", async (t) => {
 			cwd: join(s.dir, "missing"),
 		}),
 		/ENOENT/,
+	);
+});
+
+const spawnedModel = (s: ReturnType<typeof harness>) => {
+	const call = s.calls.find((call) => call.kind === "spawn");
+	assert.ok(call);
+	return (call.data as { model?: string }).model;
+};
+
+test("workerDefaultModel setting overrides the parent's model", async (t) => {
+	const s = harness(t, {
+		settings: { workerDefaultModel: "example-provider/cheap-model" },
+	});
+	await s.execute({ action: "spawn", title: "Cheap", task: "Research" });
+	assert.equal(spawnedModel(s), "example-provider/cheap-model");
+});
+
+test("workerDefaultModel supports :thinking and is ignored when malformed", async (t) => {
+	const withThinking = harness(t, {
+		settings: { workerDefaultModel: "example-provider/cheap-model:low" },
+	});
+	await withThinking.execute({
+		action: "spawn",
+		title: "Cheap",
+		task: "Research",
+	});
+	assert.equal(spawnedModel(withThinking), "example-provider/cheap-model:low");
+
+	for (const bad of ["no-slash", "", "   ", 42, null]) {
+		const s = harness(t, { settings: { workerDefaultModel: bad } });
+		await s.execute({ action: "spawn", title: "Bad", task: "Research" });
+		assert.equal(
+			spawnedModel(s),
+			"test/model:high",
+			`malformed ${JSON.stringify(bad)} should fall back to the parent model`,
+		);
+	}
+});
+
+test("explicit spawn model beats workerDefaultModel; scoping wins over the setting", async (t) => {
+	const explicit = harness(t, {
+		settings: { workerDefaultModel: "example-provider/cheap-model" },
+	});
+	await explicit.execute({
+		action: "spawn",
+		title: "Explicit",
+		task: "Research",
+		model: "example-provider/frontier-model:medium",
+	});
+	assert.equal(spawnedModel(explicit), "example-provider/frontier-model:medium");
+
+	// A model outside the session's scoped list is never forced on workers.
+	const scopedCtx = { ...explicit.ctx } as Record<string, unknown>;
+	scopedCtx.scopedModels = [{ provider: "test", id: "model" }];
+	const scoped = harness(t, {
+		settings: { workerDefaultModel: "example-provider/cheap-model" },
+	});
+	(scoped.ctx as Record<string, unknown>).scopedModels = [
+		{ provider: "test", id: "model" },
+	];
+	await scoped.execute({ action: "spawn", title: "Scoped", task: "Research" });
+	assert.equal(
+		spawnedModel(scoped),
+		"test/model:high",
+		"scoped-out default must fall back to the parent model",
 	);
 });
 

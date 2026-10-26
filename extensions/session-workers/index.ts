@@ -14,6 +14,34 @@ import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 import { bounded, WorkerTeam } from "./workers.ts";
 
 const CUSTOM_TYPE = "pi-kit:worker-notes";
+
+/**
+ * Model used for delegated workers when a spawn does not name one. Worker
+ * sessions are short-lived and fan out in batches, so they rarely amortize
+ * prompt-cache writes the way a long parent session does; defaulting them
+ * to a cheap model keeps parallel delegation inexpensive. Read from the
+ * `workerDefaultModel` setting (a "provider/model[:thinking]" string).
+ */
+function workerDefaultModel(
+	settings: { workerDefaultModel?: unknown },
+	scoped: readonly { provider: string; id: string }[],
+): string | undefined {
+	const raw = settings.workerDefaultModel;
+	if (typeof raw !== "string" || raw.trim() === "") return undefined;
+	const [reference, thinking] = raw.split(":", 2);
+	const [provider, id] = reference.split("/", 2);
+	if (!provider || !id) return undefined;
+	// Never override model scoping: a disabled model stays disabled. Absent
+	// or empty scopedModels means no scoping is configured.
+	const scopedList = scoped ?? [];
+	if (
+		scopedList.length > 0 &&
+		!scopedList.some((m) => m.provider === provider && m.id === id)
+	) {
+		return undefined;
+	}
+	return thinking ? `${provider}/${id}:${thinking}` : `${provider}/${id}`;
+}
 const actions = [
 	"spawn",
 	"list",
@@ -43,7 +71,8 @@ const Parameters = Type.Object({
 	model: Type.Optional(
 		Type.String({
 			description:
-				"provider/model[:thinking]; defaults to parent's model",
+				"provider/model[:thinking]; defaults to the " +
+				"workerDefaultModel setting, else the parent's model",
 		}),
 	),
 	text: Type.Optional(
@@ -156,8 +185,17 @@ export function registerSessionWorkers(
 					if (!params.task || !params.title) {
 						throw new Error("Spawn requires task and title");
 					}
+					// Precedence: explicit spawn model > workerDefaultModel
+					// setting > parent's model. Workers are fresh, short-lived
+					// sessions that pay cache-write rates on their prompts, so
+					// the default steers them to the configured cheap model
+					// instead of the parent's.
 					const model =
 						params.model ??
+						workerDefaultModel(
+							pi.getSettings() as { workerDefaultModel?: unknown },
+							ctx.scopedModels,
+						) ??
 						(ctx.model
 							? `${ctx.model.provider}/${ctx.model.id}:` +
 								ctx.thinkingLevel

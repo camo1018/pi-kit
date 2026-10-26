@@ -22,7 +22,16 @@ Ask one concise question only if there is no identifiable unfinished task.
   directly when delegation would not help.
 - Foreground and background parents both work. **Do not require takeover.**
 - You are the coordinator: retain integration, validation, and the final reply.
-- Use the parent's model, cwd, and inbox group unless the user says otherwise.
+- **Run workers on the cheap model, not the parent's model.** Delegated
+  sessions are fresh and short-lived, so nearly every request pays the
+  provider's cache-write premium instead of cache-read rates; a worker on a
+  frontier model can cost 5–20x its cheap-model twin. Unless the task
+  genuinely needs a frontier model (deep judgment, tricky synthesis), spawn
+  workers on a cheap, fast model (e.g. `cheap-model`) via the spawn
+  `model` field. The `workerDefaultModel` setting enforces this automatically
+  when configured. The parent keeps its own (frontier) model for integration
+  and the final answer.
+- Use the parent's cwd and inbox group unless the user says otherwise.
 - Delegation is one level only. Workers are leaves, not further coordinators.
 - If `session_workers` is unavailable, explain that its extension must be
   enabled/reloaded. Do not simulate delegation with ad-hoc shell processes.

@@ -38,7 +38,7 @@ work normally; no takeover is required.
 
 | Action | Inputs | Behavior |
 |---|---|---|
-| `spawn` | `title`, `task`; optional `context`, `cwd`, `model` | Start a worker and return its session id immediately |
+| `spawn` | `title`, `task`; optional `context`, `cwd`, `model` (defaults to the `workerDefaultModel` setting, else the parent's model) | Start a worker and return its session id immediately |
 | `list` | Optional `id` | Status and latest reply for this team's workers |
 | `read` | `id` | Status, latest reply, and transcript path |
 | `wait` | Optional `id`, `seconds` (1–60, default 30) | Wait for one worker, or all workers, to stop running; timeout returns current status |
@@ -101,6 +101,14 @@ already have the same filesystem permissions. Do not put credentials in notes.
   its startup environment marker does not reset its depth.
 - Default cwd and model/thinking level come from the executing parent, not a
   visited inbox row. `cwd` can select a dedicated worktree; it must exist.
+- **Worker default model:** spawns without an explicit `model` use the
+  `workerDefaultModel` setting when present (e.g.
+  `"workerDefaultModel": "example-provider/cheap-model"` in
+  `~/.pi/agent/settings.json`), falling back to the parent's model. Fresh
+  worker sessions rarely amortize prompt-cache writes, so defaulting them
+  to a cheap model keeps batch delegation inexpensive; an explicit spawn
+  `model` always wins, and model scoping (`enabledModels`) is never
+  overridden.
 - Workers load normal Pi settings, skills, and project instructions. Runtime
   trust, tool exclusions, and MCP approval rules still apply. The extension
   does not turn on blanket approval or bypass human-input requirements.
