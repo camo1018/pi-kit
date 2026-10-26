@@ -21,6 +21,19 @@ live settings; merge/install when ready. Loading the extension explicitly
 with `-e` is also supported: worker runs explicitly load the same extension
 path, even when it isn't enabled in their settings.
 
+## Short form: `$parallel`
+
+The bundled `parallel` skill runs this workflow from a short request:
+
+```text
+$parallel investigate this bug
+```
+
+Use `/skill:parallel <task>` without `inline-skills`, or append `$parallel` to
+an existing request. The skill handles task handoffs, shared findings, worktree
+isolation for edits, and parent-side integration/validation. Background parents
+work normally; no takeover is required.
+
 ## Tool: `session_workers`
 
 | Action | Inputs | Behavior |

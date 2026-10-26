@@ -1,6 +1,6 @@
 # pi-kit
 
-Extensions for [pi](https://pi.dev), packaged as a pi package.
+Extensions and skills for [pi](https://pi.dev), packaged as a pi package.
 
 ## Install
 
@@ -112,6 +112,25 @@ the first clean run on a new version shows a one-line "all checks pass" note.
 When adding code that touches Pi internals (prototype patches, private/protected
 methods, undocumented file layout), add a probe to
 `extensions/compat-check/index.ts` and a row to that extension's README.
+
+## Parallel work skill
+
+Use `$parallel <task>` to delegate independent work to persistent workers,
+share findings and bigbrain context, then integrate and validate the results:
+
+```text
+$parallel fix the retry bug
+```
+
+It also works on an existing request: `fix the retry bug $parallel`. The native
+command `/skill:parallel <task>` works without `inline-skills`. Foreground and
+background parents are supported; no takeover is required. The skill defaults
+to two useful worker tasks, isolates concurrent edits in worktrees, and leaves
+integration and verification with the parent. Commits/pushes require permission.
+
+Requires `session-workers`; `$parallel` also needs `inline-skills`. The skill
+ships in `skills/parallel/SKILL.md`. Reload to refresh skill commands and
+completion in an existing window; new background runs discover it automatically.
 
 ## Config
 

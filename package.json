@@ -1,7 +1,7 @@
 {
   "name": "pi-kit",
   "version": "0.1.0",
-  "description": "pi extensions: orchestrator/inbox for background agents, plan mode, local voice dictation, notifications, and TUI tweaks",
+  "description": "pi extensions and skills: orchestrator/inbox for background agents, plan mode, local voice dictation, notifications, and TUI tweaks",
   "keywords": [
     "pi-package"
   ],
@@ -25,6 +25,9 @@
       "extensions/compat-check/index.ts",
       "extensions/session-mention/index.ts",
       "extensions/tree-position/index.ts"
+    ],
+    "skills": [
+      "skills"
     ]
   },
   "peerDependencies": {
