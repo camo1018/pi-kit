@@ -3211,12 +3211,15 @@ type ReplyTarget =
 	| { kind: "agent"; id: string; title: string; cwd: string; sessionFile?: string; model?: string; agentModel?: string }
 	| {
 		kind: "new"; cwd: string; model?: string;
+		/** N picked this model explicitly, rather than inheriting the main's. */
+		modelExplicit?: boolean;
 		groupId?: string;
 		/** Exact prefill last placed in the editor; used to protect edits. */
 		templateText?: string;
 	};
 
 const REPLY_KEY = Symbol.for("pi.inbox.reply-target");
+const NEW_MODEL_KEY = Symbol.for("pi.inbox.new-session-model");
 function getReplyTarget(): ReplyTarget | undefined {
 	return (globalThis as any)[REPLY_KEY];
 }
@@ -4364,6 +4367,38 @@ export default function (pi: ExtensionAPI) {
 	let viewing: string | undefined;
 
 	pi.on("session_start", async (e, ctx) => {
+		// New-session replacement creates a fresh runtime with startup defaults.
+		// Carry only plain data across it; never reuse the outgoing context/API.
+		const inherited = G[NEW_MODEL_KEY] as
+			{ file?: string; model?: string } | undefined;
+		delete G[NEW_MODEL_KEY];
+		if (
+			ctx.mode === "tui" && e.reason === "new" && inherited &&
+			inherited.file === e.previousSessionFile
+		) {
+			const choice = parseAgentModel(inherited.model);
+			const model = choice && ctx.modelRegistry.find(
+				choice.provider, choice.id,
+			);
+			if (choice) {
+				try {
+					if (!model || !await pi.setModel(model)) {
+						ctx.ui.notify(
+							`Couldn't inherit ${choice.provider}/${choice.id}; ` +
+							"using the startup model instead.",
+							"warning",
+						);
+					} else if (choice.thinkingLevel) {
+						pi.setThinkingLevel(choice.thinkingLevel);
+					}
+				} catch (error) {
+					ctx.ui.notify(
+						`Couldn't inherit the session model: ${String(error)}`,
+						"warning",
+					);
+				}
+			}
+		}
 		writeLive(ctx, "idle");
 		// Background agent: persist a `--model x:level` override pi applied but didn't record, so the
 		// next run / any window opening this session doesn't restore a stale level (e.g. `off`).
@@ -4471,7 +4506,20 @@ export default function (pi: ExtensionAPI) {
 			!manuallyUnread(id)
 		) markRead(id);
 	});
-	pi.on("session_shutdown", async (e: any) => {
+	pi.on("session_shutdown", async (e: any, ctx) => {
+		// Shutdown runs only after switch cancellation checks have passed.
+		// A module-local variable would be lost when extensions are reloaded
+		// for the replacement runtime. Do not persist this as a global default.
+		if (e.reason === "new" && ctx.mode === "tui") {
+			const draft = getReplyTarget();
+			G[NEW_MODEL_KEY] = {
+				file: ctx.sessionManager.getSessionFile(),
+				model: draft?.kind === "new" && draft.modelExplicit
+					? draft.model : currentModel(ctx),
+			};
+		} else {
+			delete G[NEW_MODEL_KEY];
+		}
 		// Leaving a session you were looking at: it's read — except a manual unread (`u`), which is
 		// a reminder to come back: it stays unread until you actually open the session again (from
 		// the inbox or by switching back). (Only interactive windows; background agent subprocesses
@@ -5368,8 +5416,8 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (result.action === "new") {
-				// Sticky composition uses the main's model, not a visit's. Blank-home
-				// composition resolves its default again after the session switch.
+				// Inherit the main's model and effort unless N picks another model.
+				// A replacement home runtime carries the choice into its footer too.
 				let model = currentModel(ctx);
 				if (result.pickModel) {
 					const picked = await pickModel(ctx, model);
@@ -5398,13 +5446,13 @@ export default function (pi: ExtensionAPI) {
 					);
 					return;
 				}
-				// Preserve the draft across the switch, then bind its default model
-				// to the fresh home context. Pi can reset the model on newSession.
-				const pickedModel = result.pickModel;
+				// Preserve the draft across the switch. session_start applies the
+				// inherited (or explicitly picked) model to the new home runtime.
 				const target: Extract<ReplyTarget, { kind: "new" }> = {
 					kind: "new",
 					cwd: viewed.cwd,
 					model,
+					modelExplicit: result.pickModel,
 					groupId: result.rowGroup
 						? result.rowGroup.id : nextAgentTargetGroup(),
 				};
@@ -5413,7 +5461,7 @@ export default function (pi: ExtensionAPI) {
 					const returned = await goHome(ctx, {
 						reopen: false,
 						withSession: async (fresh) => {
-							if (!pickedModel) target.model = currentModel(fresh);
+							target.model = currentModel(fresh);
 							setReplyTarget(target, fresh);
 						},
 					});

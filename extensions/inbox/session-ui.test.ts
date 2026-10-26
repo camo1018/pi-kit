@@ -44,6 +44,7 @@ writeFileSync(join(dir, "notify.json"), JSON.stringify({ enabled: false }));
 const { default: inbox } = await import("./index.ts");
 const {
 	applyEvent,
+	branchSettings,
 	MAX_CONCURRENT,
 	registry,
 	removeQueuedMessage,
@@ -143,6 +144,7 @@ async function setup(t: TestContext, takenOver = true) {
 	const commands = new Map<string, any>();
 	const shortcuts = new Map<string, any>();
 	const tools = new Map<string, any>();
+	let activeContext: ExtensionCommandContext;
 	const pi = {
 		on(name: string, fn: Function) {
 			handlers.set(name, [...(handlers.get(name) ?? []), fn]);
@@ -157,8 +159,31 @@ async function setup(t: TestContext, takenOver = true) {
 			tools.set(tool.name, tool);
 		},
 		setSessionName: mock.fn((name: string) => main.appendSessionInfo(name)),
-		setModel: mock.fn(),
-		setThinkingLevel: mock.fn(),
+		setModel: mock.fn(async (model: Model<Api>) => {
+			const previousModel = activeContext.model;
+			activeContext.model = model;
+			foregroundSession.model = model;
+			(activeContext.sessionManager as SessionManager).appendModelChange(
+				model.provider, model.id,
+			);
+			if (previousModel?.id !== model.id ||
+				previousModel?.provider !== model.provider) {
+				await emit("model_select", {
+					model, previousModel, source: "set",
+				}, activeContext);
+			}
+			return true;
+		}),
+		setThinkingLevel: mock.fn((level) => {
+			const previousLevel = activeContext.thinkingLevel;
+			activeContext.thinkingLevel = level;
+			foregroundSession.state.thinkingLevel = level;
+			if (previousLevel !== level) {
+				(activeContext.sessionManager as SessionManager)
+					.appendThinkingLevelChange(level);
+				void emit("thinking_level_select", { level }, activeContext);
+			}
+		}),
 		registerFlag() {},
 		getFlag: () => false,
 		getSessionName: () => "taken-over main",
@@ -166,7 +191,7 @@ async function setup(t: TestContext, takenOver = true) {
 			name, description: name, source: "extension",
 			sourceInfo: { path: "test" },
 		})),
-		getThinkingLevel: () => foregroundSession.state.thinkingLevel,
+		getThinkingLevel: () => activeContext.thinkingLevel ?? "off",
 		sendUserMessage: mock.fn(),
 	} as unknown as ExtensionAPI;
 	const widgets = new Map<string, any>();
@@ -257,6 +282,7 @@ async function setup(t: TestContext, takenOver = true) {
 		event: any = {},
 		context: ExtensionCommandContext = ctx,
 	) {
+		if (name === "session_start") activeContext = context;
 		const results = [];
 		for (const handler of handlers.get(name) ?? []) {
 			results.push(await handler(event, context));
@@ -280,6 +306,7 @@ async function setup(t: TestContext, takenOver = true) {
 		delete globals[Symbol.for("pi.inbox.agentChild")];
 		delete globals[modeKey];
 		delete globals[Symbol.for("pi.inbox.reply-target")];
+		delete globals[Symbol.for("pi.inbox.new-session-model")];
 		delete globals[Symbol.for("pi.inbox.next-agent-group")];
 		delete globals[Symbol.for("pi.inbox.group-view")];
 		delete globals[Symbol.for("pi.inbox.group-layout")];
@@ -842,27 +869,39 @@ function mockHomeSwitch(f: Awaited<ReturnType<typeof setup>>) {
 	home.appendThinkingLevelChange("low");
 	const fresh = { ...f.ctx, sessionManager: home, model: models[0] };
 	f.ctx.newSession = mock.fn(async (options) => {
-		await f.emit("session_start", { reason: "new" }, fresh);
+		const before = await f.emit("session_before_switch", { reason: "new" });
+		if (before.some((result) => result?.cancel)) return { cancelled: true };
+		const previousSessionFile = f.ctx.sessionManager.getSessionFile();
+		await f.emit("session_shutdown", { reason: "new" });
+		await f.emit("session_start", {
+			reason: "new", previousSessionFile,
+		}, fresh);
 		await options?.withSession?.(fresh as any);
 		return { cancelled: false };
 	});
 	return fresh;
 }
 
-test("new-agent default follows the fresh home model, not the attached model",
+test("new agents inherit the current model and effort across a home switch",
 	async (t) => {
 		const f = await setup(t, false);
 		const fresh = mockHomeSwitch(f);
+		f.ctx.thinkingLevel = "high";
 		const { list, done } = await f.openInbox();
 		list.handleInput("n");
 		await done;
 		const target = (globalThis as any)[
 			Symbol.for("pi.inbox.reply-target")
 		];
-		assert.equal(target.model, "test/alpha:low");
-		assert.equal(fresh.model.id, "alpha");
+		assert.equal(target.model, "test/beta:high");
+		assert.equal(fresh.model.id, "beta");
+		assert.equal(fresh.thinkingLevel, "high");
+		assert.equal(f.footer.session.model.id, "beta");
+		assert.deepEqual(branchSettings(fresh.sessionManager.getBranch()), {
+			model: "test/beta", level: "high",
+		});
 		assert.match(f.widgets.get("inbox-reply").render(120).join("\n"),
-			/test\/alpha:low/);
+			/test\/beta:high/);
 		// Keep launch slots occupied so routing can be tested without a child
 		// process or a provider request. The queued agent must use this model.
 		t.mock.timers.enable({ apis: ["setInterval"] });
@@ -881,7 +920,7 @@ test("new-agent default follows the fresh home model, not the attached model",
 		const queued = [...registry().agents.values()].find(
 			(a) => a.state === "queued",
 		);
-		assert.equal(queued?.model, "test/alpha:low");
+		assert.equal(queued?.model, "test/beta:high");
 		assert.deepEqual(queued?.pending, ["run on the home model"]);
 	});
 
@@ -901,7 +940,7 @@ test("cancelling the home switch cancels the new-agent draft", async (t) => {
 test("an explicit new-agent model survives the switch to blank home",
 	async (t) => {
 		const f = await setup(t, false);
-		mockHomeSwitch(f);
+		const fresh = mockHomeSwitch(f);
 		f.ui.select = mock.fn(async () => "test/vendor/gamma:free:high");
 		const { list, done } = await f.openInbox();
 		list.handleInput("N");
@@ -909,7 +948,81 @@ test("an explicit new-agent model survives the switch to blank home",
 		assert.equal((globalThis as any)[
 			Symbol.for("pi.inbox.reply-target")
 		].model, "test/vendor/gamma:free:high");
+		assert.equal(fresh.model.id, "vendor/gamma:free");
+		assert.equal(fresh.thinkingLevel, "high");
 	});
+
+test("native new sessions inherit without changing saved startup defaults",
+	async (t) => {
+		const f = await setup(t, false);
+		(globalThis as any)[Symbol.for("pi.inbox.mode")].on = false;
+		const settingsFile = join(dir, "settings.json");
+		const saved = JSON.stringify({
+			defaultProvider: "test", defaultModel: "alpha",
+			defaultThinkingLevel: "low",
+		});
+		writeFileSync(settingsFile, saved);
+		t.after(() => rmSync(settingsFile, { force: true }));
+		const fresh = mockHomeSwitch(f);
+		f.ctx.thinkingLevel = "high";
+		await f.ctx.newSession();
+		assert.equal(fresh.model.id, "beta");
+		assert.equal(fresh.thinkingLevel, "high");
+		assert.equal(readFileSync(settingsFile, "utf8"), saved);
+		fresh.sessionManager.appendMessage({
+			role: "user", content: "continue with inherited model", timestamp: 3,
+		});
+		assert.equal(sessionModel(fresh.sessionManager.getSessionFile()),
+			"test/beta:high");
+	});
+
+test("a resumed session keeps its recorded model instead of inheriting",
+	async (t) => {
+		const f = await setup(t, false);
+		const fresh = mockHomeSwitch(f);
+		await f.emit("session_shutdown", { reason: "resume" });
+		await f.emit("session_start", {
+			reason: "resume", previousSessionFile: f.main.getSessionFile(),
+		}, fresh);
+		assert.equal(fresh.model.id, "alpha");
+		assert.equal((f.pi.setModel as any).mock.calls.length, 0);
+	});
+
+test("a fresh launch keeps startup defaults even with an abandoned handoff",
+	async (t) => {
+		const f = await setup(t, false);
+		const fresh = mockHomeSwitch(f);
+		await f.emit("session_shutdown", { reason: "new" });
+		await f.emit("session_start", { reason: "startup" }, fresh);
+		assert.equal(fresh.model.id, "alpha");
+		assert.equal((f.pi.setModel as any).mock.calls.length, 0);
+		assert.equal((globalThis as any)[
+			Symbol.for("pi.inbox.new-session-model")
+		], undefined);
+	});
+
+test("inheritance preserves an explicitly disabled thinking level",
+	async (t) => {
+		const f = await setup(t, false);
+		const fresh = mockHomeSwitch(f);
+		f.ctx.thinkingLevel = "off";
+		await f.ctx.newSession();
+		assert.equal(fresh.model.id, "beta");
+		assert.equal(fresh.thinkingLevel, "off");
+	});
+
+test("an unavailable inherited model falls back consistently", async (t) => {
+	const f = await setup(t, false);
+	const fresh = mockHomeSwitch(f);
+	(f.pi.setModel as any).mock.mockImplementation(async () => false);
+	const { list, done } = await f.openInbox();
+	list.handleInput("n");
+	await done;
+	const target = (globalThis as any)[Symbol.for("pi.inbox.reply-target")];
+	assert.equal(target.model, "test/alpha:low");
+	assert.equal(fresh.model.id, "alpha");
+	assert.equal(f.ui.notify.mock.calls.at(-1)?.arguments[1], "warning");
+});
 
 async function composeOnAnotherModel(
 	f: Awaited<ReturnType<typeof setup>>,
