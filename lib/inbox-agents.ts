@@ -51,6 +51,8 @@ export interface BgAgent {
 	title: string;
 	/** provider/model[:thinking] used for the first run; later runs keep the session's model. */
 	model?: string;
+	/** Explicit extensions needed by a delegated worker on every run. */
+	extensionPaths?: string[];
 	/** Model override for the next run (set when you change the model while replying). */
 	nextModel?: string;
 	sessionFile?: string;
@@ -408,6 +410,7 @@ interface SavedAgent {
 	cwd: string;
 	title: string;
 	model?: string;
+	extensionPaths?: string[];
 	nextModel?: string;
 	sessionFile?: string;
 	state: AgentState;
@@ -469,6 +472,7 @@ function persist(a: BgAgent) {
 		cwd: a.cwd,
 		title: a.title,
 		model: a.model,
+		extensionPaths: a.extensionPaths,
 		nextModel: a.nextModel,
 		sessionFile: a.sessionFile,
 		state: a.state,
@@ -716,6 +720,7 @@ function adopt(s: SavedAgent) {
 		cwd: s.cwd,
 		title: s.title,
 		model: s.model,
+		extensionPaths: s.extensionPaths,
 		nextModel: s.nextModel,
 		sessionFile: s.sessionFile ?? findSessionFile(s.id),
 		state: s.state,
@@ -774,7 +779,12 @@ function run(a: BgAgent) {
 	a.liveRun = newLiveRun();
 	liveUser(a, cleanUserText(message));
 	const { cmd, pre } = piCommand();
-	const args = [...pre, "--mode", "json", "--session-id", a.id, ...extensionArgs()];
+	const args = [
+		...pre, "--mode", "json", "--session-id", a.id, ...extensionArgs(),
+	];
+	for (const extension of a.extensionPaths ?? []) {
+		args.push("--extension", extension);
+	}
 	// --model wins over the model the session would restore, and is saved in the session.
 	const model = a.nextModel ?? (a.runs === 0 ? a.model : undefined);
 	a.nextModel = undefined;
@@ -1180,6 +1190,7 @@ function textOf(content: unknown): string {
 /** Start a new background agent. */
 export function spawnAgent(opts: {
 	id?: string; prompt: string; cwd: string; model?: string; title: string;
+	extensionPaths?: string[];
 }): BgAgent {
 	const a: BgAgent = {
 		// Callers can reserve an id to persist group membership before launch.
@@ -1187,6 +1198,7 @@ export function spawnAgent(opts: {
 		cwd: opts.cwd,
 		title: opts.title,
 		model: opts.model,
+		extensionPaths: opts.extensionPaths,
 		state: "queued",
 		pending: [opts.prompt],
 		createdAt: Date.now(),
@@ -1207,13 +1219,17 @@ export function spawnAgent(opts: {
  * Send a message to a session in the background. Existing (non-agent) sessions are adopted
  * as background agents. If the agent is working, the message is queued for its next run.
  */
-export function sendToAgent(opts: { id: string; cwd: string; sessionFile?: string; title: string; text: string; model?: string }): BgAgent {
+export function sendToAgent(opts: {
+	id: string; cwd: string; sessionFile?: string; title: string;
+	text: string; model?: string; extensionPaths?: string[];
+}): BgAgent {
 	let a = getAgent(opts.id);
 	if (!a) {
 		a = {
 			id: opts.id,
 			cwd: opts.cwd,
 			title: opts.title,
+			extensionPaths: opts.extensionPaths,
 			sessionFile: opts.sessionFile,
 			state: "idle",
 			pending: [],
@@ -1227,6 +1243,7 @@ export function sendToAgent(opts: { id: string; cwd: string; sessionFile?: strin
 		registry().agents.set(a.id, a);
 	}
 	a.pending.push(opts.text);
+	if (opts.extensionPaths) a.extensionPaths = opts.extensionPaths;
 	if (opts.model) {
 		a.nextModel = opts.model;
 		a.model = opts.model;

@@ -79,6 +79,7 @@ For a cloned install, `git pull` is equivalent to `pi update --extension`.
 |---|---|
 | `inbox/` + `lib/inbox-agents.ts` | Orchestrator mode (`pi --orchestrator`, `ctrl+q`): session inbox, background agents, attach/takeover, and per-session transcript bookmarks (`ctrl+b`, also `ctrl+shift+b`). ⚠️ [docs + internals](extensions/inbox/README.md) |
 | `group-memory/` | Share bigbrain memories by inbox group; automatic task-aware recall and group tags on foreground/background writes. [docs](extensions/group-memory/README.md) |
+| `session-workers/` | Let an agent delegate parallel work to persistent inbox sessions, collect results, and exchange shared team notes. [docs](extensions/session-workers/README.md) |
 | `plan-mode/` | Read-only planning with durable files and headless support (`/plan`, `/plan-execute`, `/plan-refine`, `/todos`) |
 | `voice/` | Local voice dictation via sox + whisper.cpp (`/voice`, `/voice check`). macOS |
 | `notify/` | Sound + macOS notification when a turn finishes (`/notify`, `~/.pi/agent/notify.json`) |
