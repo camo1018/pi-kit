@@ -67,7 +67,13 @@ export function registerSessionWorkers(
 		if (process.env.BIGBRAIN_MAINT === "1") return;
 		installBackgroundMcpAutoApproval(pi);
 		installAgentChildHooks((name) => pi.setSessionName(name));
-		if (ctx.mode === "tui" && !isAgentChild()) team.runner.supervise();
+		const caller = ctx.sessionManager.getSessionId();
+		if (
+			(ctx.mode === "tui" || isAgentChild()) &&
+			team.parent(caller) === caller
+		) {
+			team.supervise(caller);
+		}
 	});
 
 	pi.on("context", (event, ctx) => {
@@ -103,7 +109,9 @@ export function registerSessionWorkers(
 			"follow-up (not mid-run steering); cancel clears its queue. " +
 			"share publishes a team note; notes reads the shared board. " +
 			"Only the parent may spawn/send/cancel. Workers can read " +
-			"siblings and share notes. Children inherit the inbox group.",
+			"siblings and share notes. Children inherit the inbox group. " +
+			"Foreground and background parents can delegate one level; " +
+			"delegated workers cannot spawn another generation.",
 		promptGuidelines: [
 			"Use session_workers for independent tasks when parallel work " +
 				"helps. Give workers explicit scope, context, and deliverables.",
@@ -140,9 +148,9 @@ export function registerSessionWorkers(
 							.map((worker) => team.status(caller, worker.id));
 			switch (params.action) {
 				case "spawn": {
-					if (process.env.BIGBRAIN_MAINT === "1" || isAgentChild()) {
+					if (process.env.BIGBRAIN_MAINT === "1") {
 						throw new Error(
-							"Background children cannot spawn workers",
+							"Memory maintenance cannot spawn workers",
 						);
 					}
 					if (!params.task || !params.title) {

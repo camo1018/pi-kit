@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { after, mock, test } from "node:test";
+import type { BgAgent } from "./inbox-agents.ts";
 
 // Isolate runner state before its module-level agent directory is resolved.
 const dir = fs.mkdtempSync(join(tmpdir(), "pi-runner-test-"));
@@ -89,4 +90,87 @@ test("worker extension paths reach the subprocess and durable registry", async (
 	children[1].emit("exit", 0);
 	await new Promise((resolve) => setTimeout(resolve, 400));
 	assert.equal(resumed.proc, undefined);
+});
+
+test("background supervisors heartbeat teams without adopting ancestors", async (t) => {
+	const childKey = Symbol.for("pi.inbox.agentChild");
+	const supervisorKey = Symbol.for("pi.inbox.agentSupervisor");
+	const oldChild = Reflect.get(globalThis, childKey);
+	Reflect.set(globalThis, childKey, "background-parent");
+	t.mock.timers.enable({ apis: ["setInterval", "Date"], now: 1_000_000 });
+	mock.method(childProcess, "spawn", () => {
+		throw new Error("This test must never launch a subprocess");
+	});
+	syncBuiltinESMExports();
+	t.after(() => {
+		clearInterval(Reflect.get(globalThis, supervisorKey));
+		Reflect.deleteProperty(globalThis, supervisorKey);
+		if (oldChild === undefined)
+			Reflect.deleteProperty(globalThis, childKey);
+		else Reflect.set(globalThis, childKey, oldChild);
+		mock.restoreAll();
+		syncBuiltinESMExports();
+		runner.registry().agents.clear();
+	});
+	const root = join(dir, "inbox-agents");
+	fs.mkdirSync(root, { recursive: true });
+	for (const id of ["background-parent", "unrelated", "team-child"]) {
+		fs.writeFileSync(
+			join(root, `${id}.json`),
+			JSON.stringify({
+				v: 1,
+				id,
+				cwd: dir,
+				title: id,
+				state: id === "team-child" ? "idle" : "queued",
+				pending: id === "team-child" ? [] : ["Must not run"],
+				createdAt: 1,
+				updatedAt: 1,
+				runs: 1,
+				needsYou: false,
+				owner: 123456789,
+				ownerBeat: 0,
+			}),
+		);
+	}
+	const ancestor = fs.readFileSync(join(root, "background-parent.json"));
+	const unrelated = fs.readFileSync(join(root, "unrelated.json"));
+	runner.startAgentSupervisor();
+	assert.equal(Reflect.get(globalThis, supervisorKey), undefined);
+	runner.startAgentSupervisor({ allowBackground: true });
+	assert.equal(Reflect.get(globalThis, supervisorKey), undefined);
+
+	const owned: BgAgent = {
+		id: "heartbeat-worker",
+		cwd: dir,
+		title: "Owned worker",
+		state: "working",
+		proc: { kill() {} },
+		pending: [],
+		createdAt: 1,
+		updatedAt: 1,
+		needsYou: false,
+		runs: 1,
+		log: [],
+		liveText: "",
+	};
+	runner.registry().agents.set(owned.id, owned);
+	runner.startAgentSupervisor({
+		allowBackground: true,
+		adoptSessionIds: new Set(["team-child", owned.id]),
+	});
+	assert.equal(runner.getAgent("team-child")?.state, "idle");
+	assert.equal(runner.getAgent("background-parent"), undefined);
+	assert.equal(runner.getAgent("unrelated"), undefined);
+	const readBeat = () =>
+		JSON.parse(fs.readFileSync(join(root, `${owned.id}.json`), "utf8"))
+			.ownerBeat as number;
+	const firstBeat = readBeat();
+	t.mock.timers.tick(5_001);
+	assert.ok(readBeat() > firstBeat);
+	assert.deepEqual(
+		fs.readFileSync(join(root, "background-parent.json")),
+		ancestor,
+	);
+	assert.deepEqual(fs.readFileSync(join(root, "unrelated.json")), unrelated);
 });

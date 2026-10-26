@@ -25,13 +25,14 @@ function harness(t: TestContext) {
 		},
 	} as unknown as ExtensionAPI;
 	registerSessionWorkers(pi, s.team);
+	let caller = "parent";
 	const ctx = {
 		cwd: s.dir,
 		mode: "json",
 		hasUI: false,
 		thinkingLevel: "high",
 		model: { provider: "test", id: "model" },
-		sessionManager: { getSessionId: () => "parent" },
+		sessionManager: { getSessionId: () => caller },
 	} as unknown as ExtensionToolContext;
 	const execute = async (
 		params: Record<string, unknown>,
@@ -47,7 +48,24 @@ function harness(t: TestContext) {
 		) => { messages: AgentMessage[] };
 		return handler({ messages }, ctx);
 	};
-	return { ...s, tool, execute, context, ctx };
+	const start = () => {
+		const handler = handlers.get("session_start") as (
+			event: unknown,
+			ctx: ExtensionToolContext,
+		) => void;
+		handler({}, ctx);
+	};
+	return {
+		...s,
+		tool,
+		execute,
+		context,
+		ctx,
+		start,
+		switchTo(id: string) {
+			caller = id;
+		},
+	};
 }
 
 test("agent tool spawns with parent defaults and follows up", async (t) => {
@@ -164,27 +182,69 @@ test("real Pi loader registers workers cleanly without starting processes", asyn
 	assert.ok(loaded.extensions[0].tools.has("session_workers"));
 });
 
-test("background and maintenance runs cannot recursively spawn", async (t) => {
+test("background parents delegate; workers cannot create a second level", async (t) => {
 	const s = harness(t);
-	const keys = ["PI_INBOX_BG_AGENT", "BIGBRAIN_MAINT"];
-	const old = keys.map((key) => process.env[key]);
-	t.after(() =>
-		keys.forEach((key, index) => {
-			if (old[index] === undefined) delete process.env[key];
-			else process.env[key] = old[index];
-		}),
-	);
-	const spawn = () =>
+	const key = Symbol.for("pi.inbox.agentChild");
+	const previous = Reflect.get(globalThis, key);
+	t.after(() => {
+		if (previous === undefined) Reflect.deleteProperty(globalThis, key);
+		else Reflect.set(globalThis, key, previous);
+	});
+	// The inbox consumes the env marker; process identity still survives.
+	Reflect.set(globalThis, key, "parent");
+	s.start();
+	assert.equal(s.supervision[0]?.allowBackground, true);
+	assert.equal(s.supervision[0]?.adoptSessionIds?.size, 0);
+	await s.execute({ action: "spawn", title: "Child", task: "Read only" });
+	const worker = s.team.workers("parent")[0];
+	const ids = s.supervision.at(-1)?.adoptSessionIds;
+	assert.ok(ids);
+	assert.ok(ids.has(worker.id));
+	assert.equal(ids.has("parent"), false);
+	assert.equal(ids.size, 1);
+
+	s.switchTo(worker.id);
+	const count = s.supervision.length;
+	s.start();
+	assert.equal(s.supervision.length, count);
+	const nested = () =>
 		s.execute({
 			action: "spawn",
-			title: "Recursive",
+			title: "Grandchild",
 			task: "Must not run",
 		});
-	process.env.PI_INBOX_BG_AGENT = "background-child";
-	await assert.rejects(spawn(), /cannot spawn/);
-	delete process.env.PI_INBOX_BG_AGENT;
+	await assert.rejects(nested(), /maximum delegation depth: 1/);
+	// Taking over a delegated worker doesn't remove its durable depth guard.
+	Reflect.deleteProperty(globalThis, key);
+	await assert.rejects(nested(), /maximum delegation depth: 1/);
+	assert.equal(s.team.workers("parent").length, 1);
+
+	Reflect.set(globalThis, key, "parent");
+	s.switchTo("parent");
+	await s.execute({ action: "send", id: worker.id, text: "Follow up" });
+	assert.deepEqual(s.agents.get(worker.id)?.pending, ["Follow up"]);
+	await s.execute({ action: "cancel", id: worker.id });
+	assert.equal(s.agents.get(worker.id)?.state, "cancelled");
+});
+
+test("memory maintenance cannot delegate", async (t) => {
+	const s = harness(t);
+	const old = process.env.BIGBRAIN_MAINT;
+	t.after(() => {
+		if (old === undefined) delete process.env.BIGBRAIN_MAINT;
+		else process.env.BIGBRAIN_MAINT = old;
+	});
 	process.env.BIGBRAIN_MAINT = "1";
-	await assert.rejects(spawn(), /cannot spawn/);
+	s.start();
+	await assert.rejects(
+		s.execute({
+			action: "spawn",
+			title: "Maintenance",
+			task: "Must not run",
+		}),
+		/cannot spawn/,
+	);
 	assert.equal(await s.context([]), undefined);
 	assert.equal(s.calls.length, 0);
+	assert.equal(s.supervision.length, 0);
 });

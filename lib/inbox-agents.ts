@@ -668,25 +668,30 @@ export function isAgentChild(): boolean {
 	return !!(globalThis as any)[Symbol.for("pi.inbox.agentChild")] || !!process.env.PI_INBOX_BG_AGENT;
 }
 
-/**
- * Owner side: heartbeat the agents we own and adopt orphans (owner gone quiet). Only for
- * interactive pi windows; call once per session_start (idempotent, survives /reload).
- */
-export function startAgentSupervisor() {
-	if (isAgentChild()) return;
+export interface AgentSupervisorOptions {
+	/** Background parents must restrict adoption to their delegated team. */
+	allowBackground?: boolean;
+	adoptSessionIds?: ReadonlySet<string>;
+}
+
+/** Heartbeat owned runs and adopt orphans; safe across session reloads. */
+export function startAgentSupervisor(options: AgentSupervisorOptions = {}) {
+	if (isAgentChild()) {
+		if (!options.allowBackground || !options.adoptSessionIds) return;
+	}
 	const G = globalThis as any;
 	const key = Symbol.for("pi.inbox.agentSupervisor");
 	if (G[key]) clearInterval(G[key]);
 	const tick = () => {
 		for (const a of listAgents()) if (needsPersist(a)) persist(a);
-		adoptOrphans();
+		adoptOrphans(options.adoptSessionIds);
 	};
 	G[key] = setInterval(tick, OWNER_BEAT_MS);
 	G[key].unref?.();
 	tick();
 }
 
-function adoptOrphans() {
+function adoptOrphans(allowedIds?: ReadonlySet<string>) {
 	let names: string[] = [];
 	try {
 		names = fs.readdirSync(AGENTS_DIR);
@@ -696,6 +701,7 @@ function adoptOrphans() {
 	for (const n of names) {
 		if (!n.endsWith(".json")) continue;
 		const id = n.slice(0, -5);
+		if (allowedIds && !allowedIds.has(id)) continue;
 		if (registry().agents.has(id)) continue;
 		let s: SavedAgent;
 		try {

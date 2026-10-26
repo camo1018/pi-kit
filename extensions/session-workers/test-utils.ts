@@ -3,7 +3,10 @@ import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TestContext } from "node:test";
-import type { BgAgent } from "../../lib/inbox-agents.ts";
+import type {
+	AgentSupervisorOptions,
+	BgAgent,
+} from "../../lib/inbox-agents.ts";
 import { WorkerTeam, type WorkerRunner } from "./workers.ts";
 
 export function setup(t: TestContext) {
@@ -11,6 +14,7 @@ export function setup(t: TestContext) {
 	const agents = new Map<string, BgAgent>();
 	const files = new Map<string, string>();
 	const calls: { kind: string; data: unknown }[] = [];
+	const supervision: (AgentSupervisorOptions | undefined)[] = [];
 	// Process-runner boundary: no actual Pi/model process runs in tests.
 	const runner: WorkerRunner = {
 		spawn(opts) {
@@ -53,7 +57,9 @@ export function setup(t: TestContext) {
 		find: (id) => files.get(id),
 		rename: (id, title) =>
 			calls.push({ kind: "rename", data: { id, title } }),
-		supervise() {},
+		supervise(options) {
+			supervision.push(options);
+		},
 	};
 	const team = new WorkerTeam(dir, runner);
 	const spawn = (parentId = "parent") =>
@@ -67,5 +73,5 @@ export function setup(t: TestContext) {
 			extensionPath: "/extensions/session-workers/index.ts",
 		});
 	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-	return { dir, team, agents, files, calls, spawn };
+	return { dir, team, agents, files, calls, supervision, spawn };
 }

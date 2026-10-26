@@ -7,6 +7,7 @@ import {
 	cancelAgent,
 	findSessionFile,
 	getAgent,
+	isAgentChild,
 	renameAgent,
 	sendToAgent,
 	spawnAgent,
@@ -149,9 +150,24 @@ export class WorkerTeam {
 	private requireParent(caller: string): void {
 		if (this.parent(caller) !== caller) {
 			throw new Error(
-				"Only the parent may spawn, send, or cancel workers",
+				"Only the parent may spawn, send, or cancel workers " +
+					"(maximum delegation depth: 1)",
 			);
 		}
+	}
+
+	supervise(caller: string): void {
+		this.requireParent(caller);
+		// A background parent must not adopt its own run or unrelated agents.
+		const options = isAgentChild()
+			? {
+					allowBackground: true,
+					adoptSessionIds: new Set(
+						this.workers(caller).map((worker) => worker.id),
+					),
+				}
+			: undefined;
+		this.runner.supervise(options);
 	}
 
 	async spawn(opts: {
@@ -204,7 +220,7 @@ export class WorkerTeam {
 		]
 			.filter(Boolean)
 			.join("\n");
-		this.runner.supervise();
+		this.supervise(opts.parentId);
 		this.runner.rename(worker.id, worker.title);
 		this.runner.spawn({
 			...worker,
@@ -271,7 +287,7 @@ export class WorkerTeam {
 	private controllable(caller: string, id: string): Worker {
 		this.requireParent(caller);
 		const worker = this.requireWorker(caller, id);
-		this.runner.supervise();
+		this.supervise(caller);
 		if (!this.runner.get(id) && this.saved(id)) {
 			throw new Error(
 				"Worker belongs to another Pi process; " +

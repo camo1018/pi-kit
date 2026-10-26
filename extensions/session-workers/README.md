@@ -1,9 +1,9 @@
 # Session workers
 
 A model-callable delegation layer on the existing inbox background runner.
-One session can start independent sessions while continuing its own work.
-These are normal persistent Pi sessions, visible in `/inbox`, not disposable
-in-memory subagents.
+A foreground or background parent can start independent sessions while
+continuing its own work. No takeover is required. These are normal persistent
+Pi sessions, visible in `/inbox`, not disposable in-memory subagents.
 
 ## Enable
 
@@ -79,8 +79,13 @@ already have the same filesystem permissions. Do not put credentials in notes.
 
 ## Boundaries and safety
 
+- Normal foreground and background sessions can delegate. In orchestrator
+  mode, an attached background parent works without `/takeover`.
 - Only the parent may spawn, send, or cancel; workers can read and share.
-  Background children cannot recursively spawn workers.
+  Delegation depth is capped at **one**: a worker created by this tool cannot
+  spawn another generation. The guard uses persistent team membership, not
+  foreground/background process mode, so taking over a worker or consuming
+  its startup environment marker does not reset its depth.
 - Default cwd and model/thinking level come from the executing parent, not a
   visited inbox row. `cwd` can select a dedicated worktree; it must exist.
 - Workers load normal Pi settings, skills, and project instructions. Runtime
@@ -99,9 +104,13 @@ already have the same filesystem permissions. Do not put credentials in notes.
   window, cannot be sent another background run from this tool. Use its inbox
   or wait for the runner's orphan adoption. This prevents known second-writer
   cases; Pi sessions without inbox live records can't be detected.
-- Workers outlive the parent window, matching inbox semantics. Another
-  interactive window adopts orphaned runs/queues. Without a supervisor, a
-  queued follow-up waits until an interactive Pi window is available.
+- Workers outlive the parent run/window, matching inbox semantics. A running
+  background parent heartbeats its owned workers and can adopt only its own
+  team's orphaned runs, never its upstream parent or unrelated sessions.
+  Foreground inbox windows retain normal global orphan adoption. A resumed
+  background parent also starts its team supervisor; ownership still follows
+  the existing heartbeat grace period. Queues wait while no eligible
+  supervisor is running.
 - Completion doesn't automatically wake an idle parent or launch another
   parent model turn. Use `wait` while coordinating, or check the inbox later.
 
