@@ -2,8 +2,10 @@
 name: parallel
 description: >-
   Delegate independent work to persistent Pi worker sessions, exchange findings
-  and bigbrain context, then integrate and validate the results. Use when the
-  user asks to parallelize a task or invokes $parallel. Supports foreground and
+  and bigbrain context, then integrate and validate the results. Use ONLY when
+  the user explicitly asks to parallelize or delegate work (e.g. "parallelize
+  this", "fan this out", "use workers") or invokes $parallel. Never use for
+  ordinary tasks that merely look parallelizable. Supports foreground and
   background parents without takeover.
 compatibility: Requires Pi with the session-workers extension enabled.
 ---
@@ -16,6 +18,10 @@ Ask one concise question only if there is no identifiable unfinished task.
 
 ## Defaults
 
+- **Delegation is opt-in.** Start workers only when the user explicitly asked
+  to parallelize, delegate, or fan out (this skill, `$parallel`, or similar
+  wording). Do not volunteer workers for tasks that merely look parallelizable;
+  do the work directly. When in doubt, don't spawn.
 - Start **two workers** for useful independent parts of the task. Honor an
   explicit worker count, model, directory, or scope from the user. Don't invent
   busywork or split dependent steps just to use workers; handle trivial work

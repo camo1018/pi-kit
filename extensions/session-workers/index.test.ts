@@ -73,6 +73,22 @@ function harness(
 	};
 }
 
+test("delegation guidelines are opt-in", (t: TestContext) => {
+	const s = harness(t);
+	assert.ok(s.tool);
+	const guidelines = s.tool.promptGuidelines?.join(" ") ?? "";
+	assert.match(
+		guidelines,
+		/only use session_workers when the user\s+explicitly asks/i,
+	);
+	assert.match(
+		guidelines,
+		/Never spawn workers on your own\s+initiative/i,
+	);
+	// The description the model sees alongside the tool must say the same.
+	assert.match(s.tool.description, /only on\s+explicit user request/i);
+});
+
 test("agent tool spawns with parent defaults and follows up", async (t) => {
 	const s = harness(t);
 	assert.equal(s.tool?.name, "session_workers");

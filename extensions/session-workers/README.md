@@ -34,6 +34,12 @@ an existing request. The skill handles task handoffs, shared findings, worktree
 isolation for edits, and parent-side integration/validation. Background parents
 work normally; no takeover is required.
 
+**Delegation is opt-in.** Both the skill and the `session_workers` tool
+prompt-guidelines instruct agents to spawn workers only when the user
+explicitly asks to parallelize, delegate, or fan out — never on the agent's
+own initiative. If a session starts workers you did not ask for, treat that
+as a bug in the guideline wording, not an invitation.
+
 ## Tool: `session_workers`
 
 | Action | Inputs | Behavior |

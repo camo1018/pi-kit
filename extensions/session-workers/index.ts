@@ -132,7 +132,8 @@ export function registerSessionWorkers(
 		name: "session_workers",
 		label: "Session Workers",
 		description:
-			"Delegate parallel work to persistent Pi sessions. " +
+			"Delegate parallel work to persistent Pi sessions, only on " +
+			"explicit user request. " +
 			"spawn returns immediately; list/read show results, wait waits " +
 			"up to 60 seconds for one worker or the team. send queues a " +
 			"follow-up (not mid-run steering); cancel clears its queue. " +
@@ -142,11 +143,17 @@ export function registerSessionWorkers(
 			"Foreground and background parents can delegate one level; " +
 			"delegated workers cannot spawn another generation.",
 		promptGuidelines: [
-			"Use session_workers for independent tasks when parallel work " +
-				"helps. Give workers explicit scope, context, and deliverables.",
-			"Use separate worktrees for concurrent code edits; otherwise " +
-				"assign disjoint files or read-only tasks. Do not delegate " +
-				"commits, pushes, or external writes without authorization.",
+			"Delegation is opt-in: only use session_workers when the user " +
+				"explicitly asks to parallelize, delegate, or fan out work " +
+				"(or invokes $parallel). Never spawn workers on your own " +
+				"initiative to speed a task, help with a large request, or " +
+				"batch subtasks; do the work directly instead. Each worker " +
+				"is a full session with real cost.",
+			"When delegation IS requested, give workers explicit scope, " +
+				"context, and deliverables. Use separate worktrees for " +
+				"concurrent code edits; otherwise assign disjoint files or " +
+				"read-only tasks. Do not delegate commits, pushes, or " +
+				"external writes without authorization.",
 			"Shared notes refresh on model requests, not during a running " +
 				"tool. An idle worker may be blocked; inspect its reply. " +
 				"Check all worker results before declaring the task complete.",
