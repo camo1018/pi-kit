@@ -44,6 +44,7 @@ writeFileSync(join(dir, "notify.json"), JSON.stringify({ enabled: false }));
 const { default: inbox } = await import("./index.ts");
 const {
 	applyEvent,
+	MAX_CONCURRENT,
 	registry,
 	removeQueuedMessage,
 	releaseAgent,
@@ -165,7 +166,7 @@ async function setup(t: TestContext, takenOver = true) {
 			name, description: name, source: "extension",
 			sourceInfo: { path: "test" },
 		})),
-		getThinkingLevel: () => "off",
+		getThinkingLevel: () => foregroundSession.state.thinkingLevel,
 		sendUserMessage: mock.fn(),
 	} as unknown as ExtensionAPI;
 	const widgets = new Map<string, any>();
@@ -251,10 +252,14 @@ async function setup(t: TestContext, takenOver = true) {
 		switchSession: mock.fn(async () => ({ cancelled: false })),
 	} as unknown as ExtensionCommandContext;
 
-	async function emit(name: string, event: any = {}) {
+	async function emit(
+		name: string,
+		event: any = {},
+		context: ExtensionCommandContext = ctx,
+	) {
 		const results = [];
 		for (const handler of handlers.get(name) ?? []) {
-			results.push(await handler(event, ctx));
+			results.push(await handler(event, context));
 		}
 		return results;
 	}
@@ -808,29 +813,204 @@ test("pin and archive target the viewed session", async (t) => {
 	assert.equal(store.sessions[f.main.getSessionId()].archivedAt, undefined);
 });
 
-test("new-agent composition inherits the viewed directory and window's model", async (t) => {
-	const f = await setup(t);
-	const cwd = join(dir, "another-project");
-	await f.visit("other project", true, cwd);
-	assert.deepEqual(f.key("\x10"), { consume: true });
-	await nextTick();
+test("new-agent composition uses the viewed directory and main model",
+	async (t) => {
+		const f = await setup(t);
+		const cwd = join(dir, "another-project");
+		await f.visit("other project", true, cwd);
+		assert.deepEqual(f.key("\x10"), { consume: true });
+		await nextTick();
+		const { list, done } = await f.openInbox();
+		list.handleInput("n");
+		await done;
+		const globals = globalThis as any;
+		assert.equal(globals[Symbol.for("pi.inbox.reply-target")].cwd, cwd);
+		// Keep the viewed directory, but use the main's model, not the visit's.
+		assert.equal(
+			globals[Symbol.for("pi.inbox.reply-target")].model,
+			"test/alpha:low",
+		);
+		assert.ok(globals[Symbol.for("pi.inbox.mode")].takenOver.has(
+			f.main.getSessionId(),
+		));
+	});
+
+function mockHomeSwitch(f: Awaited<ReturnType<typeof setup>>) {
+	f.ctx.model = models[1];
+	const home = SessionManager.create(dir);
+	home.appendModelChange("test", "alpha");
+	home.appendThinkingLevelChange("low");
+	const fresh = { ...f.ctx, sessionManager: home, model: models[0] };
+	f.ctx.newSession = mock.fn(async (options) => {
+		await f.emit("session_start", { reason: "new" }, fresh);
+		await options?.withSession?.(fresh as any);
+		return { cancelled: false };
+	});
+	return fresh;
+}
+
+test("new-agent default follows the fresh home model, not the attached model",
+	async (t) => {
+		const f = await setup(t, false);
+		const fresh = mockHomeSwitch(f);
+		const { list, done } = await f.openInbox();
+		list.handleInput("n");
+		await done;
+		const target = (globalThis as any)[
+			Symbol.for("pi.inbox.reply-target")
+		];
+		assert.equal(target.model, "test/alpha:low");
+		assert.equal(fresh.model.id, "alpha");
+		assert.match(f.widgets.get("inbox-reply").render(120).join("\n"),
+			/test\/alpha:low/);
+		// Keep launch slots occupied so routing can be tested without a child
+		// process or a provider request. The queued agent must use this model.
+		t.mock.timers.enable({ apis: ["setInterval"] });
+		for (let i = 0; i < MAX_CONCURRENT; i++) {
+			const id = `busy-${i}`;
+			registry().agents.set(id, {
+				id, cwd: dir, title: id, state: "working",
+				proc: { kill: mock.fn() }, pending: [],
+				createdAt: 0, updatedAt: 0, needsYou: false,
+				runs: 1, log: [], liveText: "",
+			} as BgAgent);
+		}
+		await f.emit("input", {
+			source: "interactive", text: "run on the home model",
+		}, fresh);
+		const queued = [...registry().agents.values()].find(
+			(a) => a.state === "queued",
+		);
+		assert.equal(queued?.model, "test/alpha:low");
+		assert.deepEqual(queued?.pending, ["run on the home model"]);
+	});
+
+test("cancelling the home switch cancels the new-agent draft", async (t) => {
+	const f = await setup(t, false);
+	f.ctx.newSession = mock.fn(async () => ({ cancelled: true }));
 	const { list, done } = await f.openInbox();
 	list.handleInput("n");
+	await nextTick();
+	assert.equal((globalThis as any)[
+		Symbol.for("pi.inbox.reply-target")
+	], undefined);
+	f.overlay().handleInput("\x1b");
 	await done;
-	const globals = globalThis as any;
-	assert.equal(globals[Symbol.for("pi.inbox.reply-target")].cwd, cwd);
-	// A new agent uses this window's model, NOT the visited session's model:
-	// inheriting the visit's model seeded agents with e.g. frontier-model while the
-	// main stayed on cheap-model, and re-picking the main's model was a no-op (no
-	// model_select for an unchanged model). The main here runs test/alpha:low.
-	assert.equal(
-		globals[Symbol.for("pi.inbox.reply-target")].model,
-		"test/alpha:low",
-	);
-	assert.ok(
-		globals[Symbol.for("pi.inbox.mode")].takenOver.has(f.main.getSessionId()),
-	);
 });
+
+test("an explicit new-agent model survives the switch to blank home",
+	async (t) => {
+		const f = await setup(t, false);
+		mockHomeSwitch(f);
+		f.ui.select = mock.fn(async () => "test/vendor/gamma:free:high");
+		const { list, done } = await f.openInbox();
+		list.handleInput("N");
+		await done;
+		assert.equal((globalThis as any)[
+			Symbol.for("pi.inbox.reply-target")
+		].model, "test/vendor/gamma:free:high");
+	});
+
+async function composeOnAnotherModel(
+	f: Awaited<ReturnType<typeof setup>>,
+) {
+	f.ui.select = mock.fn(async () => "test/beta:low");
+	const { list, done } = await f.openInbox();
+	list.handleInput("N");
+	await done;
+	return (globalThis as any)[Symbol.for("pi.inbox.reply-target")];
+}
+
+test("confirming the current model repairs a different pending agent model",
+	async (t) => {
+		const f = await setup(t);
+		const target = await composeOnAnotherModel(f);
+		// Pi emits no model_select when alpha is selected again.
+		(f.pi.setModel as any).mock.mockImplementation(async () => true);
+		assert.equal(target.model, "test/beta:low");
+		assert.deepEqual(f.key("\x0c"), { consume: true });
+		assert.equal(f.overlay().constructor.name, "ModelSelectorComponent");
+		f.overlay().handleInput("alpha");
+		f.overlay().handleInput("\r");
+		await nextTick();
+		assert.equal(target.model, "test/alpha:low");
+		assert.equal((f.pi.setModel as any).mock.calls[0].arguments[0],
+			models[0]);
+	});
+
+test("/model can reselect the current model for a pending agent", async (t) => {
+	const f = await setup(t);
+	const target = await composeOnAnotherModel(f);
+	(f.pi.setModel as any).mock.mockImplementation(async () => true);
+	f.ui.setEditorText("/model test/alpha");
+	assert.deepEqual(f.key("\r"), { consume: true });
+	await nextTick();
+	assert.equal(target.model, "test/alpha:low");
+	assert.equal(f.ui.getEditorText(), "");
+});
+
+test("cancelling a pending-agent model picker preserves its choice",
+	async (t) => {
+		const f = await setup(t);
+		const target = await composeOnAnotherModel(f);
+		assert.deepEqual(f.key("\x0c"), { consume: true });
+		f.overlay().handleInput("\x1b");
+		await nextTick();
+		assert.equal(target.model, "test/beta:low");
+		assert.equal((f.pi.setModel as any).mock.calls.length, 0);
+	});
+
+test("a pending-agent model picker cannot apply to a replaced draft",
+	async (t) => {
+		const f = await setup(t);
+		const target = await composeOnAnotherModel(f);
+		assert.deepEqual(f.key("\x0c"), { consume: true });
+		delete (globalThis as any)[Symbol.for("pi.inbox.reply-target")];
+		f.overlay().handleInput("alpha");
+		f.overlay().handleInput("\r");
+		await nextTick();
+		assert.equal(target.model, "test/beta:low");
+		assert.equal((f.pi.setModel as any).mock.calls.length, 0);
+	});
+
+test("an unavailable model cannot replace the pending agent's choice",
+	async (t) => {
+		const f = await setup(t);
+		const target = await composeOnAnotherModel(f);
+		(f.pi.setModel as any).mock.mockImplementation(async () => false);
+		f.ui.setEditorText("/model test/alpha");
+		assert.deepEqual(f.key("\r"), { consume: true });
+		await nextTick();
+		assert.equal(target.model, "test/beta:low");
+		assert.equal(f.ui.notify.mock.calls.at(-1)?.arguments[1], "warning");
+	});
+
+test("opening a visit invalidates a pending-agent model picker", async (t) => {
+	const f = await setup(t);
+	const target = await composeOnAnotherModel(f);
+	assert.deepEqual(f.key("\x0c"), { consume: true });
+	const picker = f.overlay();
+	const a = await f.visit("another session");
+	picker.handleInput("alpha");
+	picker.handleInput("\r");
+	await nextTick();
+	assert.equal(target.model, "test/beta:low");
+	assert.equal(a.nextModel, undefined);
+	assert.equal((f.pi.setModel as any).mock.calls.length, 0);
+});
+
+test("reloading extensions invalidates a pending-agent model picker",
+	async (t) => {
+		const f = await setup(t);
+		const target = await composeOnAnotherModel(f);
+		assert.deepEqual(f.key("\x0c"), { consume: true });
+		(globalThis as any).__piInboxPi = {};
+		f.overlay().handleInput("alpha");
+		f.overlay().handleInput("\r");
+		await nextTick();
+		assert.equal(target.model, "test/beta:low");
+		assert.equal((f.pi.setModel as any).mock.calls.length, 0);
+	});
 
 async function waitForList(list: any) {
 	for (let i = 0; i < 200 && list.loading; i++) {

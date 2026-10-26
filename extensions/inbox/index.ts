@@ -83,6 +83,7 @@ import {
 import { handleVisitModelInput } from "./visit-models.ts";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -95,6 +96,7 @@ import {
 	getAgentDir,
 	getMarkdownTheme,
 	getSelectListTheme,
+	ModelSelectorComponent,
 	parseSkillBlock,
 	SessionManager,
 	SettingsManager,
@@ -137,6 +139,7 @@ import {
 	installAgentChildHooks,
 	isAgentChild,
 	markSeen,
+	parseAgentModel,
 	recordActualThinkingLevel,
 	setAgentDir,
 	startAgentSupervisor,
@@ -4639,6 +4642,125 @@ export default function (pi: ExtensionAPI) {
 		return ctx.ui.select("Model for the new background agent", options);
 	}
 
+	/** Confirm draft choices even when Pi suppresses model_select. */
+	function handleReplyModelInput(
+		data: string,
+		ctx: ExtensionContext,
+	): boolean {
+		const target = getReplyTarget();
+		if (!target) return false;
+		const kb = getKeybindings();
+		let search: string | undefined;
+		if (!kb.matches(data, "app.model.select")) {
+			if (
+				!kb.matches(data, "tui.input.submit") &&
+				!kb.matches(data, "app.message.followUp")
+			) return false;
+			const command = ctx.ui.getEditorText().trim().match(
+				/^\/model(?:\s+(.*))?$/s,
+			);
+			if (!command) return false;
+			search = command[1]?.trim() || undefined;
+			ctx.ui.setEditorText("");
+		}
+		const draft = target;
+		const sessionId = ctx.sessionManager.getSessionId();
+		const active = () => {
+			const live = (G.__piInboxAgentsCtx as ExtensionContext) ?? ctx;
+			return (
+				G.__piInboxPi === pi && !isVisiting() &&
+				getReplyTarget() === draft &&
+				live.sessionManager.getSessionId() === sessionId
+			);
+		};
+		void select().catch((error) => {
+			if (active()) {
+				ctx.ui.notify(`Model selection failed: ${String(error)}`, "error");
+			}
+		});
+		return true;
+
+		async function select() {
+			const registry = ctx.modelRegistry;
+			const settings = SettingsManager.create(ctx.cwd, getAgentDir(), {
+				projectTrusted: ctx.isProjectTrusted(),
+			});
+			const reference = parseAgentModel(
+				draft.model ?? (
+					draft.kind === "agent" ? draft.agentModel : currentModel(ctx)
+				),
+			);
+			const current = reference && registry.find(
+				reference.provider,
+				reference.id,
+			);
+			let selected: { model: Model<Api>; persist: boolean } | undefined;
+			const choices = registry.getAvailable();
+			if (search) {
+				const exact = choices.filter((m) =>
+					m.id.toLowerCase() === search!.toLowerCase() ||
+					`${m.provider}/${m.id}`.toLowerCase() === search!.toLowerCase(),
+				);
+				if (exact.length === 1) {
+					selected = { model: exact[0], persist: false };
+				}
+			}
+			if (!selected) {
+				const runtime = {
+					getAvailableSnapshot: () => registry.getAvailable(),
+					getModel: (provider: string, id: string) =>
+						registry.find(provider, id),
+					getError: () => registry.getError(),
+					refresh: (options: Parameters<typeof registry.refresh>[0]) =>
+						registry.refresh(options),
+				} as unknown as
+					ConstructorParameters<typeof ModelSelectorComponent>[2];
+				selected = await ctx.ui.custom<typeof selected>(
+					(tui, _theme, _kb, done) => new ModelSelectorComponent(
+						tui,
+						current,
+						runtime,
+						ctx.scopedModels,
+						(model) => done({ model, persist: false }),
+						() => done(undefined),
+						search,
+						(model) => done({ model, persist: true }),
+						settings.getDefaultProvider() && settings.getDefaultModel()
+							? {
+								provider: settings.getDefaultProvider()!,
+								id: settings.getDefaultModel()!,
+							} : undefined,
+					),
+				);
+			}
+			if (!selected || !active()) return;
+			const p = (G.__piInboxPi ?? pi) as ExtensionAPI;
+			const success = await p.setModel(selected.model);
+			if (!active()) return;
+			if (!success) {
+				ctx.ui.notify(
+					`No API key for ${selected.model.provider}/${selected.model.id}`,
+					"warning",
+				);
+				return;
+			}
+			// Do not rely on model_select: choosing the foreground model again
+			// emits no event, but must still replace a different draft choice.
+			draft.model = withLevel(
+				`${selected.model.provider}/${selected.model.id}`,
+				p.getThinkingLevel(),
+			);
+			if (selected.persist) {
+				settings.setDefaultModelAndProvider(
+					selected.model.provider,
+					selected.model.id,
+				);
+			}
+			const live = (G.__piInboxAgentsCtx as ExtensionContext) ?? ctx;
+			showReplyWidget(live);
+		}
+	}
+
 	/**
 	 * Directory picker overlay (orchestrator: stays full-screen). undefined = cancelled.
 	 * `ctx` is any ExtensionContext: the pending-dir is stored on globalThis, so the picker can be
@@ -5053,7 +5175,13 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/** Orchestrator: leave the current session (it stays saved) and return to the blank home session. */
-	async function goHome(ctx: ExtensionCommandContext, opts: { reopen?: boolean } = {}): Promise<boolean> {
+	async function goHome(
+		ctx: ExtensionCommandContext,
+		opts: {
+			reopen?: boolean;
+			withSession?: (ctx: ExtensionContext) => Promise<void>;
+		} = {},
+	): Promise<boolean> {
 		if (isHome(ctx)) return true;
 		const ms = modeState();
 		// End a visit first: the visited session goes back to being a pure background
@@ -5065,7 +5193,7 @@ export default function (pi: ExtensionAPI) {
 		const resume = await prepareLeave(ctx);
 		// session_start on the new blank session reopens the orchestrator (unless reopen: false).
 		ms.skipReopen = opts.reopen === false;
-		const r = await ctx.newSession();
+		const r = await ctx.newSession({ withSession: opts.withSession });
 		if (r.cancelled) ms.skipReopen = false;
 		else resume?.();
 		return !r.cancelled;
@@ -5240,10 +5368,8 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (result.action === "new") {
-				// Always this window's model: a new agent must not inherit the model of
-				// the session being visited (that seeded e.g. frontier-model while the main
-				// stayed on cheap-model, and re-picking the main's model emitted no
-				// model_select since it wasn't a change). `N` still overrides.
+				// Sticky composition uses the main's model, not a visit's. Blank-home
+				// composition resolves its default again after the session switch.
 				let model = currentModel(ctx);
 				if (result.pickModel) {
 					const picked = await pickModel(ctx, model);
@@ -5272,25 +5398,29 @@ export default function (pi: ExtensionAPI) {
 					);
 					return;
 				}
-				// No sticky main: retain the existing blank-home compose flow.
-				setReplyTarget(
-					{
-						kind: "new",
-						cwd: viewed.cwd,
-						model,
-						groupId: result.rowGroup
-							? result.rowGroup.id
-							: nextAgentTargetGroup(),
-					},
-					ctx,
-				);
-				if (
-					orchestrating() &&
-					!isHome(ctx) &&
-					!(await goHome(ctx, { reopen: false }))
-				) {
-					setReplyTarget(undefined, ctx);
-					continue;
+				// Preserve the draft across the switch, then bind its default model
+				// to the fresh home context. Pi can reset the model on newSession.
+				const pickedModel = result.pickModel;
+				const target: Extract<ReplyTarget, { kind: "new" }> = {
+					kind: "new",
+					cwd: viewed.cwd,
+					model,
+					groupId: result.rowGroup
+						? result.rowGroup.id : nextAgentTargetGroup(),
+				};
+				setReplyTarget(target, ctx);
+				if (orchestrating() && !isHome(ctx)) {
+					const returned = await goHome(ctx, {
+						reopen: false,
+						withSession: async (fresh) => {
+							if (!pickedModel) target.model = currentModel(fresh);
+							setReplyTarget(target, fresh);
+						},
+					});
+					if (!returned) {
+						setReplyTarget(undefined, ctx);
+						continue;
+					}
 				}
 				return;
 			}
@@ -6373,6 +6503,10 @@ export default function (pi: ExtensionAPI) {
 				(G.__piInboxAgentsCtx as ExtensionContext | undefined) ?? ctx;
 			const visit = visitState().visit;
 			const tui = activeInboxTui(current);
+			if (
+				!visit && !modeState().inLoop && focusedEditor(true) &&
+				handleReplyModelInput(data, current)
+			) return { consume: true };
 			if (
 				visit && tui && !modeState().inLoop && focusedEditor(true) &&
 				handleVisitModelInput(data, current, tui,
