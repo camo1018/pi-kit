@@ -123,11 +123,11 @@ competing for top-level inbox rows. Families are **collapsed by default**;
 new workers and finished results never expand them unexpectedly.
 
 ```text
-▸ ● Fix retry bug          2 workers · 1 running · 1 unread
+▸ ● Fix retry bug [2w ●1 •1]    ↳ Fixed the retry handling…
 
-▾ ● Fix retry bug          2 workers · 1 running · 1 unread
-    ├─ ● Trace callers    investigating…
-    └─ ◆ Check retries    result ready
+▾ ● Fix retry bug [2w ●1 •1]    ↳ Fixed the retry handling…
+  ├─ ● Trace callers          ↳ Checking caller compatibility…
+  └─ ◆ Check retries          ↳ Added retry edge-case coverage
 ```
 
 - **Space** expands/collapses a family. From a selected child it collapses the
