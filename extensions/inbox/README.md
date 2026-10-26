@@ -20,7 +20,7 @@ Source: `~/Code/pi-kit/extensions/inbox/index.ts` (background agents: `~/Code/pi
 | `/inbox groups` | Select the group view and create/manage groups |
 | `/group` | Move the session on screen into a group (including busy sessions) |
 | `/pin` | Toggle pin on the current session |
-| `/archive` | Toggle archive (done) on the current session |
+| `/archive` | Archive/restore the session on screen; a parent includes its delegated workers |
 | `/rename [title]` | Rename the current session (no title: auto-title from its first user message). Also available to the agent as the `rename-chat` tool — same naming, works on background-agent sessions too via its `session` param |
 | `/bookmark`, `ctrl+b`, or `ctrl+shift+b` | Fullscreen mode: return to the transcript position saved when you last opened the inbox or switched away |
 | `ctrl+r` | Rename the current session. On orchestrator home / while typing a new agent's first prompt (`n`), names that new agent instead (empty = name from its prompt); after sending, renames the just-started agent |
@@ -33,6 +33,7 @@ Pi-kit's `config/keybindings.json` binds `app.thinking.cycle` to `ctrl+shift+e`,
 |---|---|
 | `↑` `↓` / `j` `k` | Move |
 | `←` `→` | Move up / down 5 rows |
+| `space` | Expand/collapse the selected worker family; from a child, collapse returns selection to its parent |
 | `PgUp` `PgDn`, `home` `end` | Page / jump to top or bottom |
 | `enter` | **Agent view**: live transcript of the session; `r` there to reply (see [Background agents](#background-agents)) |
 | `o` | Open (switch to) the selected session in this window. In orchestrator mode: open it attached (same as `enter`) |
@@ -114,6 +115,51 @@ What to expect:
 - **At most 6 run at once** (set `PI_INBOX_MAX_AGENTS` to change it). Extra ones show `● queued`.
 - **They outlive this window.** Agents are detached processes: quitting pi, closing the tab (or a shell watchdog killing pi) does **not** stop them; the run in flight finishes on its own. Their state, including queued messages, is kept in `~/.pi/agent/inbox-agents/`. The window that started an agent owns it (heartbeat every 5s). If the owner goes away, any other open pi window adopts the agent within ~20s, or the next pi you start does. Adopting means it replays what the agent did so far, keeps following it, pings when it finishes, and delivers queued messages. Queued messages only start once some pi window is open. Stop an agent explicitly with `/stop`, `ctrl+shift+s` or `c`. Switching sessions doesn't stop agents either. Other windows see agents they don't own as `● working` but can't reply to them.
 - **Parallel agents in one repo can collide** when they edit the same files. Give each its own git worktree, or keep parallel work to separate files or read-only tasks.
+
+## Worker session families
+
+Sessions created by `session_workers` appear under their parent instead of
+competing for top-level inbox rows. Families are **collapsed by default**;
+new workers and finished results never expand them unexpectedly.
+
+```text
+▸ ● Fix retry bug          2 workers · 1 running · 1 unread
+
+▾ ● Fix retry bug          2 workers · 1 running · 1 unread
+    ├─ ● Trace callers    investigating…
+    └─ ◆ Check retries    result ready
+```
+
+- **Space** expands/collapses a family. From a selected child it collapses the
+  family and selects the parent. Up/Down traverse visible rows; Enter still
+  opens/views the selected session. Left/Right retain their five-row movement.
+- Fold choices survive refresh, reopening, restart, and multiple windows. They
+  live separately in `<agent-dir>/inbox-worker-folds.json`; folded workers keep
+  running normally. No process ownership or queue changes occur on folding.
+- The parent retains its own status and unread marker. Its worker summary
+  reports eligible workers, running/queued work, errors, and unread results;
+  narrow rows use `w`, `●`, `✗`, and `•` compact counters. Opening a parent does
+  not mark its children read.
+- Children stay in creation order, regardless of progress updates or pins.
+  Parent pin/activity ordering remains unchanged. Normal sessions and ordinary
+  forks/clones are not nested merely because they share a group or history.
+- Search temporarily opens matching families without changing saved folds.
+  Clearing search restores those folds. While typing, Space remains text;
+  with a retained query, clear it before changing folds.
+- Tab, filter-rule, and group eligibility apply to child sessions. An existing
+  parent hidden by the current view can appear as `[parent context]` so matching
+  children remain nested. Group sections anchor normal families to the parent;
+  cross-group children show their actual group when the group column is absent.
+  A missing parent never makes a child disappear: it remains accessible with
+  `[parent unavailable]`.
+- Background-owned startup workers can appear before their transcript exists.
+  Their state is read from the owner's record; the inbox does not adopt them or
+  manufacture a control handle just to display them.
+- **Archive a parent** (`a` or `/archive`) to archive its whole family, including
+  hidden or not-yet-saved workers. Restoring a parent restores its workers too.
+  Archive a child to affect only that child. Archiving is metadata only: it
+  does **not** stop running agents or clear queues. Cancellation retains its
+  existing selected-session behavior; there is no implicit family-wide stop.
 
 ## Orchestrator mode
 
@@ -344,7 +390,8 @@ working directory needs to be maintained:
 
 It runs in the feature worktree and invokes `node_modules/.bin/pi` explicitly,
 not the `pi` command on PATH (which may be a wrapper using live configuration).
-It creates temporary configuration/state and two synthetic sessions, and loads
+It creates temporary state, two synthetic parents and two workers under the
+first parent, and loads
 this worktree's inbox, inline-skills and a preview identity guard. A synthetic
 `preview-review` skill is included for trying `/skill:preview-review` and
 `$preview-review` completion. The header says
@@ -358,6 +405,10 @@ Temporary state is removed on exit unless preview agents or queued work remain;
 in that case the script prints the preserved path. Stop preview agents before
 removing that directory. `--help` can be passed to smoke-test extension loading
 without opening an interactive window.
+
+Select PR review demo and press Space to expand/collapse its two workers.
+Use Up/Down and Enter to inspect child sessions; archiving the parent archives
+both workers too. This preview performs no real worker execution.
 
 Try creating PR reviews, editing and enabling its template, moving a demo
 session with b, selecting the group, and pressing n. Then use Ctrl+G to change

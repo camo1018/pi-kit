@@ -80,6 +80,7 @@ const usage = {
   input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
+const sessions = [];
 for (const title of ["PR review demo", "Bug triage demo"]) {
   const session = SessionManager.create(root);
   session.appendMessage({
@@ -91,6 +92,23 @@ for (const title of ["PR review demo", "Bug triage demo"]) {
     content: [{ type: "text", text: "Preview only. No real task has run." }],
   });
   session.appendSessionInfo(title);
+  sessions.push(session);
+}
+const workers = path.join(dir, "session-workers", "workers");
+fs.mkdirSync(workers, { recursive: true });
+for (const title of ["Callers audit demo", "Test coverage demo"]) {
+  const child = SessionManager.create(root);
+  child.appendMessage({ role: "user", content: title, timestamp: Date.now() });
+  child.appendMessage({
+    role: "assistant", api: "openai-responses", provider: "preview",
+    model: "preview", stopReason: "stop", timestamp: Date.now(), usage,
+    content: [{ type: "text", text: "Preview finding only; no real work ran." }],
+  });
+  child.appendSessionInfo(title);
+  fs.writeFileSync(path.join(workers, `${child.getSessionId()}.json`),
+    JSON.stringify({ id: child.getSessionId(),
+      parentId: sessions[0].getSessionId(), createdAt: Date.now(),
+      title, cwd: root }));
 }
 JS
 printf 'INBOX PREVIEW: temporary state at %s\n' "$STATE"

@@ -1,6 +1,6 @@
-import type {
-	ReadonlySessionManager,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+
+type ReadonlySessionManager = ExtensionContext["sessionManager"];
 
 export type BranchKind = "Clone" | "Fork";
 
@@ -28,9 +28,10 @@ export function sourceName(sm: ReadonlySessionManager): string {
 /** Compare against the local snapshot, not a newer background writer's tip. */
 export function selectedHistory(sm: ReadonlySessionManager): boolean {
 	const leaf = sm.getLeafEntry();
-	return sm.getLeafId() !== sm.getEntries().at(-1)?.id ||
-		(leaf?.type === "custom" &&
-			leaf.customType === "pi-kit.tree-position");
+	return (
+		sm.getLeafId() !== sm.getEntries().at(-1)?.id ||
+		(leaf?.type === "custom" && leaf.customType === "pi-kit.tree-position")
+	);
 }
 
 /** Never include any of the active run, even its completed tool steps. */
@@ -48,9 +49,10 @@ export function beforeRun(
 	// prompt since launch (not the latest: steering belongs to the same run).
 	const prompts = branch.filter((e) =>
 		e.type === "message" && e.message.role === "user");
-	const prompt = run.runStartedAt === undefined
+	const started = run.runStartedAt;
+	const prompt = started === undefined
 		? prompts.at(-1)
-		: prompts.find((e) => Date.parse(e.timestamp) >= run.runStartedAt!);
+		: prompts.find((e) => Date.parse(e.timestamp) >= started);
 	// If the child hasn't persisted its prompt yet, all disk entries predate it.
 	return prompt ? prompt.parentId : sm.getLeafId();
 }

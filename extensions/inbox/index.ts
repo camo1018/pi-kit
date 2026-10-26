@@ -50,6 +50,13 @@
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { sectionByGroup } from "./group-layout.ts";
+import {
+	projectFamilies,
+	readWorkerLinks,
+	WorkerFolds,
+	type FamilyItem,
+	type WorkerLink,
+} from "./families.ts";
 import { promptAutocomplete } from "../../lib/prompt-autocomplete.ts";
 import {
 	GroupSelector, isGroupShortcut, type GroupPickerMode, type GroupSelection,
@@ -68,9 +75,7 @@ import {
 } from "./groups.ts";
 import * as fs from "node:fs";
 import * as readline from "node:readline";
-import {
-	installBackgroundMcpAutoApproval,
-} from "../../lib/background-mcp-approval.ts";
+import { installBackgroundMcpAutoApproval } from "../../lib/background-mcp-approval.ts";
 import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 import {
 	beforeRun, branchName, selectedHistory, sourceName,
@@ -78,7 +83,13 @@ import {
 import { handleVisitModelInput } from "./visit-models.ts";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, SessionInfo, Theme } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+	ExtensionContext,
+	SessionInfo,
+	Theme,
+} from "@earendil-works/pi-coding-agent";
 import {
 	AssistantMessageComponent,
 	getAgentDir,
@@ -251,9 +262,17 @@ class HelpComponent {
 		const H = this.viewH();
 		const b = (s: string) => th.fg("borderMuted", s);
 		const title = ` ${th.bold(th.fg("accent", `📥 Pi Inbox — ${this.heading}`))} `;
-		const out = [b("╭─") + title + b("─".repeat(Math.max(0, innerW - 1 - visibleWidth(title)))) + b("╮")];
+		const out = [
+			b("╭─") +
+				title +
+				b("─".repeat(Math.max(0, innerW - 1 - visibleWidth(title)))) +
+				b("╮"),
+		];
 		for (let i = 0; i < H; i++) out.push(b("│") + fit(lines[this.scroll + i] ?? "", innerW) + b("│"));
-		const pos = lines.length > H ? `${Math.round(((this.scroll + H) / lines.length) * 100)}%` : "";
+		const pos =
+			lines.length > H
+				? `${Math.round(((this.scroll + H) / lines.length) * 100)}%`
+				: "";
 		const foot = ` ${th.fg("dim", "↑↓/jk scroll · space/PgDn page · esc/q/? close")}${pos ? th.fg("dim", `  ${pos}`) : ""}`;
 		out.push(b("│") + fit(foot, innerW) + b("│"));
 		out.push(b(`╰${"─".repeat(innerW)}╯`));
@@ -299,27 +318,66 @@ function loadStore(): Store {
 }
 
 /** Read-modify-write against the latest on-disk copy (several Pi processes may share it). */
-function updateMeta(sessionId: string, fn: (m: SessionMeta) => void): SessionMeta {
+function updateMeta(
+	sessionId: string,
+	fn: (m: SessionMeta) => void,
+): SessionMeta {
+	return updateMetas([sessionId], fn)[0];
+}
+
+/** Apply one family operation against one fresh metadata snapshot. */
+function updateMetas(
+	ids: string[],
+	fn: (m: SessionMeta, id: string) => void,
+): SessionMeta[] {
 	const store = loadStore();
-	const meta = { ...(store.sessions[sessionId] ?? {}) };
-	fn(meta);
-	if (!meta.pinnedAt) delete meta.pinnedAt;
-	if (!meta.archivedAt) delete meta.archivedAt;
-	if (!meta.filter) delete meta.filter;
-	if (!meta.seenAt) delete meta.seenAt;
-	if (!meta.unreadAt) delete meta.unreadAt;
-	if (!meta.clonedAt) delete meta.clonedAt;
-	if (
-		!meta.scrollBookmark ||
-		!Number.isFinite(meta.scrollBookmark.top) ||
-		meta.scrollBookmark.top < 0
-	) {
-		delete meta.scrollBookmark;
-	}
-	if (Object.keys(meta).length === 0) delete store.sessions[sessionId];
-	else store.sessions[sessionId] = meta;
+	const result = ids.map((sessionId) => {
+		const meta = { ...(store.sessions[sessionId] ?? {}) };
+		fn(meta, sessionId);
+		if (!meta.pinnedAt) delete meta.pinnedAt;
+		if (!meta.archivedAt) delete meta.archivedAt;
+		if (!meta.filter) delete meta.filter;
+		if (!meta.seenAt) delete meta.seenAt;
+		if (!meta.unreadAt) delete meta.unreadAt;
+		if (!meta.clonedAt) delete meta.clonedAt;
+		if (
+			!meta.scrollBookmark ||
+			!Number.isFinite(meta.scrollBookmark.top) ||
+			meta.scrollBookmark.top < 0
+		)
+			delete meta.scrollBookmark;
+		if (Object.keys(meta).length === 0) delete store.sessions[sessionId];
+		else store.sessions[sessionId] = meta;
+		return meta;
+	});
 	saveStore(store);
-	return meta;
+	return result;
+}
+
+function archiveFamily(sessionId: string) {
+	const links = readWorkerLinks(AGENT_DIR);
+	// A delegated child never cascades to its parent or siblings.
+	const child = links.some((link) => link.id === sessionId);
+	const ids = [
+		...new Set([
+			sessionId,
+			...(!child
+				? links
+						.filter((link) => link.parentId === sessionId)
+						.map((link) => link.id)
+				: []),
+		]),
+	];
+	let archived = false;
+	let at: number | undefined;
+	const metas = updateMetas(ids, (meta, id) => {
+		if (id === sessionId) {
+			archived = !meta.archivedAt;
+			at = archived ? Date.now() : undefined;
+		}
+		meta.archivedAt = at;
+	});
+	return { ids, metas, archived };
 }
 
 function saveStore(store: Store) {
@@ -380,7 +438,15 @@ interface FilterRule {
 }
 
 const REGEX_KEYS = ["firstMessage", "cwd", "sessionName", "text"] as const;
-const RULE_KEYS = new Set<string>(["name", "description", "enabled", "flags", "minMessages", "maxMessages", ...REGEX_KEYS]);
+const RULE_KEYS = new Set<string>([
+	"name",
+	"description",
+	"enabled",
+	"flags",
+	"minMessages",
+	"maxMessages",
+	...REGEX_KEYS,
+]);
 
 interface CompiledRule {
 	rule: FilterRule;
@@ -409,32 +475,58 @@ function loadFilters(): FilterSet {
 		try {
 			const data = JSON.parse(fs.readFileSync(FILTERS_PATH, "utf-8"));
 			const list = Array.isArray(data) ? data : data?.rules;
-			if (!Array.isArray(list)) throw new Error('expected {"rules": [...]}');
+			if (!Array.isArray(list))
+				throw new Error('expected {"rules": [...]}');
 			list.forEach((raw: any, i: number) => {
-				const name = typeof raw?.name === "string" && raw.name.trim() ? raw.name.trim() : `rule #${i + 1}`;
-				if (!raw || typeof raw !== "object" || Array.isArray(raw)) return void set.errors.push(`${name}: not an object`);
-				const unknown = Object.keys(raw).filter((k) => !RULE_KEYS.has(k));
-				if (unknown.length) return void set.errors.push(`${name}: unknown field(s) ${unknown.join(", ")}`);
+				const name =
+					typeof raw?.name === "string" && raw.name.trim()
+						? raw.name.trim()
+						: `rule #${i + 1}`;
+				if (!raw || typeof raw !== "object" || Array.isArray(raw))
+					return void set.errors.push(`${name}: not an object`);
+				const unknown = Object.keys(raw).filter(
+					(k) => !RULE_KEYS.has(k),
+				);
+				if (unknown.length)
+					return void set.errors.push(
+						`${name}: unknown field(s) ${unknown.join(", ")}`,
+					);
 				if (raw.enabled === false) return;
 				for (const k of ["minMessages", "maxMessages"] as const) {
-					if (raw[k] !== undefined && typeof raw[k] !== "number") return void set.errors.push(`${name}: ${k} must be a number`);
+					if (raw[k] !== undefined && typeof raw[k] !== "number")
+						return void set.errors.push(
+							`${name}: ${k} must be a number`,
+						);
 				}
 				const flags = String(raw.flags ?? "").replace(/[gy]/g, "");
-				const compiled: CompiledRule = { rule: { ...raw, name }, re: {} };
+				const compiled: CompiledRule = {
+					rule: { ...raw, name },
+					re: {},
+				};
 				for (const k of REGEX_KEYS) {
 					if (raw[k] === undefined) continue;
 					try {
 						compiled.re[k] = new RegExp(String(raw[k]), flags);
 					} catch (e) {
-						return void set.errors.push(`${name}: bad ${k} regex: ${e instanceof Error ? e.message : String(e)}`);
+						return void set.errors.push(
+							`${name}: bad ${k} regex: ${e instanceof Error ? e.message : String(e)}`,
+						);
 					}
 				}
-				if (Object.keys(compiled.re).length === 0 && raw.minMessages === undefined && raw.maxMessages === undefined)
-					return void set.errors.push(`${name}: has no conditions, so it would hide every session`);
+				if (
+					Object.keys(compiled.re).length === 0 &&
+					raw.minMessages === undefined &&
+					raw.maxMessages === undefined
+				)
+					return void set.errors.push(
+						`${name}: has no conditions, so it would hide every session`,
+					);
 				set.rules.push(compiled);
 			});
 		} catch (e) {
-			set.errors.push(`${FILTERS_PATH}: ${e instanceof Error ? e.message : String(e)}`);
+			set.errors.push(
+				`${FILTERS_PATH}: ${e instanceof Error ? e.message : String(e)}`,
+			);
 		}
 	}
 	filterCache = { key, set };
@@ -571,7 +663,10 @@ function installHangupGuard() {
  */
 function visiblePids(): Set<number> | undefined {
 	try {
-		const r = spawnSync("pgrep", ["."], { encoding: "utf-8", timeout: 2000 });
+		const r = spawnSync("pgrep", ["."], {
+			encoding: "utf-8",
+			timeout: 2000,
+		});
 		if (r.status !== 0 || !r.stdout) return undefined;
 		return new Set(r.stdout.split("\n").filter(Boolean).map(Number));
 	} catch {
@@ -689,14 +784,16 @@ function readTail(file: string): TailInfo {
 				}
 				if (entry.type !== "message") continue;
 				const m = entry.message;
-				if (!m || !["user", "assistant", "toolResult"].includes(m.role)) continue;
+				if (!m || !["user", "assistant", "toolResult"].includes(m.role))
+					continue;
 				if (!lastMsg) lastMsg = m;
 				if (m.role === "assistant") {
 					const t = messageText(m.content).trim();
 					if (t) {
 						lastAssistantText ??= t;
 						// interim text alongside tool calls doesn't count as "what the agent said"
-						if (!lastSaid && m.stopReason !== "toolUse") lastSaid = { role: "assistant", text: t };
+						if (!lastSaid && m.stopReason !== "toolUse")
+							lastSaid = { role: "assistant", text: t };
 					}
 				} else if (m.role === "user" && !lastSaid) {
 					const t = messageText(m.content).trim();
@@ -705,15 +802,31 @@ function readTail(file: string): TailInfo {
 				if (lastAssistantText !== undefined && lastSaid) break;
 			}
 
-			if (lastMsg && ((lastAssistantText !== undefined && lastSaid) || len >= st.size)) {
+			if (
+				lastMsg &&
+				((lastAssistantText !== undefined && lastSaid) ||
+					len >= st.size)
+			) {
 				let status: TailStatus;
 				if (lastMsg.role === "assistant") {
 					const r = lastMsg.stopReason;
-					status = r === "error" ? "error" : r === "aborted" ? "aborted" : r === "toolUse" ? "stalled" : "your-turn";
+					status =
+						r === "error"
+							? "error"
+							: r === "aborted"
+								? "aborted"
+								: r === "toolUse"
+									? "stalled"
+									: "your-turn";
 				} else {
 					status = "stalled";
 				}
-				info = { status, lastText: lastAssistantText ?? "", lastRole: lastMsg.role, lastSaid };
+				info = {
+					status,
+					lastText: lastAssistantText ?? "",
+					lastRole: lastMsg.role,
+					lastSaid,
+				};
 				break;
 			}
 			if (len >= st.size) break;
@@ -747,25 +860,41 @@ interface Row {
 	filtered: boolean;
 	/** Background agent run by this pi, if any. */
 	bg?: BgAgent;
+	/** Read-only state owned by another supervisor; never a control handle. */
+	remoteState?: BgAgent["state"];
 	/** Needs your attention and you haven't looked since (see isUnread). */
 	unread?: boolean;
 }
 
-async function loadRows(currentId: string | undefined, wantArchived = false): Promise<Row[]> {
+async function loadRows(
+	currentId: string | undefined,
+	wantArchived = false,
+): Promise<Row[]> {
 	const [store, live, filters] = [loadStore(), readLive(), loadFilters()];
-	const infos = await scanSessions(store, wantArchived);
+	const links = readWorkerLinks(AGENT_DIR);
+	const contextParents = new Set(
+		links
+			.filter((link) => !store.sessions[link.id]?.archivedAt)
+			.map((link) => link.parentId),
+	);
+	const infos = await scanSessions(store, wantArchived, contextParents);
 	const rows: Row[] = [];
 	for (const info of infos) {
 		const isCurrent = info.id === currentId;
 		if (info.messageCount === 0 && !isCurrent) continue;
-		const title = info.name || cleanTitle(info.firstMessage) || "(no messages)";
+		const title =
+			info.name || cleanTitle(info.firstMessage) || "(no messages)";
 		const meta = store.sessions[info.id] ?? {};
 		const rule = matchRule(info, filters);
 		let tail = readTail(info.path);
 		// A fresh clone (copied up to the agent's last completed step mid-run) ends at a tool result,
 		// which reads as "stalled" / "● working?" — but nothing is running on it. Until it has
 		// activity of its own (a write newer than the clone), it's simply your turn.
-		if (meta.clonedAt && tail.status === "stalled" && info.modified.getTime() <= meta.clonedAt) {
+		if (
+			meta.clonedAt &&
+			tail.status === "stalled" &&
+			info.modified.getTime() <= meta.clonedAt
+		) {
 			tail = { ...tail, status: "your-turn" };
 		}
 		rows.push({
@@ -778,7 +907,8 @@ async function loadRows(currentId: string | undefined, wantArchived = false): Pr
 			isCurrent,
 			takenOver: modeState().takenOver.has(info.id),
 			title,
-			searchText: `${info.name ?? ""}\n${info.cwd}\n${info.allMessagesText}`.toLowerCase(),
+			searchText:
+				`${info.name ?? ""}\n${info.cwd}\n${info.allMessagesText}`.toLowerCase(),
 			bg: getAgent(info.id),
 		});
 	}
@@ -801,7 +931,11 @@ async function loadRows(currentId: string | undefined, wantArchived = false): Pr
 			info,
 			meta: store.sessions[a.id] ?? {},
 			filtered: false,
-			tail: { status: "empty", lastText: a.lastText ?? "", lastSaid: { role: "user", text: a.title } },
+			tail: {
+				status: "empty",
+				lastText: a.lastText ?? "",
+				lastSaid: { role: "user", text: a.title },
+			},
 			live: live.get(a.id),
 			isCurrent: a.id === currentId,
 			takenOver: modeState().takenOver.has(a.id),
@@ -809,6 +943,87 @@ async function loadRows(currentId: string | undefined, wantArchived = false): Pr
 			searchText: `${a.title}\n${a.cwd}`.toLowerCase(),
 			bg: a,
 		});
+	}
+	// A background parent owns its workers in a different process. Include
+	// startup rows and current state without adopting runs or writing metadata.
+	for (const link of links) {
+		if (getAgent(link.id)) continue;
+		try {
+			const saved = JSON.parse(
+				fs.readFileSync(
+					path.join(AGENT_DIR, "inbox-agents", `${link.id}.json`),
+					"utf8",
+				),
+			);
+			if (
+				saved.id !== link.id ||
+				!["working", "queued", "idle", "error", "cancelled"].includes(
+					saved.state,
+				)
+			)
+				continue;
+			const existing = rows.find((row) => row.info.id === link.id);
+			if (existing) {
+				existing.remoteState = saved.state;
+				continue;
+			}
+			const spec = JSON.parse(
+				fs.readFileSync(
+					path.join(
+						AGENT_DIR,
+						"session-workers",
+						"workers",
+						`${link.id}.json`,
+					),
+					"utf8",
+				),
+			);
+			if (
+				typeof spec.title !== "string" ||
+				typeof spec.cwd !== "string"
+			) {
+				continue;
+			}
+			const time =
+				typeof saved.updatedAt === "number" &&
+				Number.isFinite(saved.updatedAt)
+					? saved.updatedAt
+					: link.createdAt;
+			const info = {
+				path: "",
+				id: link.id,
+				cwd: spec.cwd,
+				created: new Date(link.createdAt),
+				modified: new Date(time),
+				messageCount: 0,
+				firstMessage: spec.title,
+				allMessagesText: spec.title,
+			} as unknown as SessionInfo;
+			const meta = store.sessions[link.id] ?? {};
+			const rule = matchRule(info, filters);
+			rows.push({
+				info,
+				meta,
+				rule,
+				filtered: isFiltered(meta, rule),
+				tail: {
+					status: "empty",
+					lastText: "",
+					lastSaid: {
+						role: "user",
+						text: spec.title,
+					},
+				},
+				live: live.get(link.id),
+				isCurrent: link.id === currentId,
+				takenOver: modeState().takenOver.has(link.id),
+				title: spec.title,
+				searchText: `${spec.title}\n${spec.cwd}`.toLowerCase(),
+				remoteState: saved.state,
+			});
+		} catch {
+			// The owning process may remove its completed record mid-refresh.
+		}
 	}
 	const since = unreadBaseline(store);
 	for (const r of rows) r.unread = isUnread(r, since);
@@ -847,11 +1062,26 @@ function readSessionHeaderLine(file: string): HeaderInfo | undefined {
 			const buf = Buffer.alloc(len);
 			fs.readSync(fd, buf, 0, len, 0);
 			const nl = buf.indexOf(10);
-			const line = (nl === -1 ? buf : buf.subarray(0, nl)).toString("utf-8").trim();
+			const line = (nl === -1 ? buf : buf.subarray(0, nl))
+				.toString("utf-8")
+				.trim();
 			const h = JSON.parse(line);
-			if (h?.type !== "session" || typeof h.id !== "string" || typeof h.cwd !== "string") return;
+			if (
+				h?.type !== "session" ||
+				typeof h.id !== "string" ||
+				typeof h.cwd !== "string"
+			)
+				return;
 			// `modified` falls back to mtime; the full parse refines it from message timestamps.
-			return { path: file, id: h.id, cwd: h.cwd, created: new Date(h.timestamp), modified: st.mtime, mtimeMs: st.mtimeMs, size: st.size };
+			return {
+				path: file,
+				id: h.id,
+				cwd: h.cwd,
+				created: new Date(h.timestamp),
+				modified: st.mtime,
+				mtimeMs: st.mtimeMs,
+				size: st.size,
+			};
 		} finally {
 			fs.closeSync(fd);
 		}
@@ -904,7 +1134,10 @@ async function buildInfo(h: HeaderInfo): Promise<SessionInfo> {
 	const KEEP_HEAD = 5;
 	const KEEP_TAIL = 10;
 	try {
-		const rl = readline.createInterface({ input: fs.createReadStream(h.path, { encoding: "utf-8" }), crlfDelay: Infinity });
+		const rl = readline.createInterface({
+			input: fs.createReadStream(h.path, { encoding: "utf-8" }),
+			crlfDelay: Infinity,
+		});
 		for await (const line of rl) {
 			let entry: any;
 			try {
@@ -912,7 +1145,8 @@ async function buildInfo(h: HeaderInfo): Promise<SessionInfo> {
 			} catch {
 				continue;
 			}
-			if (entry.type === "session_info" && typeof entry.name === "string") name = entry.name.trim() || undefined;
+			if (entry.type === "session_info" && typeof entry.name === "string")
+				name = entry.name.trim() || undefined;
 			if (entry.type !== "message" || !entry.message) continue;
 			// parity with pi's buildSessionInfo: every message entry counts, any role.
 			messageCount++;
@@ -967,12 +1201,21 @@ async function parseCached(h: HeaderInfo): Promise<SessionInfo> {
  * archived partition and steady-state refreshes only reparse files that actually changed —
  * an archived session that wakes up is never served stale.
  */
-async function scanSessions(store: Store, wantArchived: boolean): Promise<SessionInfo[]> {
+async function scanSessions(
+	store: Store,
+	wantArchived: boolean,
+	contextParents = new Set<string>(),
+): Promise<SessionInfo[]> {
 	const headers = scanHeaders();
 	const archivedIds = new Set(Object.entries(store.sessions).filter(([, m]) => m.archivedAt).map(([id]) => id));
 	const part: ScanPartition = { active: [], archived: [] };
 	for (const h of headers) (archivedIds.has(h.id) ? part.archived : part.active).push(h);
-	const targets = wantArchived ? [...part.active, ...part.archived] : part.active;
+	const targets = wantArchived
+		? [...part.active, ...part.archived]
+		: [
+				...part.active,
+				...part.archived.filter((h) => contextParents.has(h.id)),
+			];
 	// Like pi's own discovery, a handful at a time: parses are I/O bound, not CPU.
 	const out: SessionInfo[] = [];
 	const QUEUE = 10;
@@ -990,13 +1233,27 @@ async function scanSessions(store: Store, wantArchived: boolean): Promise<Sessio
  */
 function isUnread(r: Row, since: number): boolean {
 	// The session you're in: unread only when you marked it so by hand (`u`) — it shows as a blue `»`.
-	if (r.isCurrent) return !!(r.meta.unreadAt && r.meta.unreadAt > (r.meta.seenAt ?? 0));
+	if (r.isCurrent)
+		return !!(r.meta.unreadAt && r.meta.unreadAt > (r.meta.seenAt ?? 0));
 	// marked unread by hand (`u`) and not looked at since: show it even while running
 	if (r.meta.unreadAt && r.meta.unreadAt > (r.meta.seenAt ?? 0)) return true;
-	if (isRunning(r.bg) || r.live?.state === "working") return false;
+	if (
+		isRunning(r.bg) ||
+		r.remoteState === "working" ||
+		r.remoteState === "queued" ||
+		r.live?.state === "working"
+	)
+		return false;
 	if (r.bg?.needsYou) return true;
-	const needsYou = r.bg?.state === "error" || r.tail.status === "your-turn" || r.tail.status === "error";
-	return needsYou && r.info.modified.getTime() > Math.max(r.meta.seenAt ?? 0, since);
+	const needsYou =
+		r.bg?.state === "error" ||
+		r.remoteState === "error" ||
+		r.tail.status === "your-turn" ||
+		r.tail.status === "error";
+	return (
+		needsYou &&
+		r.info.modified.getTime() > Math.max(r.meta.seenAt ?? 0, since)
+	);
 }
 
 // ───────────────────────────── formatting helpers ─────────────────────────────
@@ -1062,17 +1319,31 @@ function filtersReport(rows: Row[]): string {
 		else if (r.rule) hits.set(r.rule, (hits.get(r.rule) ?? 0) + 1);
 	}
 	const cell = (s: string) => s.replace(/\|/g, "\\|");
-	const out = ["# Inbox filters", "", `Rules file: \`${FILTERS_PATH}\`${fs.existsSync(FILTERS_PATH) ? "" : " (not created yet)"}`, ""];
+	const out = [
+		"# Inbox filters",
+		"",
+		`Rules file: \`${FILTERS_PATH}\`${fs.existsSync(FILTERS_PATH) ? "" : " (not created yet)"}`,
+		"",
+	];
 	if (set.rules.length === 0) out.push("No active rules.", "");
 	else {
-		out.push("| Rule | Conditions (all must match) | Hidden now |", "|---|---|---|");
+		out.push(
+			"| Rule | Conditions (all must match) | Hidden now |",
+			"|---|---|---|",
+		);
 		for (const { rule } of set.rules) {
 			const conds: string[] = [];
-			for (const k of REGEX_KEYS) if (rule[k] !== undefined) conds.push(`${k} ~ \`${cell(String(rule[k]))}\``);
-			if (rule.minMessages !== undefined) conds.push(`messages ≥ ${rule.minMessages}`);
-			if (rule.maxMessages !== undefined) conds.push(`messages ≤ ${rule.maxMessages}`);
+			for (const k of REGEX_KEYS)
+				if (rule[k] !== undefined)
+					conds.push(`${k} ~ \`${cell(String(rule[k]))}\``);
+			if (rule.minMessages !== undefined)
+				conds.push(`messages ≥ ${rule.minMessages}`);
+			if (rule.maxMessages !== undefined)
+				conds.push(`messages ≤ ${rule.maxMessages}`);
 			const flags = rule.flags ? ` (flags \`${rule.flags}\`)` : "";
-			out.push(`| ${cell(rule.name)} | ${conds.join(" and ")}${flags} | ${hits.get(rule.name) ?? 0} |`);
+			out.push(
+				`| ${cell(rule.name)} | ${conds.join(" and ")}${flags} | ${hits.get(rule.name) ?? 0} |`,
+			);
 		}
 		out.push("");
 	}
@@ -1106,7 +1377,12 @@ function relTime(d: Date | number): string {
 function shortCwd(cwd: string): string {
 	if (!cwd) return "?";
 	const home = os.homedir();
-	let p = cwd === home ? "~" : cwd.startsWith(home + path.sep) ? `~/${cwd.slice(home.length + 1)}` : cwd;
+	let p =
+		cwd === home
+			? "~"
+			: cwd.startsWith(home + path.sep)
+				? `~/${cwd.slice(home.length + 1)}`
+				: cwd;
 	const parts = p.split("/");
 	if (parts.length > 3) p = `…/${parts.slice(-2).join("/")}`;
 	return p;
@@ -1161,6 +1437,11 @@ type InboxResult =
 class InboxComponent {
 	private rows: Row[];
 	private groups = readGroups();
+	private links: WorkerLink[] = readWorkerLinks(AGENT_DIR);
+	private folds = new WorkerFolds(AGENT_DIR);
+	private expanded = new Set<string>();
+	private families = new Map<string, FamilyItem<Row>>();
+	private foldError?: string;
 	private visible: Row[] = [];
 	private display: Array<{ kind: "header"; label: string } | { kind: "item"; row: Row; idx: number }> = [];
 	private selected = 0;
@@ -1203,17 +1484,23 @@ class InboxComponent {
 
 	invalidate() {}
 
-	private async refresh(wantArchived = this.archivedLoaded || viewWantsArchived(this.state.view)) {
+	private async refresh(
+		wantArchived = this.archivedLoaded ||
+			viewWantsArchived(this.state.view),
+	) {
 		if (this.loading) return;
 		this.loading = true;
 		try {
 			this.rows = await loadRows(this.currentId, wantArchived);
+			this.links = readWorkerLinks(AGENT_DIR);
 			this.archivedLoaded ||= wantArchived;
 			this.onRows(this.rows);
 			this.rebuild();
 			this.tui.requestRender();
 		} catch (e) {
-			this.say(`refresh failed: ${e instanceof Error ? e.message : String(e)}`);
+			this.say(
+				`refresh failed: ${e instanceof Error ? e.message : String(e)}`,
+			);
 		} finally {
 			this.loading = false;
 		}
@@ -1245,72 +1532,131 @@ class InboxComponent {
 
 	private rebuild() {
 		this.groups = readGroups();
+		try {
+			this.expanded = this.folds.load();
+			this.foldError = undefined;
+		} catch (error) {
+			const text = `Worker folds: ${String(error)}`;
+			if (this.foldError !== text) this.say(text);
+			this.foldError = text;
+		}
 		const terms = this.state.query.toLowerCase().split(/\s+/).filter(Boolean);
-		const match = (r: Row) => terms.every((t) => r.searchText.includes(t) || r.title.toLowerCase().includes(t));
+		const match = (row: Row) =>
+			terms.every(
+				(term) =>
+					row.searchText.includes(term) ||
+					row.title.toLowerCase().includes(term),
+			);
 		const byModified = (a: Row, b: Row) => b.info.modified.getTime() - a.info.modified.getTime();
 
 		const scope = groupView();
 		const grouped = scope === "all" && groupLayout() === "groups";
+		let eligible = this.rows.filter(
+			(row) => inGroup(this.groups, scope, row.info.id) && match(row),
+		);
+		if (this.state.view === "filtered") {
+			eligible = eligible.filter((row) => row.filtered).sort(byModified);
+		} else {
+			eligible = eligible.filter((row) => !row.filtered);
+			if (this.state.view === "inbox") {
+				eligible = eligible.filter((row) => !row.meta.archivedAt);
+				eligible = [
+					...eligible
+						.filter((row) => row.meta.pinnedAt)
+						.sort(
+							(a, b) =>
+								(b.meta.pinnedAt ?? 0) - (a.meta.pinnedAt ?? 0),
+						),
+					...eligible
+						.filter((row) => !row.meta.pinnedAt)
+						.sort(byModified),
+				];
+			} else if (this.state.view === "archived") {
+				eligible = eligible
+					.filter((row) => row.meta.archivedAt)
+					.sort(
+						(a, b) =>
+							(b.meta.archivedAt ?? 0) - (a.meta.archivedAt ?? 0),
+					);
+			} else eligible.sort(byModified);
+		}
+		const items = projectFamilies(this.rows, eligible, this.links, {
+			id: (row) => row.info.id,
+			expanded: this.expanded,
+			forceExpand: terms.length > 0,
+		});
+		this.families = new Map(items.map((item) => [item.row.info.id, item]));
+		const roots = items.filter((item) => !item.child);
 		this.display = [];
-		const push = (label: string | undefined, list: Row[]) => {
-			if (list.length === 0) return;
+		const push = (label: string | undefined, list: FamilyItem<Row>[]) => {
+			if (!list.length) return;
 			if (label) this.display.push({ kind: "header", label });
-			for (const row of list) this.display.push({ kind: "item", row, idx: 0 });
+			for (const item of list) {
+				this.display.push({ kind: "item", row: item.row, idx: 0 });
+				if (item.expanded)
+					for (const row of item.children) {
+						this.display.push({ kind: "item", row, idx: 0 });
+					}
+			}
 		};
-		const pushList = (list: Row[]) => {
+		const pushList = (list: FamilyItem<Row>[]) => {
 			if (!grouped) return push(undefined, list);
 			for (const section of sectionByGroup(
-				list, this.groups, (row) => row.info.id,
+				list,
+				this.groups,
+				(item) =>
+					(item.contextOnly
+						? (item.children[0] ?? item.row)
+						: item.row
+					).info.id,
 			)) {
-				push(`${section.name} (${section.rows.length})`, section.rows);
+				const total = section.rows.reduce(
+					(n, item) =>
+						n + (item.contextOnly ? 0 : 1) + item.children.length,
+					0,
+				);
+				push(`${section.name} (${total})`, section.rows);
 			}
 		};
-
-		const matched = this.rows.filter((row) =>
-			inGroup(this.groups, scope, row.info.id) && match(row));
-		// Filtered-out sessions appear only in their own tab, never in Inbox / Archived / All.
-		const shown = matched.filter((r) => !r.filtered);
-		if (this.state.view === "inbox") {
-			// Just PINNED and INBOX: background agents sit in place; status + unread dot flag them.
-			const live = shown.filter((r) => !r.meta.archivedAt);
-			const pinned = live.filter((r) => r.meta.pinnedAt).sort((a, b) => (b.meta.pinnedAt ?? 0) - (a.meta.pinnedAt ?? 0));
-			const rest = live.filter((r) => !r.meta.pinnedAt).sort(byModified);
-			if (grouped) {
-				// Bucketing preserves pinned-first and activity ordering per group.
-				pushList([...pinned, ...rest]);
-			} else {
-				const sectioned = pinned.length > 0;
-				push(
-					pinned.length ? `★ PINNED (${pinned.length})` : undefined,
-					pinned,
-				);
-				push(sectioned ? `INBOX (${rest.length})` : undefined, rest);
-			}
-		} else if (this.state.view === "archived") {
-			pushList(shown.filter((r) => r.meta.archivedAt).sort(
-				(a, b) => (b.meta.archivedAt ?? 0) - (a.meta.archivedAt ?? 0),
-			));
-		} else if (this.state.view === "filtered") {
+		if (this.state.view === "filtered") {
 			const errors = loadFilters().errors.length;
-			const list = matched.filter((r) => r.filtered).sort(byModified);
-			if (errors && list.length) this.display.push({ kind: "header", label: `⚠ ${errors} filter rule error(s), see /inbox filters` });
-			pushList(list);
-		} else {
-			pushList(shown.sort(byModified));
+			if (errors && roots.length)
+				this.display.push({
+					kind: "header",
+					label: `⚠ ${errors} filter rule error(s), see /inbox filters`,
+				});
 		}
-
+		if (this.state.view === "inbox" && !grouped) {
+			const pinned = roots.filter((item) => item.row.meta.pinnedAt);
+			const rest = roots.filter((item) => !item.row.meta.pinnedAt);
+			push(
+				pinned.length ? `★ PINNED (${pinned.length})` : undefined,
+				pinned,
+			);
+			push(pinned.length ? `INBOX (${rest.length})` : undefined, rest);
+		} else pushList(roots);
 		this.visible = [];
-		for (const d of this.display) {
-			if (d.kind === "item") {
-				d.idx = this.visible.length;
-				this.visible.push(d.row);
+		for (const item of this.display)
+			if (item.kind === "item") {
+				item.idx = this.visible.length;
+				this.visible.push(item.row);
 			}
+		// A collapsed child returns focus to its own parent, not another row.
+		const previous = this.state.selectedId;
+		let keep = previous
+			? this.visible.findIndex((row) => row.info.id === previous)
+			: -1;
+		if (keep < 0 && previous) {
+			const parent = this.links.find(
+				(link) => link.id === previous,
+			)?.parentId;
+			keep = this.visible.findIndex((row) => row.info.id === parent);
 		}
-
-		// keep selection pinned to the same session id when possible
-		const keepIdx = this.state.selectedId ? this.visible.findIndex((r) => r.info.id === this.state.selectedId) : -1;
-		if (keepIdx >= 0) this.selected = keepIdx;
-		this.selected = Math.max(0, Math.min(this.selected, this.visible.length - 1));
+		if (keep >= 0) this.selected = keep;
+		this.selected = Math.max(
+			0,
+			Math.min(this.selected, this.visible.length - 1),
+		);
 		this.state.selectedId = this.visible[this.selected]?.info.id;
 	}
 
@@ -1348,8 +1694,8 @@ class InboxComponent {
 		this.scroll = 0;
 		this.rebuild();
 		this.say(
-			next === "groups" ? "Grouped by group" : "Flat session list",
-			+ (saved ? "" : " (not saved: groups busy in another window)"),
+			(next === "groups" ? "Grouped by group" : "Flat session list") +
+				(saved ? "" : " (not saved: groups busy in another window)"),
 		);
 	}
 
@@ -1377,19 +1723,55 @@ class InboxComponent {
 		const store = loadStore();
 		row.meta = store.sessions[row.info.id] ?? {};
 		row.unread = isUnread(row, unreadBaseline(store));
-		this.say(row.unread ? (row.isCurrent ? "» marked unread — clears when you open it again or switch away" : "• marked unread") : "marked read");
+		this.say(
+			row.unread
+				? row.isCurrent
+					? "» marked unread — clears when you open it again or switch away"
+					: "• marked unread"
+				: "marked read",
+		);
+		this.rebuild();
+	}
+
+	private toggleFamily(row: Row) {
+		if (this.state.query.trim())
+			return this.say("Clear search to change folds.");
+		const item = this.families.get(row.info.id);
+		const id = item?.child ? item.parentId : row.info.id;
+		const parent = id ? this.families.get(id) : undefined;
+		if (!id || !parent?.children.length) return;
+		try {
+			this.folds.setExpanded(id, !parent.expanded);
+		} catch (error) {
+			return this.say(`Could not save worker folds: ${String(error)}`);
+		}
+		if (parent.expanded) this.state.selectedId = id;
 		this.rebuild();
 	}
 
 	private toggleArchive(row: Row) {
-		// move selection to the neighbour so the list doesn't jump
-		const next = this.visible[this.selected + 1] ?? this.visible[this.selected - 1];
-		const meta = updateMeta(row.info.id, (m) => {
-			m.archivedAt = m.archivedAt ? undefined : Date.now();
-		});
-		row.meta = meta;
+		const result = archiveFamily(row.info.id);
+		const ids = new Set(result.ids);
+		const next =
+			this.visible
+				.slice(this.selected + 1)
+				.find((r) => !ids.has(r.info.id)) ??
+			this.visible
+				.slice(0, this.selected)
+				.reverse()
+				.find((r) => !ids.has(r.info.id));
+		for (const [index, id] of result.ids.entries()) {
+			const target = this.rows.find((r) => r.info.id === id);
+			if (target) target.meta = result.metas[index];
+		}
 		if (this.state.view !== "all") this.state.selectedId = next?.info.id;
-		this.say(meta.archivedAt ? "✓ archived" : "↩ moved back to inbox");
+		const label =
+			result.ids.length > 1
+				? `${result.ids.length} family sessions`
+				: "session";
+		this.say(
+			result.archived ? `✓ ${label} archived` : `↩ ${label} restored`,
+		);
 		this.rebuild();
 	}
 
@@ -1404,7 +1786,13 @@ class InboxComponent {
 		row.meta = meta;
 		row.filtered = isFiltered(meta, row.rule);
 		this.state.selectedId = next?.info.id;
-		this.say(row.filtered ? "⊘ filtered out (see the Filtered tab)" : row.rule ? `✓ kept despite rule "${row.rule}"` : "↩ back in the inbox");
+		this.say(
+			row.filtered
+				? "⊘ filtered out (see the Filtered tab)"
+				: row.rule
+					? `✓ kept despite rule "${row.rule}"`
+					: "↩ back in the inbox",
+		);
 		this.rebuild();
 	}
 
@@ -1506,19 +1894,30 @@ class InboxComponent {
 			if (!isKeyRepeat(data)) this.done({ action: "defaultGroup" });
 		} else if (ch === "b") {
 			if (row) this.done({ action: "movegroup", row });
+		} else if (ch === " ") {
+			if (row && !isKeyRepeat(data)) this.toggleFamily(row);
 		} else if (ch === "s") {
 			if (!isKeyRepeat(data)) this.toggleGroupLayout();
-		} else if (kb.matches(data, "tui.select.up") || ch === "k") this.move(-1);
-		else if (kb.matches(data, "tui.select.down") || ch === "j") this.move(1);
+		} else if (kb.matches(data, "tui.select.up") || ch === "k")
+			this.move(-1);
+		else if (kb.matches(data, "tui.select.down") || ch === "j")
+			this.move(1);
 		else if (matchesKey(data, "left")) this.move(-5);
 		else if (matchesKey(data, "right")) this.move(5);
-		else if (kb.matches(data, "tui.select.pageUp")) this.move(-this.listHeight());
-		else if (kb.matches(data, "tui.select.pageDown")) this.move(this.listHeight());
+		else if (kb.matches(data, "tui.select.pageUp"))
+			this.move(-this.listHeight());
+		else if (kb.matches(data, "tui.select.pageDown"))
+			this.move(this.listHeight());
 		else if (matchesKey(data, "home")) this.move(-1e9);
 		else if (matchesKey(data, "end")) this.move(1e9);
 		else if (kb.matches(data, "tui.select.confirm")) {
 			// Orchestrator: enter takes the session over full-screen (no preview).
-			if (row) this.done(orchestrating() ? { action: "open", row } : { action: "view", row });
+			if (row)
+				this.done(
+					orchestrating()
+						? { action: "open", row }
+						: { action: "view", row },
+				);
 		} else if (ch === "v" && orchestrating()) {
 			if (row) this.done({ action: "view", row });
 		} else if (ch === "t" && orchestrating()) {
@@ -1528,8 +1927,12 @@ class InboxComponent {
 		} else if (ch === "Q" && orchestrating()) {
 			this.done({ action: "exitMode" });
 		} else if (ch === "h") {
-			if (!orchestrating()) this.say("h = hand back, in orchestrator mode only (/orchestrator)");
-			else if (this.atHome) this.say("already home · enter on a session takes it over");
+			if (!orchestrating())
+				this.say(
+					"h = hand back, in orchestrator mode only (/orchestrator)",
+				);
+			else if (this.atHome)
+				this.say("already home · enter on a session takes it over");
 			else this.done({ action: "home" });
 		} else if (ch === "n" || ch === "N") {
 			this.done({ action: "new", pickModel: ch === "N" });
@@ -1537,7 +1940,13 @@ class InboxComponent {
 			// New agent that joins the selected session's group (explicit choice: an ungrouped row
 			// means Ungrouped, overriding any f pre-pick or default).
 			if (row)
-				this.done({ action: "new", pickModel: false, rowGroup: { id: sessionGroup(this.groups, row.info.id)?.id } });
+				this.done({
+					action: "new",
+					pickModel: false,
+					rowGroup: {
+						id: sessionGroup(this.groups, row.info.id)?.id,
+					},
+				});
 		} else if (ch === "c") {
 			if (row && isRunning(row.bg)) this.done({ action: "cancel", row });
 			else this.say("not a running background agent");
@@ -1547,20 +1956,38 @@ class InboxComponent {
 			} else {
 				this.say("that agent has no queued messages");
 			}
-		} else if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || ch === "q") {
+		} else if (
+			matchesKey(data, "escape") ||
+			matchesKey(data, "ctrl+c") ||
+			ch === "q"
+		) {
 			if (this.state.query) {
 				this.state.query = "";
 				this.rebuild();
 			} else if (orchestrating() && this.atHome) {
 				if (matchesKey(data, "ctrl+c")) {
-					if (this.quitArmed && Date.now() - this.quitArmed < 2000) return this.done({ action: "quit" });
+					if (this.quitArmed && Date.now() - this.quitArmed < 2000)
+						return this.done({ action: "quit" });
 					this.quitArmed = Date.now();
-					this.say("press ctrl+c again to quit pi (stops all background agents)");
-				} else this.say("this window is the orchestrator · Q leaves orchestrator mode · ctrl+c twice quits");
+					this.say(
+						"press ctrl+c again to quit pi (stops all background agents)",
+					);
+				} else
+					this.say(
+						"this window is the orchestrator · Q leaves orchestrator mode · ctrl+c twice quits",
+					);
 			} else this.done({ action: "close" });
-		} else if (matchesKey(data, "tab")) this.setView(VIEWS[(VIEWS.indexOf(this.state.view) + 1) % VIEWS.length]!);
+		} else if (matchesKey(data, "tab"))
+			this.setView(
+				VIEWS[(VIEWS.indexOf(this.state.view) + 1) % VIEWS.length]!,
+			);
 		else if (matchesKey(data, "shift+tab"))
-			this.setView(VIEWS[(VIEWS.indexOf(this.state.view) + VIEWS.length - 1) % VIEWS.length]!);
+			this.setView(
+				VIEWS[
+					(VIEWS.indexOf(this.state.view) + VIEWS.length - 1) %
+						VIEWS.length
+				]!,
+			);
 		else if (ch === "1") this.setView("inbox");
 		else if (ch === "2") this.setView("archived");
 		else if (ch === "3") this.setView("all");
@@ -1579,9 +2006,16 @@ class InboxComponent {
 			if (row) this.startRename(row);
 		} else if (ch === "d") {
 			// "d" = move to another directory (was a third archive spelling; D is gone).
-			if (row && !isRunning(row.bg) && orchestrating()) this.done({ action: "movedir", row });
-			else if (row && !isRunning(row.bg)) this.say("moving a session's directory is an orchestrator-mode action");
-			else if (row) this.say("wait for the agent to finish (or cancel it with c) before moving it");
+			if (row && !isRunning(row.bg) && orchestrating())
+				this.done({ action: "movedir", row });
+			else if (row && !isRunning(row.bg))
+				this.say(
+					"moving a session's directory is an orchestrator-mode action",
+				);
+			else if (row)
+				this.say(
+					"wait for the agent to finish (or cancel it with c) before moving it",
+				);
 		} else if (ch === "?") {
 			this.done({ action: "help" });
 		} else if (ch === "R" || matchesKey(data, "ctrl+r")) {
@@ -1615,12 +2049,44 @@ class InboxComponent {
 		return l ? th.fg("accent", "↳ ") + th.fg("text", l) : "";
 	}
 
+	private workerSummary(item: FamilyItem<Row>, compact = false): string {
+		let running = 0;
+		let errors = 0;
+		let unread = 0;
+		for (const row of item.children) {
+			const state = row.bg?.state ?? row.remoteState;
+			if (state === "error") errors++;
+			else if (
+				state === "working" ||
+				state === "queued" ||
+				row.live?.state === "working"
+			)
+				running++;
+			else if (!state && row.tail.status === "error") errors++;
+			if (row.unread) unread++;
+		}
+		const pieces = compact
+			? [`${item.children.length}w`]
+			: [
+					`${item.children.length} worker${item.children.length === 1 ? "" : "s"}`,
+				];
+		if (errors) pieces.push(compact ? `✗${errors}` : `${errors} error`);
+		if (running)
+			pieces.push(compact ? `●${running}` : `${running} running`);
+		if (unread) pieces.push(compact ? `•${unread}` : `${unread} unread`);
+		return this.theme.fg(
+			errors ? "error" : running ? "warning" : "muted",
+			pieces.join(compact ? " " : " · "),
+		);
+	}
+
 	private statusCell(r: Row): string {
 		const th = this.theme;
-		if (r.bg?.state === "working") return th.fg("warning", "● working");
-		if (r.bg?.state === "queued") return th.fg("warning", "● queued");
-		if (r.bg?.state === "error") return th.fg("error", "✗ error");
-		if (r.bg?.state === "cancelled") return th.fg("muted", "⏸ cancelled");
+		const state = r.bg?.state ?? r.remoteState;
+		if (state === "working") return th.fg("warning", "● working");
+		if (state === "queued") return th.fg("warning", "● queued");
+		if (state === "error") return th.fg("error", "✗ error");
+		if (state === "cancelled") return th.fg("muted", "⏸ cancelled");
 		if (r.live?.state === "working") return th.fg("warning", "● working");
 		if (r.tail.status === "stalled" && !r.live && Date.now() - r.info.modified.getTime() < RECENT_WRITE_MS)
 			return th.fg("warning", "● working?");
@@ -1655,19 +2121,39 @@ class InboxComponent {
 		const nameWidth = Math.max(1, Math.min(24,
 			innerW - visibleWidth(heading) - (preview ? 10 : 0) - 16));
 		const defaultName = truncateToWidth(fallback, nameWidth);
-		const title = ` ${th.bold(th.fg("accent", heading))}` +
+		const title =
+			` ${th.bold(th.fg("accent", heading))}` +
 			th.fg("muted", " · default: ") +
 			th.bold(th.fg("accent", defaultName)) +
 			(preview ? th.bold(th.fg("warning", " · PREVIEW")) : "") +
-			(summary ? th.fg("dim", `  ${summary}`) : "") + " ";
+			(summary ? th.fg("dim", `  ${summary}`) : "") +
+			" ";
 		const spin = this.loading ? th.fg("dim", " ⟳ ") : "";
-		out.push(b("╭─") + title + spin + b("─".repeat(Math.max(0, innerW - 1 - visibleWidth(title) - visibleWidth(spin)))) + b("╮"));
+		out.push(
+			b("╭─") +
+				title +
+				spin +
+				b(
+					"─".repeat(
+						Math.max(
+							0,
+							innerW -
+								1 -
+								visibleWidth(title) -
+								visibleWidth(spin),
+						),
+					),
+				) +
+				b("╮"),
+		);
 
 		// tabs + search
 		const c = this.counts();
 		const tab = (v: View, label: string, n: number) => {
 			const t = ` ${label} ${n} `;
-			return this.state.view === v ? th.bg("selectedBg", th.bold(th.fg("accent", t))) : th.fg("muted", t);
+			return this.state.view === v
+				? th.bg("selectedBg", th.bold(th.fg("accent", t)))
+				: th.fg("muted", t);
 		};
 		let tabs = ` ${tab("inbox", "Inbox", c.inbox)} ${tab("archived", "Archived", c.archived)} ${tab("all", "All", c.all)} ${tab("filtered", "Filtered", c.filtered)}`;
 		const q = this.searching
@@ -1689,8 +2175,12 @@ class InboxComponent {
 			? ` · next: ${th.bold(th.fg("warning",
 				groupLabel(this.groups, preset === "all" ? "all" : preset)))}`
 			: "";
-		out.push(line(` Group: ${groupLabel(this.groups, scope)}${layout}${nextPick}` +
-			" · f next group · F default group · g groups · b move"));
+		out.push(
+			line(
+				` Group: ${groupLabel(this.groups, scope)}${layout}${nextPick}` +
+					" · f next group · F default group · g groups · b move",
+			),
+		);
 		out.push(sep());
 
 		// list
@@ -1698,14 +2188,27 @@ class InboxComponent {
 		const selDisplayIdx = this.display.findIndex((d) => d.kind === "item" && d.idx === this.selected);
 		if (selDisplayIdx >= 0) {
 			// show the section header above the first item when scrolled to top
-			const target = selDisplayIdx > 0 && this.display[selDisplayIdx - 1]?.kind === "header" ? selDisplayIdx - 1 : selDisplayIdx;
+			const target =
+				selDisplayIdx > 0 &&
+				this.display[selDisplayIdx - 1]?.kind === "header"
+					? selDisplayIdx - 1
+					: selDisplayIdx;
 			if (target < this.scroll) this.scroll = target;
-			if (selDisplayIdx >= this.scroll + LH) this.scroll = selDisplayIdx - LH + 1;
+			if (selDisplayIdx >= this.scroll + LH)
+				this.scroll = selDisplayIdx - LH + 1;
 		}
-		this.scroll = Math.max(0, Math.min(this.scroll, Math.max(0, this.display.length - LH)));
+		this.scroll = Math.max(
+			0,
+			Math.min(this.scroll, Math.max(0, this.display.length - LH)),
+		);
 
 		// columns
 		const wStatus = 12;
+		const wTree = [...this.families.values()].some(
+			(item) => item.child || item.children.length,
+		)
+			? 4
+			: 0;
 		// The ⚑ slot only exists while takeover is possible (orchestrator mode).
 		const wTake = orchestrating() ? 2 : 0;
 		const wProj = Math.min(22, Math.max(10, Math.floor(innerW * 0.18)));
@@ -1717,6 +2220,7 @@ class InboxComponent {
 		const wAge = 5;
 		const wMsgs = 5;
 		const wFixed =
+			wTree +
 			2 +
 			2 +
 			2 +
@@ -1759,6 +2263,12 @@ class InboxComponent {
 					continue;
 				}
 				const r = d.row;
+				const family = this.families.get(r.info.id);
+				const tree = family?.child
+					? this.theme.fg("dim", family.lastChild ? " └─ " : " ├─ ")
+					: family?.children.length
+						? this.theme.fg("accent", family.expanded ? "▾ " : "▸ ")
+						: "";
 				const sel = d.idx === this.selected;
 				const cursor = sel ? th.fg("accent", "▶ ") : "  ";
 				const pin = r.meta.pinnedAt ? th.fg("warning", "★ ") : "  ";
@@ -1766,8 +2276,13 @@ class InboxComponent {
 				// independent of which row is the current one (`»`). Orchestrator-only:
 				// the slot disappears with the mode so non-orchestrator layout is unchanged.
 				const takeoverDot =
-					orchestrating() && r.takenOver ? th.fg("warning", "⚑ ") : "  ";
-				const liveDot = r.isCurrent || r.live || r.bg ? th.fg("success", "◉ ") : "  ";
+					orchestrating() && r.takenOver
+						? th.fg("warning", "⚑ ")
+						: "  ";
+				const liveDot =
+					r.isCurrent || r.live || r.bg
+						? th.fg("success", "◉ ")
+						: "  ";
 				// fixed 2-col slot before the title so titles stay aligned whether or not a row is unread,
 				// shared with the current-session marker: gold `»` (warning) is the session you're in and
 				// it's read; blue `»` (mdLink) is the session you're in but you marked it unread by hand.
@@ -1779,24 +2294,98 @@ class InboxComponent {
 							: r.isCurrent
 								? th.fg("warning", "» ")
 								: "  ";
-				const titleColor = r.meta.archivedAt && this.state.view === "all" ? "dim" : "text";
-				let t = r.info.name ? th.bold(th.fg(titleColor, r.title)) : th.fg(titleColor, r.title);
+				const titleColor =
+					r.meta.archivedAt && this.state.view === "all"
+						? "dim"
+						: "text";
+				let t = r.info.name
+					? th.bold(th.fg(titleColor, r.title))
+					: th.fg(titleColor, r.title);
 				// lead with the reason so a long title can't truncate it away
-				if (this.state.view === "filtered") t = th.fg("warning", `⊘ ${filterReason(r)}`) + th.fg("dim", " · ") + t;
+				if (this.state.view === "filtered")
+					t =
+						th.fg("warning", `⊘ ${filterReason(r)}`) +
+						th.fg("dim", " · ") +
+						t;
+				if (family?.contextOnly) t += th.fg("dim", " [parent context]");
+				if (family?.child && !showGroup) {
+					const parent = this.families.get(
+						family.parentId ?? "",
+					)?.row;
+					if (
+						parent &&
+						sessionGroup(this.groups, parent.info.id)?.id !==
+							sessionGroup(this.groups, r.info.id)?.id
+					) {
+						t += th.fg(
+							"dim",
+							` [${
+								sessionGroup(this.groups, r.info.id)?.name ??
+								"Ungrouped"
+							}]`,
+						);
+					}
+				}
+				if (
+					!family?.child &&
+					this.links.some(
+						(link) =>
+							link.id === r.info.id &&
+							!this.rows.some(
+								(parent) => parent.info.id === link.parentId,
+							),
+					)
+				) {
+					t += th.fg("dim", " [parent unavailable]");
+				}
 				t = unread + t;
-				if (r.meta.archivedAt && this.state.view === "all") t += th.fg("dim", " [archived]");
-				if (r.rule && r.meta.filter === "show" && this.state.view !== "filtered") t += th.fg("dim", " [kept]");
-				const age = this.state.view === "archived" && r.meta.archivedAt ? relTime(r.meta.archivedAt) : relTime(r.info.modified);
-				const editing = this.renaming && this.renaming.id === r.info.id ? this.renaming.input : undefined;
-				const textCells = editing
-					? fit(editing.render(wText)[0] ?? "", wText)
-					: fit(t, wTitle) + (wLast ? " " + fit(this.latestCell(r), wLast) : "");
-				const groupName = sessionGroup(this.groups, r.info.id)?.name
-					?? "Ungrouped";
+				if (r.meta.archivedAt && this.state.view === "all")
+					t += th.fg("dim", " [archived]");
+				if (
+					r.rule &&
+					r.meta.filter === "show" &&
+					this.state.view !== "filtered"
+				)
+					t += th.fg("dim", " [kept]");
+				const age =
+					this.state.view === "archived" && r.meta.archivedAt
+						? relTime(r.meta.archivedAt)
+						: relTime(r.info.modified);
+				const editing =
+					this.renaming && this.renaming.id === r.info.id
+						? this.renaming.input
+						: undefined;
+				let textCells =
+					fit(t, wTitle) +
+					(wLast ? " " + fit(this.latestCell(r), wLast) : "");
+				if (family?.children.length) {
+					if (wLast)
+						textCells =
+							fit(t, wTitle) +
+							" " +
+							fit(this.workerSummary(family, wLast < 45), wLast);
+					else {
+						const summary = this.workerSummary(family, true);
+						const summaryWidth = Math.min(
+							visibleWidth(summary),
+							Math.max(2, Math.floor(wText * 0.6)),
+						);
+						textCells =
+							fit(t, wText - summaryWidth - 1) +
+							" " +
+							fit(summary, summaryWidth);
+					}
+				}
+				if (editing)
+					textCells = fit(editing.render(wText)[0] ?? "", wText);
+				const groupName =
+					sessionGroup(this.groups, r.info.id)?.name ?? "Ungrouped";
 				const groupCell = wGroup
-					? fit(th.fg("muted", groupName), wGroup) + " " : "";
+					? fit(th.fg("muted", groupName), wGroup) + " "
+					: "";
 				let content =
 					cursor +
+					(wTree ? fit(tree, wTree) : "") +
 					pin +
 					takeoverDot +
 					liveDot +
@@ -1809,7 +2398,10 @@ class InboxComponent {
 					" " +
 					th.fg("dim", fit(age.padStart(wAge), wAge)) +
 					" " +
-					th.fg("dim", fit(String(r.info.messageCount).padStart(wMsgs), wMsgs));
+					th.fg(
+						"dim",
+						fit(String(r.info.messageCount).padStart(wMsgs), wMsgs),
+					);
 				content = fit(content, innerW);
 				out.push(line(sel ? th.bg("selectedBg", content) : content));
 			}
@@ -1821,31 +2413,50 @@ class InboxComponent {
 		if (r) {
 			const meta: string[] = [];
 			meta.push(shortCwd(r.info.cwd));
-			meta.push(`group: ${sessionGroup(this.groups, r.info.id)?.name
-				?? "Ungrouped"}`);
+			const family = this.families.get(r.info.id);
+			if (family?.children.length) meta.push(this.workerSummary(family));
+			if (family?.contextOnly)
+				meta.push("parent shown for matching workers");
+			meta.push(
+				`group: ${
+					sessionGroup(this.groups, r.info.id)?.name ?? "Ungrouped"
+				}`,
+			);
 			meta.push(`created ${ago(r.info.created)}`);
 			meta.push(`updated ${ago(r.info.modified)}`);
 			if (r.meta.pinnedAt) meta.push(`pinned ${ago(r.meta.pinnedAt)}`);
-			if (r.meta.archivedAt) meta.push(`archived ${ago(r.meta.archivedAt)}`);
+			if (r.meta.archivedAt)
+				meta.push(`archived ${ago(r.meta.archivedAt)}`);
 			if (r.filtered) meta.push(`filtered: ${filterReason(r)}`);
-			else if (r.rule && r.meta.filter === "show") meta.push(`kept despite rule: ${r.rule}`);
+			else if (r.rule && r.meta.filter === "show")
+				meta.push(`kept despite rule: ${r.rule}`);
 			if (r.bg) {
-				if (r.bg.activity && isRunning(r.bg)) meta.push(`▸ ${r.bg.activity}`);
-				if (r.bg.pending.length) meta.push(`${r.bg.pending.length} queued`);
+				if (r.bg.activity && isRunning(r.bg))
+					meta.push(`▸ ${r.bg.activity}`);
+				if (r.bg.pending.length)
+					meta.push(`${r.bg.pending.length} queued`);
 				if (r.bg.model && r.bg.runs <= 1) meta.push(r.bg.model);
-				if (r.bg.state === "error" && r.bg.error) meta.push(`✗ ${r.bg.error}`);
-			} else if (r.live?.bgParent) meta.push(`background agent of pid ${r.live.bgParent}`);
+				if (r.bg.state === "error" && r.bg.error)
+					meta.push(`✗ ${r.bg.error}`);
+			} else if (r.live?.bgParent)
+				meta.push(`background agent of pid ${r.live.bgParent}`);
 			else if (r.live && !r.isCurrent)
 				meta.push(
 					r.live.stuckMin
 						? `pid ${r.live.pid} looks stuck (silent ${r.live.stuckMin}m; kill -9 ${r.live.pid})`
 						: `open in pid ${r.live.pid}`,
 				);
-			const first = r.info.name ? `${th.fg("muted", "first:")} ${cleanTitle(r.info.firstMessage)}` : "";
+			const first = r.info.name
+				? `${th.fg("muted", "first:")} ${cleanTitle(r.info.firstMessage)}`
+				: "";
 			out.push(line(` ${th.fg("dim", meta.join(" · "))}`));
 			out.push(line(` ${first ? th.fg("dim", first) : ""}`));
 			const last = r.tail.lastText.replace(/\s+/g, " ").trim();
-			out.push(line(` ${th.fg("muted", "last:")} ${th.fg("text", last || "—")}`));
+			out.push(
+				line(
+					` ${th.fg("muted", "last:")} ${th.fg("text", last || "—")}`,
+				),
+			);
 		} else {
 			out.push(line(""), line(""), line(""));
 		}
@@ -1855,6 +2466,12 @@ class InboxComponent {
 		const flash = this.flash && this.flash.until > Date.now() ? this.flash.text : undefined;
 		const k = (key: string, label: string) => `${th.fg("accent", key)} ${th.fg("dim", label)}`;
 		const archLabel = this.state.view === "archived" ? "unarchive" : r?.meta.archivedAt ? "unarchive" : "archive";
+		const item = r ? this.families.get(r.info.id) : undefined;
+		const foldable =
+			item?.children.length ||
+			(item?.parentId &&
+				this.families.get(item.parentId)?.children.length);
+		const foldHint = foldable ? [k("space", "workers")] : [];
 		const help = this.renaming
 			? [
 					k("type", this.renaming.replace ? "to replace" : "to edit"),
@@ -1863,52 +2480,67 @@ class InboxComponent {
 					k("esc", "cancel"),
 				].join(th.fg("dim", " · "))
 			: this.searching
-			? [k("type", "to filter"), k("enter", "keep"), k("esc", "clear")].join(th.fg("dim", " · "))
-			: orchestrating()
-			? [
-					k("↑↓", "move"),
-					k("←→", "±5"),
-					k("enter", "open"),
-					k("t", "take over"),
-					k("n", "new agent"),
-					k("N", "new (pick model)"),
-					k("G", "new (in this group)"),
-					k("v", "peek"),
-					...(isRunning(r?.bg) ? [k("c", "cancel")] : []),
-					...(r?.bg?.pending.length ? [k("m", "manage queue")] : []),
-					...(r && !isRunning(r?.bg) ? [k("d", "move dir")] : []),
-					...(this.atHome ? [] : [k("h", "hand back"), k("esc", "back to session")]),
-					k("p", r?.meta.pinnedAt ? "unpin" : "pin"),
-					k("a", archLabel),
-					k("u", r?.unread ? "mark read" : "mark unread"),
-					k("x", r?.filtered ? "unfilter" : "filter"),
-					k("tab", "view"),
-					k("/", "search"),
-					k("r", "rename"),
-					k("?", "help"),
-					k("Q", "leave orchestrator"),
-				].join(th.fg("dim", " · "))
-				: [
-						k("↑↓", "move"),
-						k("←→", "±5"),
-						k("enter", "view/reply"),
-						k("o", "open here"),
-						k("n", "new agent"),
-						k("G", "new (in this group)"),
-						...(isRunning(r?.bg) ? [k("c", "cancel")] : []),
-						...(r?.bg?.pending.length
-							? [k("m", "manage queue")]
-							: []),
-						k("p", r?.meta.pinnedAt ? "unpin" : "pin"),
-						k("a", archLabel),
-						k("u", r?.unread ? "mark read" : "mark unread"),
-						k("x", r?.filtered ? "unfilter" : "filter"),
-						k("tab", "view"),
-						k("/", "search"),
-						k("r", "rename"),
-						k("?", "help"),
-						k("esc", "close"),
-					].join(th.fg("dim", " · "));
+				? [
+						k("type", "to filter"),
+						k("enter", "keep"),
+						k("esc", "clear"),
+					].join(th.fg("dim", " · "))
+				: orchestrating()
+					? [
+							k("↑↓", "move"),
+							k("←→", "±5"),
+							...foldHint,
+							k("enter", "open"),
+							k("t", "take over"),
+							k("n", "new agent"),
+							k("N", "new (pick model)"),
+							k("G", "new (in this group)"),
+							k("v", "peek"),
+							...(isRunning(r?.bg) ? [k("c", "cancel")] : []),
+							...(r?.bg?.pending.length
+								? [k("m", "manage queue")]
+								: []),
+							...(r && !isRunning(r?.bg)
+								? [k("d", "move dir")]
+								: []),
+							...(this.atHome
+								? []
+								: [
+										k("h", "hand back"),
+										k("esc", "back to session"),
+									]),
+							k("p", r?.meta.pinnedAt ? "unpin" : "pin"),
+							k("a", archLabel),
+							k("u", r?.unread ? "mark read" : "mark unread"),
+							k("x", r?.filtered ? "unfilter" : "filter"),
+							k("tab", "view"),
+							k("/", "search"),
+							k("r", "rename"),
+							k("?", "help"),
+							k("Q", "leave orchestrator"),
+						].join(th.fg("dim", " · "))
+					: [
+							k("↑↓", "move"),
+							k("←→", "±5"),
+							...foldHint,
+							k("enter", "view/reply"),
+							k("o", "open here"),
+							k("n", "new agent"),
+							k("G", "new (in this group)"),
+							...(isRunning(r?.bg) ? [k("c", "cancel")] : []),
+							...(r?.bg?.pending.length
+								? [k("m", "manage queue")]
+								: []),
+							k("p", r?.meta.pinnedAt ? "unpin" : "pin"),
+							k("a", archLabel),
+							k("u", r?.unread ? "mark read" : "mark unread"),
+							k("x", r?.filtered ? "unfilter" : "filter"),
+							k("tab", "view"),
+							k("/", "search"),
+							k("r", "rename"),
+							k("?", "help"),
+							k("esc", "close"),
+						].join(th.fg("dim", " · "));
 		out.push(line(` ${flash ? th.fg("success", flash) : help}`));
 		out.push(b(`╰${"─".repeat(innerW)}╯`));
 
@@ -1940,7 +2572,14 @@ class NewAgentPromptComponent implements Focusable {
 		private done: (text: string | undefined) => void,
 		private info: { heading: string; detail: string; action: string },
 	) {
-		this.editor = new Editor(tui, { borderColor: (t: string) => theme.fg("borderAccent", t), selectList: getSelectListTheme() }, { paddingX: 1 });
+		this.editor = new Editor(
+			tui,
+			{
+				borderColor: (t: string) => theme.fg("borderAccent", t),
+				selectList: getSelectListTheme(),
+			},
+			{ paddingX: 1 },
+		);
 		this.editor.onSubmit = (text) => {
 			if (text.trim()) this.done(text);
 		};
@@ -1963,7 +2602,12 @@ class NewAgentPromptComponent implements Focusable {
 		const line = (s: string) => b("│") + fit(s, innerW) + b("│");
 		const rows = Math.max(14, this.tui.terminal?.rows ?? 30);
 		const title = ` ${th.bold(th.fg("accent", `📥 Pi Inbox · orchestrator · ${this.info.heading}`))} `;
-		const out = [b("╭─") + title + b("─".repeat(Math.max(0, innerW - 1 - visibleWidth(title)))) + b("╮")];
+		const out = [
+			b("╭─") +
+				title +
+				b("─".repeat(Math.max(0, innerW - 1 - visibleWidth(title)))) +
+				b("╮"),
+		];
 		out.push(line(` ${th.fg("dim", this.info.detail)}`));
 		out.push(line(""));
 		const kb = getKeybindings();
@@ -2089,16 +2733,24 @@ class DirPickerComponent implements Focusable {
 		const line = (s: string) => b("│") + fit(s, innerW) + b("│");
 		const rows = Math.max(14, this.tui.terminal?.rows ?? 30);
 		const title = ` ${th.bold(th.fg("accent", `📥 Pi Inbox · orchestrator · ${this.opts.title}`))} `;
-		const out = [b("╭─") + title + b("─".repeat(Math.max(0, innerW - 1 - visibleWidth(title)))) + b("╮")];
+		const out = [
+			b("╭─") +
+				title +
+				b("─".repeat(Math.max(0, innerW - 1 - visibleWidth(title)))) +
+				b("╮"),
+		];
 		if (this.opts.hint) out.push(line(` ${th.fg("dim", this.opts.hint)}`));
 		out.push(line(""));
 		this.input.focused = this._focused;
-		out.push(line(` ${this.input.render(Math.max(10, innerW - 2))[0] ?? ""}`));
+		out.push(
+			line(` ${this.input.render(Math.max(10, innerW - 2))[0] ?? ""}`),
+		);
 		out.push(line(""));
 
 		const LIST_H = Math.max(4, rows - 9);
 		if (this.selected < this.scroll) this.scroll = this.selected;
-		if (this.selected >= this.scroll + LIST_H) this.scroll = this.selected - LIST_H + 1;
+		if (this.selected >= this.scroll + LIST_H)
+			this.scroll = this.selected - LIST_H + 1;
 		if (!this.suggestions.length) out.push(line(` ${th.fg("dim", "(no suggestions — type a path)")}`));
 		for (let i = 0; i < LIST_H; i++) {
 			const s = this.suggestions[this.scroll + i];
@@ -2123,7 +2775,13 @@ class DirPickerComponent implements Focusable {
 		const k = (key: string, label: string) => `${th.fg("accent", key)} ${th.fg("dim", label)}`;
 		const foot = this.error
 			? th.fg("error", ` ✗ ${this.error}`)
-			: [k("↑↓", "pick"), k("tab", "fill"), k("enter", "accept"), k("esc", "cancel"), k("typing", "filters the list")].join(th.fg("dim", " · "));
+			: [
+					k("↑↓", "pick"),
+					k("tab", "fill"),
+					k("enter", "accept"),
+					k("esc", "cancel"),
+					k("typing", "filters the list"),
+				].join(th.fg("dim", " · "));
 		out.push(line(` ${foot}`));
 		out.push(b(`╰${"─".repeat(innerW)}╯`));
 		return out.slice(0, rows).map((l) => truncateToWidth(l, width));
@@ -2157,7 +2815,12 @@ class ConfirmComponent {
 		const line = (s: string) => b("│") + fit(s, innerW) + b("│");
 		const rows = Math.max(10, this.tui.terminal?.rows ?? 30);
 		const title = ` ${th.bold(th.fg("accent", "📥 Pi Inbox · orchestrator"))} `;
-		const out = [b("╭─") + title + b("─".repeat(Math.max(0, innerW - 1 - visibleWidth(title)))) + b("╮")];
+		const out = [
+			b("╭─") +
+				title +
+				b("─".repeat(Math.max(0, innerW - 1 - visibleWidth(title)))) +
+				b("╮"),
+		];
 		const body = [
 			"",
 			` ${th.bold(th.fg("warning", this.title))}`,
@@ -2171,7 +2834,11 @@ class ConfirmComponent {
 		for (let i = 0; i < top; i++) out.push(line(""));
 		out.push(...body.map(line));
 		while (out.length < rows - 2) out.push(line(""));
-		out.push(line(` ${th.fg("accent", "↑↓")} ${th.fg("dim", "choose")} · ${th.fg("accent", "enter")} ${th.fg("dim", "select")} · ${th.fg("accent", "y/n")} · ${th.fg("accent", "esc")} ${th.fg("dim", "no")}`));
+		out.push(
+			line(
+				` ${th.fg("accent", "↑↓")} ${th.fg("dim", "choose")} · ${th.fg("accent", "enter")} ${th.fg("dim", "select")} · ${th.fg("accent", "y/n")} · ${th.fg("accent", "esc")} ${th.fg("dim", "no")}`,
+			),
+		);
 		out.push(b(`╰${"─".repeat(innerW)}╯`));
 		return out.slice(0, rows).map((l) => truncateToWidth(l, width));
 	}
@@ -2430,11 +3097,18 @@ function dirSuggestions(input: string, base: string): DirSuggestion[] {
 	};
 	const typed = !!input.trim();
 	const { dir, rest } = resolvePrefix(input, base);
-	push({ value: dir, label: prettyDir(dir), hint: typed ? (rest ? undefined : "as typed") : "current", kind: "as-typed" });
+	push({
+		value: dir,
+		label: prettyDir(dir),
+		hint: typed ? (rest ? undefined : "as typed") : "current",
+		kind: "as-typed",
+	});
 	const parent = path.dirname(dir);
-	if (parent && parent !== dir) push({ value: parent, label: "..", hint: "parent", kind: "up" });
+	if (parent && parent !== dir)
+		push({ value: parent, label: "..", hint: "parent", kind: "up" });
 	const home = os.homedir();
-	if (home !== dir) push({ value: home, label: "~", hint: "home", kind: "home" });
+	if (home !== dir)
+		push({ value: home, label: "~", hint: "home", kind: "home" });
 
 	let names: string[] = [];
 	try {
@@ -2442,7 +3116,10 @@ function dirSuggestions(input: string, base: string): DirSuggestion[] {
 			.readdirSync(dir)
 			.filter((n) => {
 				try {
-					return fs.statSync(path.join(dir, n)).isDirectory() && !n.startsWith(".");
+					return (
+						fs.statSync(path.join(dir, n)).isDirectory() &&
+						!n.startsWith(".")
+					);
 				} catch {
 					return false;
 				}
@@ -2461,7 +3138,12 @@ function dirSuggestions(input: string, base: string): DirSuggestion[] {
 		const q = input.trim().toLowerCase();
 		for (const c of recentSessionDirs()) {
 			if (c === dir || !prettyDir(c).toLowerCase().includes(q)) continue;
-			push({ value: c, label: prettyDir(c), hint: "recent", kind: "recent" });
+			push({
+				value: c,
+				label: prettyDir(c),
+				hint: "recent",
+				kind: "recent",
+			});
 		}
 	}
 	return out.slice(0, 14);
@@ -2587,7 +3269,16 @@ function setNextAgentName(name: string | undefined) {
 }
 // Session names in status lines get a stable per-session color, so different targets are easy to
 // tell apart (pi renders notify() text dim gray otherwise).
-const NAME_COLORS = ["syntaxType", "syntaxFunction", "syntaxKeyword", "syntaxString", "mdHeading", "syntaxVariable", "success", "syntaxNumber"] as const;
+const NAME_COLORS = [
+	"syntaxType",
+	"syntaxFunction",
+	"syntaxKeyword",
+	"syntaxString",
+	"mdHeading",
+	"syntaxVariable",
+	"success",
+	"syntaxNumber",
+] as const;
 function nameColor(key: string): (typeof NAME_COLORS)[number] {
 	let h = 0;
 	for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0;
@@ -2633,9 +3324,18 @@ function showReplyWidget(ctx: ExtensionContext) {
 		: "";
 	const text =
 		t.kind === "new"
-			? th.fg("accent", "＋ Your next message starts a new background agent") +
-				th.fg("dim", ` · ${shortCwd(nextDir ?? t.cwd)}` +
-					` · ${t.model ?? "default model"}`) + named + dir + group
+			? th.fg(
+					"accent",
+					"＋ Your next message starts a new background agent",
+				) +
+				th.fg(
+					"dim",
+					` · ${shortCwd(nextDir ?? t.cwd)}` +
+						` · ${t.model ?? "default model"}`,
+				) +
+				named +
+				dir +
+				group
 			: `${th.fg("accent", "↪ Your next message goes to ")}${th.bold(th.fg(nameColor(t.id), t.title.slice(0, 50)))}${th.fg(
 					"dim",
 					` · ${t.model ? `${t.model} (changed)` : (t.agentModel ?? "its current model")}${isRunning(getAgent(t.id)) ? " · queued: it's working" : ""}`,
@@ -2833,7 +3533,12 @@ function coverImagesUnderOverlays(tui: TUI): void {
 /** Overlay geometry: full screen in orchestrator mode, a centered pane otherwise. */
 function overlayOpts(paneWidth: `${number}%` = "94%"): OverlayOptions {
 	return orchestrating()
-		? { width: "100%", maxHeight: "100%", anchor: "top-left" as const, margin: 0 }
+		? {
+				width: "100%",
+				maxHeight: "100%",
+				anchor: "top-left" as const,
+				margin: 0,
+			}
 		: { width: paneWidth, maxHeight: "92%", anchor: "center" as const };
 }
 
@@ -2855,12 +3560,19 @@ function isHome(ctx: ExtensionContext): boolean {
  * A "taken over" session runs right here, like plain pi.
  */
 function isAttached(ctx: ExtensionContext): boolean {
-	return orchestrating() && !isHome(ctx) && !modeState().takenOver.has(ctx.sessionManager.getSessionId());
+	return (
+		orchestrating() &&
+		!isHome(ctx) &&
+		!modeState().takenOver.has(ctx.sessionManager.getSessionId())
+	);
 }
 
 /** The window's real foreground session is the sticky taken-over main. */
 function isStickyMain(ctx: ExtensionContext): boolean {
-	return orchestrating() && modeState().takenOver.has(ctx.sessionManager.getSessionId());
+	return (
+		orchestrating() &&
+		modeState().takenOver.has(ctx.sessionManager.getSessionId())
+	);
 }
 
 /** Shared queue target for /queue and the native dequeue-key interceptor. */
@@ -2875,7 +3587,10 @@ function queueTargetId(ctx: ExtensionContext): string | undefined {
 
 /** Attached and its background run is still going (the on-screen transcript is a snapshot). */
 function attachedBusy(ctx: ExtensionContext): boolean {
-	return isAttached(ctx) && isRunning(getAgent(ctx.sessionManager.getSessionId()));
+	return (
+		isAttached(ctx) &&
+		isRunning(getAgent(ctx.sessionManager.getSessionId()))
+	);
 }
 
 /** The only special mode banner: identify the main session as taken over. */
@@ -3428,7 +4143,9 @@ export default function (pi: ExtensionAPI) {
 
 	// ctrl+r (registered by the rename-chat extension) asks here first: on orchestrator home, or
 	// while a new-agent prompt is pending, it names that new agent instead of this session.
-	(globalThis as any)[Symbol.for("pi.inbox.rename-target")] = (ctx: ExtensionContext) => {
+	(globalThis as any)[Symbol.for("pi.inbox.rename-target")] = (
+		ctx: ExtensionContext,
+	) => {
 		const t = getReplyTarget();
 		if (t?.kind === "agent") return undefined;
 		const visit = visitState().visit;
@@ -3438,12 +4155,18 @@ export default function (pi: ExtensionAPI) {
 				current: getAgent(visit.id)?.title ?? visit.title,
 				apply: (name: string) => {
 					const sm = SessionManager.open(visit.file);
-					const first = sm.getBranch().find(
-						(e: any) => e.type === "message" && e.message?.role === "user",
-					) as any;
-					const title = name || cleanTitle(
-						messageText(first?.message?.content) || "",
-					).slice(0, 200);
+					const first = sm
+						.getBranch()
+						.find(
+							(e: any) =>
+								e.type === "message" &&
+								e.message?.role === "user",
+						) as any;
+					const title =
+						name ||
+						cleanTitle(
+							messageText(first?.message?.content) || "",
+						).slice(0, 200);
 					if (!title) return "No user message yet — pass a title.";
 					if (getAgent(visit.id)) renameAgent(visit.id, title);
 					else sm.appendSessionInfo(title);
@@ -3590,7 +4313,7 @@ export default function (pi: ExtensionAPI) {
 	/** One-off: the group the NEXT new agent joins (F in the inbox list). */
 	async function chooseNextGroup(ctx: ExtensionContext) {
 		const preset = getNextAgentGroup();
-		const initial = preset ?? (newAgentGroup() ?? "ungrouped");
+		const initial = preset ?? newAgentGroup() ?? "ungrouped";
 		const scope = await pickGroup(ctx, "next", initial);
 		if (scope === undefined) return;
 		setNextAgentGroup(scope);
@@ -3626,7 +4349,8 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.registerFlag("orchestrator", {
-		description: "Start in inbox orchestrator mode: this window becomes a full-screen agent control panel (/orchestrator)",
+		description:
+			"Start in inbox orchestrator mode: this window becomes a full-screen agent control panel (/orchestrator)",
 		type: "boolean",
 		default: false,
 	});
@@ -3640,7 +4364,10 @@ export default function (pi: ExtensionAPI) {
 		// next run / any window opening this session doesn't restore a stale level (e.g. `off`).
 		if (isAgentChild()) {
 			try {
-				recordActualThinkingLevel(ctx.sessionManager, ctx.thinkingLevel ?? pi.getThinkingLevel());
+				recordActualThinkingLevel(
+					ctx.sessionManager,
+					ctx.thinkingLevel ?? pi.getThinkingLevel(),
+				);
 			} catch {
 				// best effort
 			}
@@ -3655,7 +4382,8 @@ export default function (pi: ExtensionAPI) {
 		const ms = modeState();
 		if (!ms.flagApplied) {
 			ms.flagApplied = true;
-			if (pi.getFlag("orchestrator") === true && ctx.mode === "tui") ms.on = true;
+			if (pi.getFlag("orchestrator") === true && ctx.mode === "tui")
+				ms.on = true;
 		}
 		// A real session switch while a visit was mounted (e.g. /resume used directly): the new
 		// session's render writes through the chat container, so the visit's interposition must
@@ -3675,8 +4403,10 @@ export default function (pi: ExtensionAPI) {
 			delete G[key];
 			try {
 				const source = SessionManager.open(e.previousSessionFile);
-				const kind = pending?.file === e.previousSessionFile
-					? pending.kind : "Fork";
+				const kind =
+					pending?.file === e.previousSessionFile
+						? pending.kind
+						: "Fork";
 				pi.setSessionName(branchName(sourceName(source), kind));
 			} catch {
 				// A missing source must not prevent opening the new branch.
@@ -3686,7 +4416,10 @@ export default function (pi: ExtensionAPI) {
 				if (header) {
 					const group = sessionGroup(readGroups(), header.id);
 					if (group) {
-						await inboxGroups.assign(ctx.sessionManager.getSessionId(), group.id);
+						await inboxGroups.assign(
+							ctx.sessionManager.getSessionId(),
+							group.id,
+						);
 						refreshFooter(ctx);
 					}
 				}
@@ -3699,7 +4432,8 @@ export default function (pi: ExtensionAPI) {
 		// reload) the full-screen orchestrator comes back up, so pi's chat view never shows at home.
 		const skip = ms.skipReopen;
 		ms.skipReopen = false;
-		if (orchestrating() && ctx.mode === "tui" && isHome(ctx) && !skip) reopenInbox((t, o) => pi.sendUserMessage(t, o));
+		if (orchestrating() && ctx.mode === "tui" && isHome(ctx) && !skip)
+			reopenInbox((t, o) => pi.sendUserMessage(t, o));
 	});
 	pi.on("agent_start", async (_e, ctx) => {
 		writeLive(ctx, "working");
@@ -3792,7 +4526,8 @@ export default function (pi: ExtensionAPI) {
 	// Keyed by a version so per-session re-instantiation doesn't churn it.
 	const LISTENER_VERSION = 14;
 	if (G.__piInboxAgentsListenerVersion !== LISTENER_VERSION) {
-		if (typeof G.__piInboxAgentsListener === "function") G.__piInboxAgentsListener();
+		if (typeof G.__piInboxAgentsListener === "function")
+			G.__piInboxAgentsListener();
 		G.__piInboxAgentsListenerVersion = LISTENER_VERSION;
 		G.__piInboxAgentsListener = onAgentEvent((ev) => {
 			const ctx = G.__piInboxAgentsCtx as ExtensionContext | undefined;
@@ -3815,7 +4550,11 @@ export default function (pi: ExtensionAPI) {
 					holdAgent(cur);
 					ms.betweenRuns.add(cur);
 					scheduleRefresh(cur);
-				} else if (ev.type === "run_end" && ev.agent.id === cur && ms.inLoop) {
+				} else if (
+					ev.type === "run_end" &&
+					ev.agent.id === cur &&
+					ms.inLoop
+				) {
 					ms.stale.add(cur);
 				}
 				ctx.ui.setStatus("inbox-agents", agentsSummary());
@@ -3828,7 +4567,8 @@ export default function (pi: ExtensionAPI) {
 						ev.agent.id === shown &&
 						!ms.inLoop &&
 						!manuallyUnread(shown)
-					) markRead(shown);
+					)
+						markRead(shown);
 					showLiveStream(ctx);
 					showModeWidget(ctx);
 				} else if (isAttached(ctx)) {
@@ -3857,7 +4597,9 @@ export default function (pi: ExtensionAPI) {
 				if (ev.type === "finished") {
 					const failed = ev.agent.state === "error";
 					ctx.ui.notify(
-						failed ? `✗ Agent failed: ${ev.agent.title.slice(0, 60)}` : `◆ Agent finished: ${ev.agent.title.slice(0, 60)} — ctrl+q to view`,
+						failed
+							? `✗ Agent failed: ${ev.agent.title.slice(0, 60)}`
+							: `◆ Agent finished: ${ev.agent.title.slice(0, 60)} — ctrl+q to view`,
 						failed ? "error" : "info",
 					);
 					playSound(failed);
@@ -4017,7 +4759,9 @@ export default function (pi: ExtensionAPI) {
 	 * handed to a background agent; the returned function starts that agent (call it after the
 	 * switch, once this window no longer holds the session).
 	 */
-	async function prepareLeave(ctx: ExtensionCommandContext): Promise<(() => void) | undefined> {
+	async function prepareLeave(
+		ctx: ExtensionCommandContext,
+	): Promise<(() => void) | undefined> {
 		const ms = modeState();
 		const id = ctx.sessionManager.getSessionId();
 		const wasTakenOver = ms.takenOver.delete(id);
@@ -4038,7 +4782,14 @@ export default function (pi: ExtensionAPI) {
 		ctx.abort();
 		await ctx.waitForIdle();
 		return () => {
-			sendToAgent({ id, cwd, sessionFile: file, title, text: CONTINUE_MSG, model });
+			sendToAgent({
+				id,
+				cwd,
+				sessionFile: file,
+				title,
+				text: CONTINUE_MSG,
+				model,
+			});
 			const c = G.__piInboxAgentsCtx as ExtensionContext | undefined;
 			try {
 				c?.ui.notify(
@@ -4404,10 +5155,18 @@ export default function (pi: ExtensionAPI) {
 						atHome,
 						(row, name) => {
 							// Working (or not saved yet) background agent: its process applies the name itself.
-							if (row.bg && (isRunning(row.bg) || !row.info.path)) renameAgent(row.bg.id, name);
-							else if (row.info.id === foregroundId) pi.setSessionName(name);
-							else if (!row.info.path) throw new Error("session isn't saved yet, try again in a moment");
-							else SessionManager.open(row.info.path).appendSessionInfo(name);
+							if (row.bg && (isRunning(row.bg) || !row.info.path))
+								renameAgent(row.bg.id, name);
+							else if (row.info.id === foregroundId)
+								pi.setSessionName(name);
+							else if (!row.info.path)
+								throw new Error(
+									"session isn't saved yet, try again in a moment",
+								);
+							else
+								SessionManager.open(
+									row.info.path,
+								).appendSessionInfo(name);
 						},
 					);
 				},
@@ -4422,7 +5181,8 @@ export default function (pi: ExtensionAPI) {
 					orchestrating() &&
 					(ms.stale.has(foregroundId) ||
 						ms.takeoverWhenDone.has(foregroundId))
-				) await refreshCurrent(ctx);
+				)
+					await refreshCurrent(ctx);
 				return;
 			}
 
@@ -4495,18 +5255,36 @@ export default function (pi: ExtensionAPI) {
 						if (tui) closeVisit(tui);
 						showLiveStream(ctx);
 					}
-					setReplyTarget({
-						kind: "new", cwd: viewed.cwd, model,
-						groupId: result.rowGroup ? result.rowGroup.id : nextAgentTargetGroup(),
-					}, ctx);
+					setReplyTarget(
+						{
+							kind: "new",
+							cwd: viewed.cwd,
+							model,
+							groupId: result.rowGroup
+								? result.rowGroup.id
+								: nextAgentTargetGroup(),
+						},
+						ctx,
+					);
 					return;
 				}
 				// No sticky main: retain the existing blank-home compose flow.
-				setReplyTarget({
-					kind: "new", cwd: viewed.cwd, model,
-					groupId: result.rowGroup ? result.rowGroup.id : nextAgentTargetGroup(),
-				}, ctx);
-				if (orchestrating() && !isHome(ctx) && !(await goHome(ctx, { reopen: false }))) {
+				setReplyTarget(
+					{
+						kind: "new",
+						cwd: viewed.cwd,
+						model,
+						groupId: result.rowGroup
+							? result.rowGroup.id
+							: nextAgentTargetGroup(),
+					},
+					ctx,
+				);
+				if (
+					orchestrating() &&
+					!isHome(ctx) &&
+					!(await goHome(ctx, { reopen: false }))
+				) {
 					setReplyTarget(undefined, ctx);
 					continue;
 				}
@@ -4515,18 +5293,23 @@ export default function (pi: ExtensionAPI) {
 
 			if (result.action === "cancel") {
 				const row = result.row;
-				if (await ask(ctx, "Cancel background agent?", `Stop "${row.title.slice(0, 80)}"? Completed steps stay saved; you can reply later to continue.`))
+				if (
+					await ask(
+						ctx,
+						"Cancel background agent?",
+						`Stop "${row.title.slice(0, 80)}"? Completed steps stay saved; you can reply later to continue.`,
+					)
+				)
 					cancelAgent(row.info.id);
 				continue;
 			}
 
 			if (result.action === "queue") {
-				await manageQueue(
-					ctx,
-					result.row.info.id,
-					result.row.title,
+				await manageQueue(ctx, result.row.info.id, result.row.title);
+				rowCache = await loadRows(
+					viewed.id,
+					viewWantsArchived(uiState.view),
 				);
-				rowCache = await loadRows(viewed.id, viewWantsArchived(uiState.view));
 				(globalThis as any)[ROWS_KEY] = rowCache;
 				continue;
 			}
@@ -4535,9 +5318,16 @@ export default function (pi: ExtensionAPI) {
 				const row = result.row;
 				// Live guards: the file mustn't move while someone holds it (this window included).
 				const live = readLive().get(row.info.id);
-				const ours = live && (live.pid === process.pid || live.pid === getAgent(row.info.id)?.pid || live.bgParent === process.pid);
+				const ours =
+					live &&
+					(live.pid === process.pid ||
+						live.pid === getAgent(row.info.id)?.pid ||
+						live.bgParent === process.pid);
 				if (isRunning(getAgent(row.info.id))) {
-					ctx.ui.notify("That agent is working: wait for it to finish or cancel it (c) before moving it.", "warning");
+					ctx.ui.notify(
+						"That agent is working: wait for it to finish or cancel it (c) before moving it.",
+						"warning",
+					);
 					continue;
 				}
 				if (live && !ours) {
@@ -4550,7 +5340,10 @@ export default function (pi: ExtensionAPI) {
 					continue;
 				}
 				if (!row.info.path || !fs.existsSync(row.info.path)) {
-					ctx.ui.notify("That session isn't saved yet — nothing to move.", "warning");
+					ctx.ui.notify(
+						"That session isn't saved yet — nothing to move.",
+						"warning",
+					);
 					continue;
 				}
 				const pick = await pickDir(ctx, {
@@ -4569,16 +5362,25 @@ export default function (pi: ExtensionAPI) {
 						// The viewed-row marker does not imply foreground ownership.
 						await ctx.switchSession(moved, {
 							withSession: async (c) => {
-								c.ui.notify(`📁 Session moved to ${prettyDir(pick)} — it now runs there.`, "info");
+								c.ui.notify(
+									`📁 Session moved to ${prettyDir(pick)} — it now runs there.`,
+									"info",
+								);
 							},
 						});
 					} else {
-						ctx.ui.notify(`📁 Session moved to ${prettyDir(pick)} — replies to it now run there.`, "info");
+						ctx.ui.notify(
+							`📁 Session moved to ${prettyDir(pick)} — replies to it now run there.`,
+							"info",
+						);
 					}
 					rowCache = [];
 					(globalThis as any)[ROWS_KEY] = [];
 				} catch (e) {
-					ctx.ui.notify(`Move failed: ${e instanceof Error ? e.message : String(e)}`, "error");
+					ctx.ui.notify(
+						`Move failed: ${e instanceof Error ? e.message : String(e)}`,
+						"error",
+					);
 				}
 				continue;
 			}
@@ -4598,16 +5400,24 @@ export default function (pi: ExtensionAPI) {
 						}),
 					{ overlay: true, overlayOptions: overlayOpts() },
 				);
-				rowCache = await loadRows(viewed.id, viewWantsArchived(uiState.view));
+				rowCache = await loadRows(
+					viewed.id,
+					viewWantsArchived(uiState.view),
+				);
 				(globalThis as any)[ROWS_KEY] = rowCache;
 				if (r?.action === "cancel") cancelAgent(row.info.id);
 				if (r?.action === "reply") {
-					const blocked = sendBlockedReason(row.info.id, row.info.path || undefined, ctx);
+					const blocked = sendBlockedReason(
+						row.info.id,
+						row.info.path || undefined,
+						ctx,
+					);
 					if (blocked) {
 						ctx.ui.notify(blocked, "warning");
 						continue;
 					}
-					const file = row.info.path || getAgent(row.info.id)?.sessionFile;
+					const file =
+						row.info.path || getAgent(row.info.id)?.sessionFile;
 					if (orchestrating()) {
 						const wasRunning = isRunning(getAgent(row.info.id));
 						const text = await promptFullScreen(ctx, {
@@ -4616,13 +5426,29 @@ export default function (pi: ExtensionAPI) {
 							action: "send",
 						});
 						if (!text) continue;
-						sendToAgent({ id: row.info.id, cwd: row.info.cwd, sessionFile: file, title: row.title, text });
+						sendToAgent({
+							id: row.info.id,
+							cwd: row.info.cwd,
+							sessionFile: file,
+							title: row.title,
+							text,
+						});
 						uiState.selectedId = row.info.id;
-						rowCache = await loadRows(viewed.id, viewWantsArchived(uiState.view));
+						rowCache = await loadRows(
+							viewed.id,
+							viewWantsArchived(uiState.view),
+						);
 						continue;
 					}
 					setReplyTarget(
-						{ kind: "agent", id: row.info.id, title: row.title, cwd: row.info.cwd, sessionFile: file, agentModel: sessionModel(file) },
+						{
+							kind: "agent",
+							id: row.info.id,
+							title: row.title,
+							cwd: row.info.cwd,
+							sessionFile: file,
+							agentModel: sessionModel(file),
+						},
 						ctx,
 					);
 					return;
@@ -4654,31 +5480,40 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 					if (result.takeover) return takeOverCurrent(ctx);
-					if (ms.stale.has(id) || ms.takeoverWhenDone.has(id)) await refreshCurrent(ctx);
+					if (ms.stale.has(id) || ms.takeoverWhenDone.has(id))
+						await refreshCurrent(ctx);
 					return;
 				}
 				const file = row.info.path || getAgent(id)?.sessionFile;
 				if (!file) {
-					ctx.ui.notify("That agent hasn't written its session yet. Try again in a moment.", "warning");
+					ctx.ui.notify(
+						"That agent hasn't written its session yet. Try again in a moment.",
+						"warning",
+					);
 					continue;
 				}
 				// Sticky takeover: a taken-over session is the window's main session. Opening any
 				// OTHER session visits it (a view over its file + background agent) — the main keeps
 				// running untouched, nothing is aborted, and no prepareLeave handoff happens.
-				const sticky = ms.takenOver.size > 0 || ms.takeoverWhenDone.size > 0
-					? (ms.takenOver.values().next().value ?? ms.takeoverWhenDone.values().next().value)
-					: undefined;
+				const sticky =
+					ms.takenOver.size > 0 || ms.takeoverWhenDone.size > 0
+						? (ms.takenOver.values().next().value ??
+							ms.takeoverWhenDone.values().next().value)
+						: undefined;
 				if (sticky && sticky !== id && !result.takeover) {
 					const tui = activeInboxTui(ctx);
-					if (tui && openVisit(tui, ctx, {
-						mainId: String(sticky),
-						id,
-						file,
-						cwd: row.info.cwd,
-						title: row.title,
-						modelRegistry: (ctx as any).modelRegistry,
-						recordedModel: sessionModel(file),
-					})) {
+					if (
+						tui &&
+						openVisit(tui, ctx, {
+							mainId: String(sticky),
+							id,
+							file,
+							cwd: row.info.cwd,
+							title: row.title,
+							modelRegistry: (ctx as any).modelRegistry,
+							recordedModel: sessionModel(file),
+						})
+					) {
 						markRead(id); // visiting counts as looking
 						showModeWidget(ctx);
 						showLiveStream(ctx);
@@ -4694,9 +5529,14 @@ export default function (pi: ExtensionAPI) {
 					continue;
 				}
 				const live = readLive().get(id);
-				const ours = live && (live.pid === process.pid || live.pid === getAgent(id)?.pid || live.bgParent === process.pid);
+				const ours =
+					live &&
+					(live.pid === process.pid ||
+						live.pid === getAgent(id)?.pid ||
+						live.bgParent === process.pid);
 				if (live && !ours) {
-					const ok = await ask(ctx,
+					const ok = await ask(
+						ctx,
 						"Session is open elsewhere",
 						live.stuckMin
 							? `Pi process ${live.pid} still holds this session but looks stuck (no activity for ${live.stuckMin}m, likely an orphan from a closed tab; \`kill -9 ${live.pid}\` clears it). Open here anyway?`
@@ -4716,8 +5556,16 @@ export default function (pi: ExtensionAPI) {
 				const takeover = !!result.takeover;
 				const r = await ctx.switchSession(file, {
 					withSession: async (c) => {
-						if (takeover && !working) c.ui.notify("🎮 Taken over: runs here, like plain pi. ctrl+q: orchestrator · ctrl+q → h: hand back.", "info");
-						else if (takeover) c.ui.notify("⏳ Still working in the background: it takes over here as soon as this run finishes.", "info");
+						if (takeover && !working)
+							c.ui.notify(
+								"🎮 Taken over: runs here, like plain pi. ctrl+q: orchestrator · ctrl+q → h: hand back.",
+								"info",
+							);
+						else if (takeover)
+							c.ui.notify(
+								"⏳ Still working in the background: it takes over here as soon as this run finishes.",
+								"info",
+							);
 					},
 				});
 				if (!r.cancelled) resume?.();
@@ -4739,30 +5587,42 @@ export default function (pi: ExtensionAPI) {
 				let stopped = false;
 				if (isRunning(getAgent(row.info.id))) {
 					if (!orchestrating()) {
-						ctx.ui.notify("That agent is still working: wait for it to finish, or cancel it (c), then open it here.", "warning");
+						ctx.ui.notify(
+							"That agent is still working: wait for it to finish, or cancel it (c), then open it here.",
+							"warning",
+						);
 						continue;
 					}
 					const queued = getAgent(row.info.id)?.pending.length ?? 0;
-					const ok = await ask(ctx,
+					const ok = await ask(
+						ctx,
 						"Take over a working agent?",
 						`"${row.title.slice(0, 80)}" is still working. Taking it over stops the background run (completed steps are saved) and opens it here.${queued ? ` Its ${queued} queued message(s) are moved to the editor.` : ""} Send "continue" to resume. Take over?`,
 					);
 					if (!ok) continue;
 					const pending = await stopForTakeover(row.info.id);
 					if (!pending) {
-						ctx.ui.notify("The agent didn't stop in time. Try again in a moment.", "warning");
+						ctx.ui.notify(
+							"The agent didn't stop in time. Try again in a moment.",
+							"warning",
+						);
 						continue;
 					}
 					carried = pending;
 					stopped = true;
 				}
-				const file = row.info.path || getAgent(row.info.id)?.sessionFile;
+				const file =
+					row.info.path || getAgent(row.info.id)?.sessionFile;
 				if (!file) {
-					ctx.ui.notify("That agent hasn't written its session yet.", "warning");
+					ctx.ui.notify(
+						"That agent hasn't written its session yet.",
+						"warning",
+					);
 					continue;
 				}
 				if (!ctx.isIdle() || ctx.hasPendingMessages()) {
-					const ok = await ask(ctx,
+					const ok = await ask(
+						ctx,
 						"Current session is working",
 						"The current session is still working. Switching will abort the in-flight run (completed steps are saved and it can be resumed later) and drop any queued messages. Switch anyway?",
 					);
@@ -4770,7 +5630,8 @@ export default function (pi: ExtensionAPI) {
 				}
 				const live = readLive().get(row.info.id);
 				if (live && live.pid !== process.pid) {
-					const ok = await ask(ctx,
+					const ok = await ask(
+						ctx,
 						"Session is open elsewhere",
 						live.stuckMin
 							? `Pi process ${live.pid} still holds this session but looks stuck (claims working, no activity for ${live.stuckMin}m — likely an orphan from a closed tab; if so, \`kill -9 ${live.pid}\` clears it). Open here anyway?`
@@ -4781,10 +5642,11 @@ export default function (pi: ExtensionAPI) {
 				releaseAgent(row.info.id); // it's a foreground session from now on
 				await ctx.switchSession(file, {
 					withSession: async (c) => {
-						if (carried.length) c.ui.setEditorText(carried.join("\n\n"));
+						if (carried.length)
+							c.ui.setEditorText(carried.join("\n\n"));
 						if (orchestrating())
 							c.ui.notify(
-								`📥 Taken over${stopped ? " (background run stopped, send \"continue\" to resume)" : ""}. ctrl+q: orchestrator · ctrl+q → h: hand back.`,
+								`📥 Taken over${stopped ? ' (background run stopped, send "continue" to resume)' : ""}. ctrl+q: orchestrator · ctrl+q → h: hand back.`,
 								"info",
 							);
 					},
@@ -4795,14 +5657,25 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("inbox", {
-		description: "Visual todo-box of all sessions: status, pin, archive (shift+tab / ctrl+q)",
+		description:
+			"Visual todo-box of all sessions: status, pin, archive (shift+tab / ctrl+q)",
 		getArgumentCompletions: (prefix) => {
 			const p = prefix.trim();
 			const items = [
-				{ value: "help", label: "help", description: "Show the Inbox README" },
-				{ value: "filters", label: "filters", description: "Show the session filter rules and what they hide" },
 				{
-					value: "groups", label: "groups",
+					value: "help",
+					label: "help",
+					description: "Show the Inbox README",
+				},
+				{
+					value: "filters",
+					label: "filters",
+					description:
+						"Show the session filter rules and what they hide",
+				},
+				{
+					value: "groups",
+					label: "groups",
 					description: "Select or manage inbox groups",
 				},
 			].filter((i) => i.value.startsWith(p));
@@ -4810,7 +5683,8 @@ export default function (pi: ExtensionAPI) {
 		},
 		handler: async (args, ctx) => {
 			const a = args.trim().toLowerCase();
-			if (["help", "?", "docs", "readme"].includes(a)) return showHelp(ctx);
+			if (["help", "?", "docs", "readme"].includes(a))
+				return showHelp(ctx);
 			if (a === "groups") {
 				await selectGroupView(ctx);
 				return openInbox(ctx);
@@ -4835,31 +5709,58 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("orchestrator", {
-		description: "Inbox orchestrator mode: this window becomes a full-screen agent control panel (toggle | on | off | home)",
+		description:
+			"Inbox orchestrator mode: this window becomes a full-screen agent control panel (toggle | on | off | home)",
 		getArgumentCompletions: (prefix) => {
 			const p = prefix.trim();
 			const items = [
-				{ value: "on", label: "on", description: "Turn orchestrator mode on" },
-				{ value: "off", label: "off", description: "Turn orchestrator mode off (this window becomes a normal session)" },
-				{ value: "home", label: "home", description: "Leave this session (it keeps running in the background) and return to the orchestrator" },
-				{ value: "takeover", label: "takeover", description: "Run this session here, like plain pi (same as /takeover)" },
+				{
+					value: "on",
+					label: "on",
+					description: "Turn orchestrator mode on",
+				},
+				{
+					value: "off",
+					label: "off",
+					description:
+						"Turn orchestrator mode off (this window becomes a normal session)",
+				},
+				{
+					value: "home",
+					label: "home",
+					description:
+						"Leave this session (it keeps running in the background) and return to the orchestrator",
+				},
+				{
+					value: "takeover",
+					label: "takeover",
+					description:
+						"Run this session here, like plain pi (same as /takeover)",
+				},
 			].filter((i) => i.value.startsWith(p));
 			return items.length ? items : null;
 		},
 		handler: async (args, ctx) => {
 			const raw = args.trim();
 			// movedir is matched on raw args (it carries a JSON payload with case-sensitive paths).
-			if (raw.startsWith("movedir ")) return moveSessionCommand(ctx, raw.slice(8).trim()); // internal: ctrl+w on an open session
+			if (raw.startsWith("movedir "))
+				return moveSessionCommand(ctx, raw.slice(8).trim()); // internal: ctrl+w on an open session
 			const a = raw.toLowerCase();
-			if (a === "" || a === "toggle") return setOrchestrator(ctx, !orchestrating());
+			if (a === "" || a === "toggle")
+				return setOrchestrator(ctx, !orchestrating());
 			if (a === "on") return setOrchestrator(ctx, true);
 			if (a === "off") return setOrchestrator(ctx, false);
 			if (a === "refresh") return refreshCurrent(ctx); // internal: reload an attached session after its run
-			if (a.startsWith("open ")) return openStarted(ctx, args.trim().slice(5).trim()); // internal: a new agent's session is on disk
+			if (a.startsWith("open "))
+				return openStarted(ctx, args.trim().slice(5).trim()); // internal: a new agent's session is on disk
 			if (a === "clone") return cloneLatest(ctx); // internal: /clone on an attached session that's working
 			if (a === "takeover") return takeOverCurrent(ctx);
 			if (a === "home") {
-				if (!orchestrating()) return ctx.ui.notify("Orchestrator mode is off. /orchestrator turns it on.", "info");
+				if (!orchestrating())
+					return ctx.ui.notify(
+						"Orchestrator mode is off. /orchestrator turns it on.",
+						"info",
+					);
 				if (isHome(ctx)) return openInbox(ctx);
 				await goHome(ctx);
 				return;
@@ -4980,25 +5881,39 @@ export default function (pi: ExtensionAPI) {
 			file: ctx.sessionManager.getSessionFile(),
 			kind: e?.position === "at" ? "Clone" : "Fork",
 		};
-		if (!attachedBusy(ctx) || e?.position !== "at" ||
-			selectedHistory(ctx.sessionManager)) return undefined;
+		if (
+			!attachedBusy(ctx) ||
+			e?.position !== "at" ||
+			selectedHistory(ctx.sessionManager)
+		)
+			return undefined;
 		delete G[Symbol.for("pi.inbox.branch-name")];
 		const file = ctx.sessionManager.getSessionFile();
 		const agent = getAgent(ctx.sessionManager.getSessionId());
 		if (file && agent?.state === "working") {
 			G[Symbol.for("pi.inbox.clone-checkpoint")] = {
-				file, leaf: beforeRun(SessionManager.open(file), agent),
+				file,
+				leaf: beforeRun(SessionManager.open(file), agent),
 			};
 		}
 		const p = (G.__piInboxPi ?? pi) as ExtensionAPI;
-		setTimeout(() => void Promise.resolve(p.sendUserMessage("/orchestrator clone", { expandPromptTemplates: true })).catch(() => {}), 50);
+		setTimeout(
+			() =>
+				void Promise.resolve(
+					p.sendUserMessage("/orchestrator clone", {
+						expandPromptTemplates: true,
+					}),
+				).catch(() => {}),
+			50,
+		);
 		return { cancel: true };
 	});
 
 	/** Clone without including any work from the active background prompt. */
 	async function cloneLatest(ctx: ExtensionCommandContext) {
 		const file = ctx.sessionManager.getSessionFile();
-		if (!file || !fs.existsSync(file)) return ctx.ui.notify("Nothing to clone yet.", "info");
+		if (!file || !fs.existsSync(file))
+			return ctx.ui.notify("Nothing to clone yet.", "info");
 		const sm = SessionManager.open(file, ctx.sessionManager.getSessionDir());
 		const agent = getAgent(ctx.sessionManager.getSessionId());
 		const historical = selectedHistory(ctx.sessionManager);
@@ -5011,27 +5926,36 @@ export default function (pi: ExtensionAPI) {
 				: agent?.state === "working"
 					? beforeRun(sm, agent) : sm.getLeafId();
 		if (leaf === undefined) {
-			return ctx.ui.notify("Can't locate the run's checkpoint.", "warning");
+			return ctx.ui.notify(
+				"Can't locate the run's checkpoint.",
+				"warning",
+			);
 		}
 		const name = branchName(sourceName(sm), "Clone");
 		const behind = sm.getLeafId() !== leaf;
 		// A first-ever prompt has no parent: produce an empty, named clone.
-		const cloned = leaf === null
-			? (() => {
-				const empty = SessionManager.create(
-					sm.getCwd(), ctx.sessionManager.getSessionDir());
-				empty.newSession({ parentSession: file });
-				empty.appendSessionInfo(name);
-				const destination = empty.getSessionFile()!;
-				// Pi defers saving setup-only sessions until a user prompt.
-				// This explicit empty clone must be reopenable right away.
-				fs.writeFileSync(destination, [
-					empty.getHeader(), ...empty.getEntries(),
-				].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
-				{ flag: "wx" });
-				return destination;
-			})()
-			: sm.createBranchedSession(leaf);
+		const cloned =
+			leaf === null
+				? (() => {
+						const empty = SessionManager.create(
+							sm.getCwd(),
+							ctx.sessionManager.getSessionDir(),
+						);
+						empty.newSession({ parentSession: file });
+						empty.appendSessionInfo(name);
+						const destination = empty.getSessionFile()!;
+						// Pi defers saving setup-only sessions until a user prompt.
+						// This explicit empty clone must be reopenable right away.
+						fs.writeFileSync(
+							destination,
+							[empty.getHeader(), ...empty.getEntries()]
+								.map((entry) => JSON.stringify(entry))
+								.join("\n") + "\n",
+							{ flag: "wx" },
+						);
+						return destination;
+					})()
+				: sm.createBranchedSession(leaf);
 		if (!cloned || !fs.existsSync(cloned)) return ctx.ui.notify("Clone failed: couldn't write the new session.", "error");
 		SessionManager.open(cloned).appendSessionInfo(name);
 		try {
@@ -5178,8 +6102,8 @@ export default function (pi: ExtensionAPI) {
 		if (target?.kind === "agent") return;
 		const composing = target?.kind === "new" ? target : undefined;
 		const initial = composing
-			? composing.groupId ?? "ungrouped"
-			: newAgentGroup() ?? "ungrouped";
+			? (composing.groupId ?? "ungrouped")
+			: (newAgentGroup() ?? "ungrouped");
 		const scope = await pickGroup(ctx, "assign", initial);
 		if (scope === undefined || getReplyTarget() !== target) return;
 		const next: Extract<ReplyTarget, { kind: "new" }> = composing ?? {
@@ -5197,8 +6121,7 @@ export default function (pi: ExtensionAPI) {
 		if (event.source !== "interactive") return { action: "continue" };
 		// A one-shot new-agent target is valid at blank home OR over the sticky main.
 		// Every other stale target is dropped when a real session is on screen.
-		const composingNewOverMain =
-			t?.kind === "new" && isStickyMain(ctx);
+		const composingNewOverMain = t?.kind === "new" && isStickyMain(ctx);
 		if (
 			t &&
 			orchestrating() &&
@@ -5216,11 +6139,19 @@ export default function (pi: ExtensionAPI) {
 		// the hidden main session.
 		if (!t && text && isVisiting()) {
 			const v = visitState().visit!;
-			if (event.images?.length) ctx.ui.notify("Images can't be sent to background agents yet: sent the text only.", "warning");
+			if (event.images?.length)
+				ctx.ui.notify(
+					"Images can't be sent to background agents yet: sent the text only.",
+					"warning",
+				);
 			// The visit's model comes from its own saved/pending choice, never
 			// from the hidden foreground runtime used to host this view.
 			sendToAgent({
-				id: v.id, cwd: v.cwd, sessionFile: v.file, title: v.title, text,
+				id: v.id,
+				cwd: v.cwd,
+				sessionFile: v.file,
+				title: v.title,
+				text,
 			});
 			showModeWidget(ctx);
 			showLiveStream(ctx); // queued count / running state may have changed
@@ -5234,7 +6165,11 @@ export default function (pi: ExtensionAPI) {
 				: undefined;
 		const pending = pendingId ? getAgent(pendingId) : undefined;
 		if (!t && text && pending) {
-			if (event.images?.length) ctx.ui.notify("Images can't be sent to background agents yet: sent the text only.", "warning");
+			if (event.images?.length)
+				ctx.ui.notify(
+					"Images can't be sent to background agents yet: sent the text only.",
+					"warning",
+				);
 			sendToAgent({
 				id: pending.id,
 				cwd: pending.cwd,
@@ -5244,10 +6179,13 @@ export default function (pi: ExtensionAPI) {
 			showStartingPrompt(ctx, pending);
 			return { action: "handled" };
 		}
-		if (!t && orchestrating() && isHome(ctx)) t = {
-			kind: "new", cwd: ctx.cwd, model: currentModel(ctx),
-			groupId: nextAgentTargetGroup(),
-		};
+		if (!t && orchestrating() && isHome(ctx))
+			t = {
+				kind: "new",
+				cwd: ctx.cwd,
+				model: currentModel(ctx),
+				groupId: nextAgentTargetGroup(),
+			};
 		// Orchestrator, attached session: the message runs as a background agent on this session, so
 		// you can switch away mid-run. The chat view reloads from disk when the run finishes.
 		if (!t && text && isAttached(ctx)) {
@@ -5255,10 +6193,29 @@ export default function (pi: ExtensionAPI) {
 			const wasRunning = isRunning(getAgent(id));
 			const firstUser = ctx.sessionManager
 				.getBranch()
-				.find((e: any) => e?.type === "message" && e.message?.role === "user") as any;
-			const title = getAgent(id)?.title ?? pi.getSessionName() ?? cleanTitle(messageText(firstUser?.message?.content) || text).slice(0, 120);
-			if (event.images?.length) ctx.ui.notify("Images can't be sent to background agents yet: sent the text only.", "warning");
-			sendToAgent({ id, cwd: ctx.cwd, sessionFile: ctx.sessionManager.getSessionFile(), title, text, model: currentModel(ctx) });
+				.find(
+					(e: any) =>
+						e?.type === "message" && e.message?.role === "user",
+				) as any;
+			const title =
+				getAgent(id)?.title ??
+				pi.getSessionName() ??
+				cleanTitle(
+					messageText(firstUser?.message?.content) || text,
+				).slice(0, 120);
+			if (event.images?.length)
+				ctx.ui.notify(
+					"Images can't be sent to background agents yet: sent the text only.",
+					"warning",
+				);
+			sendToAgent({
+				id,
+				cwd: ctx.cwd,
+				sessionFile: ctx.sessionManager.getSessionFile(),
+				title,
+				text,
+				model: currentModel(ctx),
+			});
 			modeState().wasRunning.add(id);
 			// No notify() here: in pi that's a permanent chat line, so "Queued" outlived the delivery.
 			// The live panel lists queued messages instead and drops them once a run picks them up.
@@ -5293,11 +6250,18 @@ export default function (pi: ExtensionAPI) {
 		const preName = t.kind === "new" ? getNextAgentName() : undefined;
 		const preDir = t.kind === "new" ? getNextAgentDir() : undefined; // ctrl+w pick; captured before the target drops
 		setReplyTarget(undefined, ctx); // one message per target (also drops the pre-name/pre-dir)
-		if (event.images?.length) ctx.ui.notify("Images can't be sent to background agents yet — sent the text only.", "warning");
+		if (event.images?.length)
+			ctx.ui.notify(
+				"Images can't be sent to background agents yet — sent the text only.",
+				"warning",
+			);
 
 		if (t.kind === "new") {
 			const a = spawnAgent({
-				id: newId, prompt: text, cwd: preDir ?? t.cwd, model: t.model,
+				id: newId,
+				prompt: text,
+				cwd: preDir ?? t.cwd,
+				model: t.model,
 				title: preName ?? cleanTitle(text).slice(0, 120),
 			});
 			// The agent is started: the f one-off pre-group (if any) is spent.
@@ -5306,10 +6270,20 @@ export default function (pi: ExtensionAPI) {
 			if (preName) renameAgent(a.id, preName);
 			uiState.view = "inbox";
 			uiState.selectedId = a.id; // the inbox opens on it next time
-			ctx.ui.notify(`＋ Started background agent: ${coloredName(ctx.ui.theme, a.id, a.title.slice(0, 60))}`, "info");
+			ctx.ui.notify(
+				`＋ Started background agent: ${coloredName(ctx.ui.theme, a.id, a.title.slice(0, 60))}`,
+				"info",
+			);
 		} else {
 			const wasRunning = isRunning(getAgent(t.id));
-			sendToAgent({ id: t.id, cwd: t.cwd, sessionFile: t.sessionFile, title: t.title, text, model: t.model });
+			sendToAgent({
+				id: t.id,
+				cwd: t.cwd,
+				sessionFile: t.sessionFile,
+				title: t.title,
+				text,
+				model: t.model,
+			});
 			uiState.view = "inbox";
 			uiState.selectedId = t.id;
 			ctx.ui.notify(
@@ -5322,12 +6296,10 @@ export default function (pi: ExtensionAPI) {
 		// Stay in pi's chat view. At blank home, or over a sticky main, the new agent
 		// opens as soon as its session file is ready. Sticky mode opens a visit; it
 		// never switches or interrupts the main.
-		if (
-			orchestrating() &&
-			(isHome(ctx) || isStickyMain(ctx))
-		) {
+		if (orchestrating() && (isHome(ctx) || isStickyMain(ctx))) {
 			if (t.kind === "new") watchStarted(uiState.selectedId!, ctx);
-			else if (isHome(ctx)) reopenInbox((s, o) => pi.sendUserMessage(s, o));
+			else if (isHome(ctx))
+				reopenInbox((s, o) => pi.sendUserMessage(s, o));
 		}
 		return { action: "handled" };
 	});
@@ -5511,10 +6483,14 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("archive", {
 		description: "Toggle archive (done) on the current session",
 		handler: async (_args, ctx) => {
-			const meta = updateMeta(viewedSession(ctx).id, (m) => {
-				m.archivedAt = m.archivedAt ? undefined : Date.now();
-			});
-			ctx.ui.notify(meta.archivedAt ? "✓ Session archived — find it under /inbox → Archived" : "↩ Session moved back to inbox", "info");
+			const result = archiveFamily(viewedSession(ctx).id);
+			const label = result.ids.length > 1 ? "Session family" : "Session";
+			ctx.ui.notify(
+				result.archived
+					? `✓ ${label} archived — find it under /inbox → Archived`
+					: `↩ ${label} moved back to inbox`,
+				"info",
+			);
 			refreshFooter(ctx);
 		},
 	});

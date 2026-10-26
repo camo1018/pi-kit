@@ -3,6 +3,7 @@ import {
 	existsSync,
 	mkdtempSync,
 	readFileSync,
+	mkdirSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
@@ -15,7 +16,7 @@ import {
 	initTheme,
 	SessionManager,
 	type ExtensionAPI,
-	type ExtensionContext,
+	type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import {
 	CombinedAutocompleteProvider,
@@ -32,6 +33,7 @@ import {
 import type { BgAgent } from "../../lib/inbox-agents.ts";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { InboxGroups } from "./groups.ts";
+import { WorkerFolds } from "./families.ts";
 import inlineSkills from "../inline-skills/index.ts";
 
 // Import only after isolating every inbox write from the operator's data.
@@ -125,7 +127,10 @@ async function setup(t: TestContext, takenOver = true) {
 		getFocusedComponent: () => focus,
 		requestRender: mock.fn(),
 		viewportTop: 0,
-		scrollBy(lines: number) {
+		scrollBy(
+			this: { viewportTop: number; requestRender(): void },
+			lines: number,
+		) {
 			this.viewportTop = Math.max(0, this.viewportTop + lines);
 			this.requestRender();
 		},
@@ -177,12 +182,14 @@ async function setup(t: TestContext, takenOver = true) {
 	let autocomplete: AutocompleteProvider;
 	const ui = {
 		tui,
-		addAutocompleteProvider(factory: typeof autocompleteWrappers[number]) {
+		addAutocompleteProvider(
+			factory: (typeof autocompleteWrappers)[number],
+		) {
 			autocompleteWrappers.push(factory);
-			autocomplete = new CombinedAutocompleteProvider([
-				{ name: "help", description: "Help" },
-				...pi.getCommands(),
-			], dir);
+			autocomplete = new CombinedAutocompleteProvider(
+				[{ name: "help", description: "Help" }, ...pi.getCommands()],
+				dir,
+			);
 			for (const wrap of autocompleteWrappers) {
 				autocomplete = wrap(autocomplete);
 			}
@@ -202,15 +209,22 @@ async function setup(t: TestContext, takenOver = true) {
 		editor: mock.fn(async () => "Use gh-pr-review\n\nPR: "),
 		onTerminalInput(fn: (data: string) => any) {
 			terminalInputs.add(fn);
-			return () => { terminalInputs.delete(fn); };
+			return () => {
+				terminalInputs.delete(fn);
+			};
 		},
 		custom(factory: Function) {
 			return new Promise((resolve) => {
-				overlay = factory(tui, theme, getKeybindings(), (result: any) => {
-					overlay?.dispose?.();
-					focus = editor;
-					resolve(result);
-				});
+				overlay = factory(
+					tui,
+					theme,
+					getKeybindings(),
+					(result: any) => {
+						overlay?.dispose?.();
+						focus = editor;
+						resolve(result);
+					},
+				);
 				focus = overlay;
 			});
 		},
@@ -235,7 +249,7 @@ async function setup(t: TestContext, takenOver = true) {
 		isIdle: () => false,
 		// Orchestrator clone (cloneLatest) lands here; tests can capture the target.
 		switchSession: mock.fn(async () => ({ cancelled: false })),
-	} as unknown as ExtensionContext;
+	} as unknown as ExtensionCommandContext;
 
 	async function emit(name: string, event: any = {}) {
 		const results = [];
@@ -413,7 +427,10 @@ test("Alt+Up on an unregistered visit cannot dequeue the main", async (t) => {
 test("switching visits keeps /queue and its status on the new target", async (t) => {
 	const f = await setup(t);
 	const first = await f.visit("first visit");
-	await f.emit("input", { source: "interactive", text: "first queued reply" });
+	await f.emit("input", {
+		source: "interactive",
+		text: "first queued reply",
+	});
 	const second = await f.visit("second visit");
 	assert.doesNotMatch(f.widgets.get("inbox-live").join("\n"), /message/);
 	await f.emit("input", {
@@ -626,7 +643,9 @@ for (const takenOver of [false, true]) {
 		const { list, done } = await f.openInbox();
 		assert.equal(list.visible[list.selected].info.id, id);
 		assert.deepEqual(
-			list.rows.filter((r: any) => r.isCurrent).map((r: any) => r.info.id),
+			list.rows
+				.filter((r: any) => r.isCurrent)
+				.map((r: any) => r.info.id),
 			[id],
 		);
 		list.handleInput("\r");
@@ -685,13 +704,18 @@ test("Ctrl+B restores a bookmark before editor cursor movement", async (t) => {
 	list.handleInput("\x1b");
 	await done;
 
-	const editor = new CustomEditor(f.tui, {
-		borderColor: (text) => text,
-		selectList: getSelectListTheme(),
-	}, getKeybindings());
+	const editor = new CustomEditor(
+		f.tui,
+		{
+			borderColor: (text) => text,
+			selectList: getSelectListTheme(),
+		},
+		getKeybindings() as ConstructorParameters<typeof CustomEditor>[2],
+	);
 	editor.onExtensionShortcut = (data) => {
 		for (const [key, shortcut] of f.shortcuts) {
-			if (!matchesKey(data, key)) continue;
+			if (!matchesKey(data, key as Parameters<typeof matchesKey>[1]))
+				continue;
 			void shortcut.handler(f.ctx);
 			return true;
 		}
@@ -950,8 +974,12 @@ test("long and wide group names fit narrow terminals", async (t) => {
 test("pins-first group layout preserves selection", async (t) => {
 	const f = await layoutFixture(t);
 	const selected = f.list.state.selectedId;
-	const files = [f.main.getSessionFile()!, f.a.sessionFile!,
-		f.b.sessionFile!, f.c.sessionFile!];
+	const files = [
+		f.main.getSessionFile()!,
+		f.a.sessionFile!,
+		f.b.sessionFile!,
+		f.c.sessionFile!,
+	];
 	const before = files.map((file) => readFileSync(file, "utf8"));
 	const groupsBefore = readFileSync(f.groups.file, "utf8");
 	assert.match(f.list.render(120).join("\n"), /Layout: flat/);
@@ -959,10 +987,15 @@ test("pins-first group layout preserves selection", async (t) => {
 	f.list.handleInput("s");
 	assert.match(f.list.render(120).join("\n"), /Layout: by group/);
 	assert.deepEqual(sectionLabels(f.list), [
-		"A Bugs (1)", "Z Reviews (2)", "Ungrouped (1)",
+		"A Bugs (1)",
+		"Z Reviews (2)",
+		"Ungrouped (1)",
 	]);
 	assert.deepEqual(rowIds(f.list), [
-		f.c.id, f.b.id, f.a.id, f.main.getSessionId(),
+		f.c.id,
+		f.b.id,
+		f.a.id,
+		f.main.getSessionId(),
 	]);
 	assert.equal(f.list.state.selectedId, selected);
 	f.list.handleInput("\x1b[115;1:2u");
@@ -971,7 +1004,10 @@ test("pins-first group layout preserves selection", async (t) => {
 	f.list.handleInput("s");
 	assert.equal(f.list.state.selectedId, selected);
 	assert.deepEqual(sectionLabels(f.list), ["★ PINNED (1)", "INBOX (3)"]);
-	assert.deepEqual(files.map((file) => readFileSync(file, "utf8")), before);
+	assert.deepEqual(
+		files.map((file) => readFileSync(file, "utf8")),
+		before,
+	);
 	// Layout toggles legitimately persist to inbox-groups.json; membership must not move.
 	assert.deepEqual(
 		JSON.parse(readFileSync(f.groups.file, "utf8")).sessions,
@@ -984,16 +1020,16 @@ test("pins-first group layout preserves selection", async (t) => {
 test("group sections respect tabs and archive sorting", async (t) => {
 	const f = await layoutFixture(t, true);
 	f.list.handleInput("s");
-	assert.deepEqual(sectionLabels(f.list), [
-		"A Bugs (1)", "Ungrouped (1)",
-	]);
+	assert.deepEqual(sectionLabels(f.list), ["A Bugs (1)", "Ungrouped (1)"]);
 	f.list.handleInput("2");
 	await waitForList(f.list);
 	assert.deepEqual(sectionLabels(f.list), ["Z Reviews (2)"]);
 	assert.deepEqual(rowIds(f.list), [f.a.id, f.b.id]);
 	f.list.handleInput("3");
 	assert.deepEqual(sectionLabels(f.list), [
-		"A Bugs (1)", "Z Reviews (2)", "Ungrouped (1)",
+		"A Bugs (1)",
+		"Z Reviews (2)",
+		"Ungrouped (1)",
 	]);
 	assert.equal(rowIds(f.list).includes(f.filtered!.id), false);
 	f.list.handleInput("4");
@@ -1211,11 +1247,21 @@ test("f Ungrouped forces the next agent out of any default", async (t) => {
 test("template editor shares slash and inline-skill completion", async (t) => {
 	const f = await setup(t);
 	const original = f.pi.getCommands;
-	f.pi.getCommands = () => [...original(), {
-		name: "skill:reviewer", description: "Sample review skill",
-		source: "skill",
-		sourceInfo: { path: join(dir, "reviewer", "SKILL.md"), baseDir: dir },
-	}];
+	f.pi.getCommands = () => [
+		...original(),
+		{
+			name: "skill:reviewer",
+			description: "Sample review skill",
+			source: "skill",
+			sourceInfo: {
+				path: join(dir, "reviewer", "SKILL.md"),
+				baseDir: dir,
+				source: "test",
+				scope: "temporary",
+				origin: "top-level",
+			},
+		},
+	];
 	// Install the real $skill wrapper BEFORE opening the template editor.
 	inlineSkills(f.pi);
 	await f.emit("session_start");
@@ -1379,7 +1425,8 @@ test("membership is saved before starting a new agent", async (t) => {
 	// Avoid the interactive auto-open watcher; test only the routing boundary.
 	(globalThis as any)[Symbol.for("pi.inbox.mode")].on = false;
 	const result = await f.emit("input", {
-		source: "interactive", text: "review URL",
+		source: "interactive",
+		text: "review URL",
 	});
 	assert.deepEqual(result, [{ action: "handled" }]);
 	const agent = [...registry().agents.values()].find(
@@ -1389,8 +1436,10 @@ test("membership is saved before starting a new agent", async (t) => {
 	assert.equal(agent.proc, undefined);
 	assert.equal(groups.load().sessions[agent.id], group.id);
 	assert.deepEqual(agent.pending, ["review URL"]);
-	assert.equal((globalThis as any)[Symbol.for("pi.inbox.reply-target")],
-		undefined);
+	assert.equal(
+		(globalThis as any)[Symbol.for("pi.inbox.reply-target")],
+		undefined,
+	);
 });
 
 test("a native fork lands in the original session's group", async (t) => {
@@ -1445,19 +1494,42 @@ test("a busy mid-run clone lands in the original session's group", async (t) => 
 	const main = f.main;
 	main.appendMessage({
 		role: "assistant",
-		content: [{ type: "toolCall", id: "call-1", name: "read", arguments: {} }],
-		api: "openai-responses", provider: "test", model: "alpha",
-		usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
-		stopReason: "toolUse", timestamp: 4,
+		content: [
+			{ type: "toolCall", id: "call-1", name: "read", arguments: {} },
+		],
+		api: "openai-responses",
+		provider: "test",
+		model: "alpha",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				total: 0,
+			},
+		},
+		stopReason: "toolUse",
+		timestamp: 4,
 	});
 	main.appendMessage({
-		role: "toolResult", toolCallId: "call-1", toolName: "read",
-		content: [{ type: "text", text: "ok" }], isError: false, timestamp: 5,
+		role: "toolResult",
+		toolCallId: "call-1",
+		toolName: "read",
+		content: [{ type: "text", text: "ok" }],
+		isError: false,
+		timestamp: 5,
 	});
 	await groups.assign(main.getSessionId(), group.id);
 	const before = readFileSync(main.getSessionFile()!, "utf8");
 	await f.commands.get("orchestrator").handler("clone", f.ctx);
-	const clone = (f.ctx.switchSession as any).mock.calls.at(-1)?.arguments?.[0] as string;
+	const clone = (f.ctx.switchSession as any).mock.calls.at(-1)
+		?.arguments?.[0] as string;
 	assert.match(clone, /\.jsonl$/);
 	assert.ok(existsSync(clone), "the clone session file should exist");
 	assert.notEqual(clone, main.getSessionFile());
@@ -1475,17 +1547,40 @@ test("a clone from an ungrouped session stays Ungrouped", async (t) => {
 	const main = f.main;
 	main.appendMessage({
 		role: "assistant",
-		content: [{ type: "toolCall", id: "call-1", name: "read", arguments: {} }],
-		api: "openai-responses", provider: "test", model: "alpha",
-		usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
-		stopReason: "toolUse", timestamp: 4,
+		content: [
+			{ type: "toolCall", id: "call-1", name: "read", arguments: {} },
+		],
+		api: "openai-responses",
+		provider: "test",
+		model: "alpha",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				total: 0,
+			},
+		},
+		stopReason: "toolUse",
+		timestamp: 4,
 	});
 	main.appendMessage({
-		role: "toolResult", toolCallId: "call-1", toolName: "read",
-		content: [{ type: "text", text: "ok" }], isError: false, timestamp: 5,
+		role: "toolResult",
+		toolCallId: "call-1",
+		toolName: "read",
+		content: [{ type: "text", text: "ok" }],
+		isError: false,
+		timestamp: 5,
 	});
 	await f.commands.get("orchestrator").handler("clone", f.ctx);
-	const clone = (f.ctx.switchSession as any).mock.calls.at(-1)?.arguments?.[0] as string;
+	const clone = (f.ctx.switchSession as any).mock.calls.at(-1)
+		?.arguments?.[0] as string;
 	assert.ok(existsSync(clone), "the clone session file should exist");
 	const cloneId = SessionManager.open(clone).getSessionId();
 	assert.equal(groups.load().sessions[cloneId], undefined);
@@ -1682,4 +1777,297 @@ test("completion is read only for the session actually on screen", async (t) => 
 	}
 	assert.equal(visited.needsYou, false);
 	assert.equal(f.ui.notify.mock.calls.length, 0);
+});
+
+async function familyFixture(t: TestContext) {
+	const f = await setup(t);
+	const parent = f.main.getSessionId();
+	f.main.appendSessionInfo("Family parent");
+	const workers = join(dir, "session-workers", "workers");
+	rmSync(workers, { recursive: true, force: true });
+	rmSync(join(dir, "inbox-worker-folds.json"), { force: true });
+	mkdirSync(workers, { recursive: true });
+	const children = ["Child first", "Child second"].map((label, index) => {
+		const title = `${label} ${parent.slice(-8)}`;
+		const session = SessionManager.create(dir);
+		session.appendMessage({ role: "user", content: title, timestamp: 2 });
+		session.appendSessionInfo(title);
+		const id = session.getSessionId();
+		writeFileSync(
+			join(workers, `${id}.json`),
+			JSON.stringify({
+				id,
+				parentId: parent,
+				createdAt: index + 1,
+				title,
+				cwd: dir,
+				extensionPath: "test",
+			}),
+		);
+		return { id, session, title };
+	});
+	t.after(() => {
+		rmSync(workers, { recursive: true, force: true });
+		rmSync(join(dir, "inbox-worker-folds.json"), { force: true });
+	});
+	return {
+		...f,
+		parent,
+		children,
+		ids: [parent, ...children.map((child) => child.id)],
+	};
+}
+
+test("worker families collapse, expand, retain focus and persist folds", async (t) => {
+	const f = await familyFixture(t);
+	const { list, done } = await f.openInbox();
+	const ids = () =>
+		list.visible
+			.filter((row: any) => f.ids.includes(row.info.id))
+			.map((row: any) => row.info.id);
+	assert.deepEqual(ids(), [f.parent]);
+	list.state.selectedId = f.parent;
+	list.rebuild();
+	list.handleInput(" ");
+	assert.deepEqual(ids(), f.ids);
+	list.state.selectedId = f.children[1].id;
+	list.rebuild();
+	list.handleInput(" ");
+	assert.deepEqual(ids(), [f.parent]);
+	assert.equal(list.state.selectedId, f.parent);
+	list.handleInput(" ");
+	await list.refresh();
+	assert.deepEqual(ids(), f.ids);
+	assert.ok(new WorkerFolds(dir).load().has(f.parent));
+	for (const width of [60, 80, 120, 200]) {
+		assert.ok(
+			list
+				.render(width)
+				.every((line: string) => visibleWidth(line) <= width),
+		);
+	}
+	list.handleInput("\x1b");
+	await done;
+	const reopened = await f.openInbox();
+	assert.deepEqual(
+		reopened.list.visible
+			.filter((row: any) => f.ids.includes(row.info.id))
+			.map((row: any) => row.info.id),
+		f.ids,
+	);
+	reopened.list.handleInput("\x1b");
+	await reopened.done;
+});
+
+test("search exposes matching children without changing saved folds", async (t) => {
+	const f = await familyFixture(t);
+	const { list, done } = await f.openInbox();
+	list.state.query = f.children[1].title;
+	list.rebuild();
+	assert.deepEqual(
+		list.visible.map((row: any) => row.info.id),
+		[f.parent, f.children[1].id],
+	);
+	assert.equal(list.families.get(f.parent).contextOnly, true);
+	assert.equal(new WorkerFolds(dir).load().size, 0);
+	list.state.selectedId = f.children[1].id;
+	list.rebuild();
+	list.handleInput("\x1b");
+	assert.equal(list.state.query, "");
+	assert.equal(list.state.selectedId, f.parent);
+	assert.equal(
+		list.visible.some((row: any) => row.info.id === f.children[1].id),
+		false,
+	);
+	list.handleInput("\x1b");
+	await done;
+});
+
+test("list archiving cascades hidden children; child archiving stays local", async (t) => {
+	const f = await familyFixture(t);
+	const { list, done } = await f.openInbox();
+	list.state.selectedId = f.parent;
+	list.rebuild();
+	list.handleInput("a");
+	const storeFile = join(dir, "inbox.json");
+	let store = JSON.parse(readFileSync(storeFile, "utf8"));
+	assert.ok(f.ids.every((id) => store.sessions[id].archivedAt));
+	assert.equal(
+		list.visible.some((row: any) => f.ids.includes(row.info.id)),
+		false,
+	);
+	list.handleInput("2");
+	await list.refresh(true);
+	list.state.selectedId = f.parent;
+	list.rebuild();
+	list.handleInput("a");
+	store = JSON.parse(readFileSync(storeFile, "utf8"));
+	assert.ok(f.ids.every((id) => !store.sessions[id]?.archivedAt));
+	list.handleInput("1");
+	list.state.selectedId = f.parent;
+	list.rebuild();
+	list.handleInput(" ");
+	list.state.selectedId = f.children[0].id;
+	list.rebuild();
+	list.handleInput("a");
+	store = JSON.parse(readFileSync(storeFile, "utf8"));
+	assert.ok(store.sessions[f.children[0].id].archivedAt);
+	assert.equal(store.sessions[f.parent]?.archivedAt, undefined);
+	assert.equal(store.sessions[f.children[1].id]?.archivedAt, undefined);
+	list.handleInput("\x1b");
+	await done;
+});
+
+test("archive command includes absent-file and filtered workers without stopping them", async (t) => {
+	const f = await familyFixture(t);
+	const extra = "family-unsaved-child";
+	writeFileSync(
+		join(dir, "session-workers/workers", `${extra}.json`),
+		JSON.stringify({ id: extra, parentId: f.parent, createdAt: 3 }),
+	);
+	const kill = mock.fn();
+	registry().agents.set(extra, {
+		id: extra,
+		title: "Not saved",
+		cwd: dir,
+		state: "working",
+		proc: { kill },
+		pending: ["Keep queued"],
+		runs: 1,
+		createdAt: 1,
+		updatedAt: 1,
+		needsYou: false,
+		log: [],
+		liveText: "",
+	});
+	writeFileSync(
+		join(dir, "inbox.json"),
+		JSON.stringify({
+			version: 1,
+			sessions: { [f.children[0].id]: { filter: "hide", pinnedAt: 12 } },
+		}),
+	);
+	await f.commands.get("archive").handler("", f.ctx);
+	const store = JSON.parse(readFileSync(join(dir, "inbox.json"), "utf8"));
+	assert.ok([...f.ids, extra].every((id) => store.sessions[id].archivedAt));
+	assert.equal(store.sessions[f.children[0].id].filter, "hide");
+	assert.equal(store.sessions[f.children[0].id].pinnedAt, 12);
+	assert.equal(kill.mock.calls.length, 0);
+	assert.deepEqual(registry().agents.get(extra)?.pending, ["Keep queued"]);
+});
+
+test("cross-group children remain nested with contextual parents", async (t) => {
+	const f = await familyFixture(t);
+	const groups = new InboxGroups(dir);
+	const a = await groups.create("Parent group");
+	const b = await groups.create("Worker group");
+	await groups.assign(f.parent, a.id);
+	await groups.assign(f.children[0].id, b.id);
+	Reflect.set(globalThis, Symbol.for("pi.inbox.group-view"), b.id);
+	const { list, done } = await f.openInbox();
+	assert.deepEqual(
+		list.visible.map((row: any) => row.info.id),
+		[f.parent],
+	);
+	assert.equal(list.families.get(f.parent).contextOnly, true);
+	list.handleInput(" ");
+	assert.deepEqual(
+		list.visible.map((row: any) => row.info.id),
+		[f.parent, f.children[0].id],
+	);
+	list.handleInput("\x1b");
+	await done;
+});
+
+test("archived parents remain accessible when a worker wakes in the inbox", async (t) => {
+	const f = await familyFixture(t);
+	writeFileSync(
+		join(dir, "inbox.json"),
+		JSON.stringify({
+			version: 1,
+			sessions: {
+				[f.parent]: { archivedAt: 10 },
+				[f.children[1].id]: { archivedAt: 10 },
+			},
+		}),
+	);
+	const { list, done } = await f.openInbox();
+	assert.ok(list.visible.some((row: any) => row.info.id === f.parent));
+	assert.equal(list.families.get(f.parent).contextOnly, true);
+	list.state.selectedId = f.parent;
+	list.rebuild();
+	list.handleInput(" ");
+	assert.ok(
+		list.visible.some((row: any) => row.info.id === f.children[0].id),
+	);
+	list.handleInput("\x1b");
+	await done;
+});
+
+test("foreign startup workers appear once without creating control handles", async (t) => {
+	const f = await familyFixture(t);
+	const id = "family-foreign-startup";
+	writeFileSync(
+		join(dir, "session-workers/workers", `${id}.json`),
+		JSON.stringify({
+			id,
+			parentId: f.parent,
+			createdAt: 3,
+			title: "Foreign startup",
+			cwd: dir,
+		}),
+	);
+	const agents = join(dir, "inbox-agents");
+	mkdirSync(agents, { recursive: true });
+	const saved = join(agents, `${id}.json`);
+	const raw = JSON.stringify({
+		id,
+		state: "working",
+		owner: 123456789,
+		ownerBeat: Date.now(),
+		updatedAt: Date.now(),
+	});
+	writeFileSync(saved, raw);
+	t.after(() => rmSync(saved, { force: true }));
+	const { list, done } = await f.openInbox();
+	const family = list.families.get(f.parent);
+	assert.equal(family.children.length, 3);
+	const row = family.children.find((row: any) => row.info.id === id);
+	assert.equal(row.remoteState, "working");
+	assert.equal(row.bg, undefined);
+	assert.equal(registry().agents.has(id), false);
+	assert.match(list.workerSummary(family), /1 running/);
+	assert.equal(readFileSync(saved, "utf8"), raw);
+	list.handleInput("\x1b");
+	await done;
+});
+
+test("family summary preserves parent status and Enter still opens sessions", async (t) => {
+	const f = await familyFixture(t);
+	const { list, done } = await f.openInbox();
+	list.state.selectedId = f.parent;
+	list.rebuild();
+	const family = list.families.get(f.parent);
+	const before = list.statusCell(family.row);
+	family.children[0].remoteState = "working";
+	family.children[0].tail.status = "error";
+	family.children[1].remoteState = "error";
+	family.children[1].unread = true;
+	assert.match(list.workerSummary(family), /1 error/);
+	assert.match(list.workerSummary(family), /1 running/);
+	assert.match(list.workerSummary(family), /1 unread/);
+	assert.equal(list.statusCell(family.row), before);
+	assert.equal(family.row.unread, false);
+	const complete = list.done;
+	let action: { action: string; row: { info: { id: string } } } | undefined;
+	list.done = (value: typeof action) => {
+		action = value;
+	};
+	list.handleInput("\r");
+	assert.equal(action?.action, "open");
+	assert.equal(action?.row.info.id, f.parent);
+	assert.equal(new WorkerFolds(dir).load().size, 0);
+	list.done = complete;
+	list.handleInput("\x1b");
+	await done;
 });
