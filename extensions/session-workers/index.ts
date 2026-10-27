@@ -24,7 +24,7 @@ const CUSTOM_TYPE = "pi-kit:worker-notes";
  */
 function workerDefaultModel(
 	settings: { workerDefaultModel?: unknown },
-	scoped: readonly { provider: string; id: string }[],
+	scoped: readonly { model: { provider: string; id: string } }[],
 ): string | undefined {
 	const raw = settings.workerDefaultModel;
 	if (typeof raw !== "string" || raw.trim() === "") return undefined;
@@ -36,7 +36,9 @@ function workerDefaultModel(
 	const scopedList = scoped ?? [];
 	if (
 		scopedList.length > 0 &&
-		!scopedList.some((m) => m.provider === provider && m.id === id)
+		!scopedList.some(
+			(m) => m.model.provider === provider && m.model.id === id,
+		)
 	) {
 		return undefined;
 	}

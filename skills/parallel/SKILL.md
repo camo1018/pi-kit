@@ -33,10 +33,10 @@ Ask one concise question only if there is no identifiable unfinished task.
   provider's cache-write premium instead of cache-read rates; a worker on a
   frontier model can cost 5–20x its cheap-model twin. Unless the task
   genuinely needs a frontier model (deep judgment, tricky synthesis), spawn
-  workers on a cheap, fast model (e.g. `cheap-model`) via the spawn
-  `model` field. The `workerDefaultModel` setting enforces this automatically
-  when configured. The parent keeps its own (frontier) model for integration
-  and the final answer.
+  workers on a cheap, fast model (e.g. `cheap-model`) via the
+  spawn `model` field. The `workerDefaultModel` setting enforces this
+  automatically when configured. The parent keeps its own (frontier) model
+  for integration and the final answer.
 - Use the parent's cwd and inbox group unless the user says otherwise.
 - Delegation is one level only. Workers are leaves, not further coordinators.
 - If `session_workers` is unavailable, explain that its extension must be

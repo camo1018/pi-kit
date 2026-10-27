@@ -176,13 +176,11 @@ test("explicit spawn model beats workerDefaultModel; scoping wins over the setti
 	assert.equal(spawnedModel(explicit), "example-provider/frontier-model:medium");
 
 	// A model outside the session's scoped list is never forced on workers.
-	const scopedCtx = { ...explicit.ctx } as Record<string, unknown>;
-	scopedCtx.scopedModels = [{ provider: "test", id: "model" }];
 	const scoped = harness(t, {
 		settings: { workerDefaultModel: "example-provider/cheap-model" },
 	});
 	(scoped.ctx as Record<string, unknown>).scopedModels = [
-		{ provider: "test", id: "model" },
+		{ model: { provider: "test", id: "model" } },
 	];
 	await scoped.execute({ action: "spawn", title: "Scoped", task: "Research" });
 	assert.equal(
@@ -190,6 +188,23 @@ test("explicit spawn model beats workerDefaultModel; scoping wins over the setti
 		"test/model:high",
 		"scoped-out default must fall back to the parent model",
 	);
+});
+
+test("workerDefaultModel survives scoping when in scope", async (t) => {
+	// Regression: ctx.scopedModels holds { model: { provider, id } } entries
+	// (ScopedModel), so a flat shape check scoped every default out and
+	// silently fell back to the parent's model.
+	const s = harness(t, {
+		settings: {
+			workerDefaultModel: "example-provider/cheap-model",
+		},
+	});
+	(s.ctx as Record<string, unknown>).scopedModels = [
+		{ model: { provider: "test", id: "model" } },
+		{ model: { provider: "example-provider", id: "cheap-model" } },
+	];
+	await s.execute({ action: "spawn", title: "In scope", task: "Research" });
+	assert.equal(spawnedModel(s), "example-provider/cheap-model");
 });
 
 test("shared notes refresh in request context without transcript mutation", async (t) => {
