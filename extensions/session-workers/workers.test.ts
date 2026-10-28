@@ -86,6 +86,23 @@ test("concurrent team notes persist, refresh, and stay isolated", async (t) => {
 	assert.ok(large);
 	assert.ok(large.length < 17_000);
 	assert.match(large, /omitted="[1-9]/);
+
+	// Retract
+	const toRetract = reopened.notes(first.id)[0];
+	reopened.retract(first.id, toRetract.id);
+	assert.equal(
+		reopened.notes(first.id).some((n) => n.id === toRetract.id),
+		false,
+	);
+	assert.throws(
+		() => reopened.retract(first.id, toRetract.id),
+		/does not exist in this team/,
+	);
+	assert.throws(
+		() => reopened.retract("other-parent", toRetract.id),
+		/does not exist in this team/,
+	);
+	assert.throws(() => reopened.retract(first.id, "../escape"), /session id/);
 });
 
 test("results survive parent restart and use the active branch", async (t) => {

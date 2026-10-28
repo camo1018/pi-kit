@@ -370,6 +370,16 @@ export class WorkerTeam {
 		return note;
 	}
 
+	retract(caller: string, noteId: string): void {
+		validId(noteId);
+		const parentId = this.parent(caller);
+		const file = path.join(this.root, "notes", parentId, `${noteId}.json`);
+		if (!fs.existsSync(file)) {
+			throw new Error(`Note ${noteId} does not exist in this team`);
+		}
+		fs.rmSync(file, { force: true });
+	}
+
 	notes(caller: string): Note[] {
 		const dir = path.join(this.root, "notes", this.parent(caller));
 		return names(dir)
@@ -389,6 +399,12 @@ export class WorkerTeam {
 			.sort(
 				(a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id),
 			);
+	}
+
+	notesFingerprint(caller: string): string | undefined {
+		const all = this.notes(caller);
+		if (!all.length) return undefined;
+		return all.map((n) => `${n.id}:${n.createdAt}`).join(",");
 	}
 
 	context(caller: string): string | undefined {

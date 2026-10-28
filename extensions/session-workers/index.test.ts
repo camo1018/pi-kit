@@ -217,12 +217,60 @@ test("shared notes refresh in request context without transcript mutation", asyn
 	assert.equal(history.length, 1);
 	assert.equal(first.messages.length, 2);
 	assert.equal(first.messages[1].role, "custom");
+
+	// Same board on next request -> not injected again
+	const second = await s.context(first.messages);
+	assert.equal(second.messages.length, 1);
+	assert.equal(second.messages[0].role, "user");
+
 	await s.execute({ action: "share", text: "New sibling finding" });
-	const next = await s.context(first.messages);
+	const next = await s.context(second.messages);
 	assert.equal(next.messages.length, 2);
 	assert.match(JSON.stringify(next), /New sibling finding/);
 	const notes = await s.execute({ action: "notes" });
 	assert.match(JSON.stringify(notes.content), /First finding/);
+});
+
+test("injection cursor tracks sessions independently and retract updates board", async (t) => {
+	const s = harness(t);
+	const history: AgentMessage[] = [
+		{ role: "user", content: "task", timestamp: 1 },
+	];
+	const shareRes = await s.execute({ action: "share", text: "Temporary note" });
+	const noteId = (shareRes.details as { data: { id: string } }).data.id;
+
+	// First session receives note
+	const firstTurn = await s.context(history);
+	assert.equal(firstTurn.messages.length, 2);
+	assert.match(JSON.stringify(firstTurn.messages[1]), /Temporary note/);
+
+	// First session again with unchanged board: not injected
+	const secondTurn = await s.context(firstTurn.messages);
+	assert.equal(secondTurn.messages.length, 1);
+
+	// Switch to a second session: spawn a worker on the team
+	const worker = await s.spawn();
+	s.switchTo(worker.id);
+	const workerTurn = await s.context(history);
+	assert.equal(workerTurn.messages.length, 2);
+	assert.match(JSON.stringify(workerTurn.messages[1]), /Temporary note/);
+
+	// Retract the note as worker (team member)
+	await s.execute({ action: "retract", noteId });
+
+	// Retract of unknown id errors
+	await assert.rejects(
+		s.execute({ action: "retract", noteId }),
+		/does not exist in this team/,
+	);
+	await assert.rejects(s.execute({ action: "retract" }), /requires noteId/);
+
+	// Context for worker and parent now has no notes
+	const afterRetract = await s.context(history);
+	assert.equal(afterRetract.messages.length, 1);
+	s.switchTo("parent");
+	const parentAfterRetract = await s.context(history);
+	assert.equal(parentAfterRetract.messages.length, 1);
 });
 
 test("wait finishes after worker exit; abort leaves detached work intact", async (t) => {

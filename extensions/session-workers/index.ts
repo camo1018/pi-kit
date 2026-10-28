@@ -52,11 +52,15 @@ const actions = [
 	"send",
 	"cancel",
 	"share",
+	"retract",
 	"notes",
 ] as const;
 const Parameters = Type.Object({
 	action: StringEnum(actions),
 	id: Type.Optional(Type.String({ description: "Worker session id" })),
+	noteId: Type.Optional(
+		Type.String({ description: "Shared note id, as returned by share" }),
+	),
 	title: Type.Optional(Type.String({ maxLength: 200 })),
 	task: Type.Optional(Type.String({ maxLength: 32_000 })),
 	context: Type.Optional(
@@ -107,9 +111,11 @@ export function registerSessionWorkers(
 		}
 	});
 
+	const lastFingerprints = new Map<string, string>();
+
 	pi.on("context", (event, ctx) => {
 		if (process.env.BIGBRAIN_MAINT === "1") return;
-		const content = team.context(ctx.sessionManager.getSessionId());
+		const sessionId = ctx.sessionManager.getSessionId();
 		const messages = event.messages.filter(
 			(message) =>
 				!(
@@ -117,14 +123,21 @@ export function registerSessionWorkers(
 					message.customType === CUSTOM_TYPE
 				),
 		);
+		const content = team.context(sessionId);
 		if (content) {
-			messages.push({
-				role: "custom",
-				customType: CUSTOM_TYPE,
-				content,
-				display: false,
-				timestamp: Date.now(),
-			});
+			const fingerprint = team.notesFingerprint(sessionId);
+			if (fingerprint && fingerprint !== lastFingerprints.get(sessionId)) {
+				lastFingerprints.set(sessionId, fingerprint);
+				messages.push({
+					role: "custom",
+					customType: CUSTOM_TYPE,
+					content,
+					display: false,
+					timestamp: Date.now(),
+				});
+			}
+		} else {
+			lastFingerprints.delete(sessionId);
 		}
 		// Request-only: notes aren't persisted or re-ingested as new memories.
 		return { messages };
@@ -139,9 +152,11 @@ export function registerSessionWorkers(
 			"spawn returns immediately; list/read show results, wait waits " +
 			"up to 60 seconds for one worker or the team. send queues a " +
 			"follow-up (not mid-run steering); cancel clears its queue. " +
-			"share publishes a team note; notes reads the shared board. " +
+			"share publishes a team note; retract removes a note by noteId; " +
+			"notes reads the shared board. " +
 			"Only the parent may spawn/send/cancel. Workers can read " +
-			"siblings and share notes. Children inherit the inbox group. " +
+			"siblings, share notes, and retract. " +
+			"Children inherit the inbox group. " +
 			"Foreground and background parents can delegate one level; " +
 			"delegated workers cannot spawn another generation.",
 		promptGuidelines: [
@@ -232,6 +247,14 @@ export function registerSessionWorkers(
 					return result(team.status(caller, id()));
 				case "share":
 					return result(team.share(caller, params.text ?? ""));
+				case "retract": {
+					const noteId = params.noteId?.trim();
+					if (!noteId) {
+						throw new Error("retract requires noteId");
+					}
+					team.retract(caller, noteId);
+					return result({ retracted: noteId });
+				}
 				case "notes":
 					return result({
 						notes: team.notes(caller).slice(-24),

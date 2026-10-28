@@ -51,6 +51,7 @@ as a bug in the guideline wording, not an invitation.
 | `send` | `id`, `text` | Queue a follow-up in the same worker session |
 | `cancel` | `id` | Stop the run and clear its queue |
 | `share` | `text` (1–4000 characters) | Append an attributed finding to the team notes board |
+| `retract` | `id` | Remove a stale or superseded note from the team notes board |
 | `notes` | None | Read the latest 24 notes and the directory for full history |
 
 Example spawn:
@@ -76,9 +77,12 @@ workers; cancel them explicitly.
   and the provided `context`. The parent's full history is not silently copied.
   Include decisions, file scopes, evidence links, and required deliverables.
 - **Immediate team notes:** parent and workers can publish findings with
-  `share`. Every model request refreshes a bounded, escaped, request-only notes
-  message (latest 24 notes, up to 16K characters). Notes are marked as data,
-  not instructions. Nothing is injected into the persisted transcript.
+  `share` and remove stale entries with `retract`. Before each model request,
+  the extension checks whether the team's notes board has changed since the
+  session last received it; notes are injected only when changed, rather than
+  re-sent identically on every request. Injections are bounded, escaped, and
+  request-only (latest 24 notes, up to 16K characters). Notes are marked as
+  data, not instructions. Nothing is injected into the persisted transcript.
   A long-running tool does not receive live updates until its next model call.
 - **Sibling results:** workers can `list` or `read` their siblings to avoid
   duplicating research. Replies are bounded; the full transcript path is
