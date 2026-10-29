@@ -10,6 +10,7 @@
 
 import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 import { transcriptMarkdown } from "../../lib/inbox-agents.ts";
+import { InboxGroups } from "../inbox/groups.ts";
 import {
 	indexSessionIdentities,
 	renderQuotedSession,
@@ -17,12 +18,13 @@ import {
 } from "./format.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
+	getAgentDir,
 	SessionManager,
 	type SessionInfo,
 } from "@earendil-works/pi-coding-agent";
 import { fuzzyFilter } from "@earendil-works/pi-tui";
 
-const COMPLETION_PATTERN = /(?:^|[\s([{<"'`])@\[([^\]\n]*)$/;
+const COMPLETION_PATTERN = /(?:^|[\s([{<"'`])(@g?\[)([^\]\n]*)$/;
 const TOKEN_PATTERN = /(^|[\s([{<"'])@\[([^\]\n]+)\]/g;
 const MAX_SESSION_TRANSCRIPT_CHARS = 24 * 1024;
 const MAX_REQUEST_TRANSCRIPT_CHARS = 64 * 1024;
@@ -62,6 +64,12 @@ function byModified(a: SessionRef, b: SessionRef): number {
 let cachedAt = 0;
 let cachedSessions: SessionRef[] | undefined;
 let inflight: Promise<SessionRef[]> | undefined;
+export function clearSessionCache(): void {
+	cachedAt = 0;
+	cachedSessions = undefined;
+	inflight = undefined;
+}
+
 async function listSessions(): Promise<SessionRef[]> {
 	const now = Date.now();
 	if (cachedSessions && now - cachedAt < 1000) return cachedSessions;
@@ -337,8 +345,79 @@ export default function (pi: ExtensionAPI): void {
 					);
 				}
 
-				const query = match[1] ?? "";
-				const sessions = await listSessions();
+				const trigger = match[1]; // "@[" or "@g["
+				const query = match[2] ?? "";
+				const isGroupOnly = trigger === "@g[";
+
+				let groupName: string | undefined;
+				let groupSessionIds: Set<string> | undefined;
+
+				if (isGroupOnly) {
+					const currentSessionId =
+						ctx.sessionManager?.getSessionId?.();
+					let currentGroupId: string | undefined;
+					if (currentSessionId) {
+						try {
+							const groupsStore = new InboxGroups(
+								getAgentDir(),
+							).load();
+							currentGroupId =
+								groupsStore.sessions[currentSessionId];
+							if (currentGroupId) {
+								const grp = groupsStore.groups.find(
+									(g) => g.id === currentGroupId,
+								);
+								groupName = grp?.name ?? "Current Group";
+								groupSessionIds = new Set(
+									Object.entries(groupsStore.sessions)
+										.filter(
+											([sid, gid]) =>
+												gid === currentGroupId &&
+												sid !== currentSessionId,
+										)
+										.map(([sid]) => sid),
+								);
+							}
+						} catch {
+							// Ignore groups load errors; treat as ungrouped
+						}
+					}
+
+					if (!currentGroupId) {
+						return {
+							prefix: `${trigger}${query}`,
+							items: [
+								{
+									value: "",
+									label: "(Current session is ungrouped)",
+									description:
+										"Assign this session to an inbox group to reference group sessions",
+								},
+							],
+						};
+					}
+				}
+
+				let sessions = await listSessions();
+				if (isGroupOnly && groupSessionIds) {
+					sessions = sessions.filter((s) =>
+						groupSessionIds!.has(s.info.id),
+					);
+					if (sessions.length === 0) {
+						return {
+							prefix: `${trigger}${query}`,
+							items: [
+								{
+									value: "",
+									label: `(No other sessions in ${groupName})`,
+									description:
+										"No other saved sessions found in this group",
+								},
+							],
+						};
+					}
+				}
+
 				const matches = query
 					? fuzzyFilter(
 							sessions,
@@ -373,7 +452,7 @@ export default function (pi: ExtensionAPI): void {
 				};
 
 				return {
-					prefix: `@[${query}`,
+					prefix: `${trigger}${query}`,
 					items: matches.slice(0, 20).map((session) => ({
 						value: `@[${session.info.id}]`,
 						label: labelOf(session),
@@ -396,7 +475,7 @@ export default function (pi: ExtensionAPI): void {
 				const line = lines[cursorLine] ?? "";
 				const before = line.slice(0, cursorCol);
 				const match = before.match(COMPLETION_PATTERN);
-				if (!match || !item.value.startsWith("@[")) {
+				if (!match) {
 					return current.applyCompletion(
 						lines,
 						cursorLine,
@@ -406,7 +485,29 @@ export default function (pi: ExtensionAPI): void {
 					);
 				}
 
-				const tokenStart = cursorCol - (match[1].length + 2);
+				const trigger = match[1]; // "@[" or "@g["
+				const query = match[2] ?? "";
+				const tokenStart = cursorCol - (query.length + trigger.length);
+
+				// Placeholder items (e.g. ungrouped warning or empty group) have empty value
+				if (!item.value) {
+					return {
+						lines,
+						cursorLine,
+						cursorCol,
+					};
+				}
+
+				if (!item.value.startsWith("@[")) {
+					return current.applyCompletion(
+						lines,
+						cursorLine,
+						cursorCol,
+						item,
+						prefix,
+					);
+				}
+
 				const after = line.slice(cursorCol);
 				const insert = after.startsWith(" ")
 					? item.value

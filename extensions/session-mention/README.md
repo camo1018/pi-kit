@@ -1,12 +1,17 @@
 # session-mention
 
-Reference other Pi sessions from a prompt with `@[...]`.
+Reference other Pi sessions from a prompt with `@[...]` (or sessions in your current inbox group with `@g[...]`).
 
 - Typing `@[` opens a fuzzy picker over all saved sessions (all projects),
   matched by name, first message, cwd basename, or id. The picker displays the
   session title but always inserts its immutable id, so duplicate or later
   renamed titles cannot redirect the mention. Plain `@` file completion is
   untouched.
+- Typing `@g[` restricts the autocomplete suggestions specifically to other
+  saved sessions that belong to the current session's inbox group. If the current
+  session is ungrouped (or if no other sessions exist in that group), an
+  informative placeholder item is shown instead of inserting arbitrary sessions.
+  Selecting a suggestion inserts the standard `@[id]` token.
 - On each model request, every recognized `@[id]` token expands in Pi's
   in-flight context clone. The referenced active-branch transcript is placed
   in a `<skill>`-shaped block and the token becomes a readable `«title»`
