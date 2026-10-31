@@ -1,7 +1,8 @@
 /**
  * Inbox — a visual "todo box" for all Pi sessions.
  *
- *   /inbox            open the inbox (also: shift+tab, ctrl+q)
+ *   /inbox            open the inbox (also: shift+tab); ctrl+q jumps to the agent that
+ *                     finished last
  *   /orchestrator     toggle inbox orchestrator mode: this window becomes a full-screen
  *                     agent control panel (pi --orchestrator); on | off | home
  *                     (home = hand back the taken-over session)
@@ -44,7 +45,8 @@
  *
  * Orchestrator mode: the inbox fills the whole screen and the window never shows a chat at
  * home. enter takes a session over (a working agent is stopped first), v peeks, n starts an
- * agent from a full-screen prompt, ctrl+q comes back, h hands back, Q leaves the mode.
+ * agent from a full-screen prompt, ctrl+q jumps to the agent that finished last, h hands back,
+ * Q leaves the mode.
  */
 
 import { spawn, spawnSync } from "node:child_process";
@@ -402,6 +404,9 @@ function unreadBaseline(store: Store): number {
 /** You've looked at this session: clear its unread dot (and a background agent's "needs you"). */
 function markRead(sessionId: string) {
 	markSeen(sessionId);
+	// Seeing it any other way also spends a pending ctrl+q jump (one notification, one jump).
+	const ms = modeState();
+	if (ms.lastFinished === sessionId) ms.lastFinished = undefined;
 	try {
 		updateMeta(sessionId, (m) => {
 			m.seenAt = Date.now();
@@ -3463,7 +3468,7 @@ function editorFocused(): boolean {
 // enter opens a session "attached" (pi's own chat view; what you type runs as a background agent,
 // and the view reloads from disk when the run ends), so switching never aborts anything. `t` /
 // /takeover makes a session run here like plain pi; leaving it mid-run hands the run back to a
-// background agent. ctrl+q comes back to the orchestrator, `h` returns home. State lives on
+// background agent. ctrl+q jumps to the agent that finished last, `h` returns home. State lives on
 // globalThis because the extension is re-instantiated on every session switch.
 
 interface ModeState {
@@ -3486,6 +3491,10 @@ interface ModeState {
 	takeoverSwitch?: string;
 	/** The next blank session is home for typing a new agent's prompt: don't cover it with the orchestrator. */
 	skipReopen?: boolean;
+	/** Id of the agent whose finish notification came last: ctrl+q jumps there, once. */
+	lastFinished?: string;
+	/** Id the next inbox open should land on instead of painting the list (ctrl+q). */
+	jumpTo?: string;
 }
 const MODE_KEY = Symbol.for("pi.inbox.mode");
 /** Agent id whose queue manager currently owns an overlay. */
@@ -4649,9 +4658,12 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (ev.type === "finished") {
 					const failed = ev.agent.state === "error";
+					// This is the session that notified: ctrl+q goes here next (spent once, see markRead).
+					// Not for the session already on screen — there'd be nowhere to jump to.
+					if (ev.agent.id !== shown) ms.lastFinished = ev.agent.id;
 					ctx.ui.notify(
 						failed
-							? `✗ Agent failed: ${ev.agent.title.slice(0, 60)}`
+							? `✗ Agent failed: ${ev.agent.title.slice(0, 60)} — ctrl+q to view`
 							: `◆ Agent finished: ${ev.agent.title.slice(0, 60)} — ctrl+q to view`,
 						failed ? "error" : "info",
 					);
@@ -5011,7 +5023,7 @@ export default function (pi: ExtensionAPI) {
 				await ctx.switchSession(file, {
 					withSession: async (c) => {
 						if (draft) c.ui.setEditorText(draft);
-						if (takeover) c.ui.notify("🎮 Taken over: this session now runs here, like plain pi. ctrl+q: orchestrator · ctrl+q → h: hand back.", "info");
+						if (takeover) c.ui.notify("🎮 Taken over: this session now runs here, like plain pi. shift+tab: orchestrator · h: hand back.", "info");
 					},
 				});
 			} finally {
@@ -5203,7 +5215,7 @@ export default function (pi: ExtensionAPI) {
 		const ms = modeState();
 		const id = ctx.sessionManager.getSessionId();
 		if (!orchestrating()) return ctx.ui.notify("/takeover is for orchestrator mode (/orchestrator).", "info");
-		if (isHome(ctx)) return ctx.ui.notify("Pick a session first (ctrl+q, then t on it).", "info");
+		if (isHome(ctx)) return ctx.ui.notify("Pick a session first (shift+tab, then t on it).", "info");
 		// While visiting, the current foreground session IS the taken-over main: /takeover
 		// would target the visited view. Close the visit instead — the main is already taken over.
 		if (isVisiting()) {
@@ -5261,6 +5273,59 @@ export default function (pi: ExtensionAPI) {
 		if (!(await goHome(ctx))) ms.on = false;
 	}
 
+	/**
+	 * ctrl+q: go straight to the session whose finish notification came last, without painting the
+	 * list first. One notification, one jump: the target is spent as soon as it's looked at (see
+	 * markRead) and a refused jump isn't replayed, so ctrl+q can't ambush you twice with the same
+	 * agent. With nothing pending it just says so — the list stays on shift+tab / `/inbox`.
+	 */
+	async function jumpToFinished(ctx: ExtensionCommandContext) {
+		const ms = modeState();
+		// The list is already up: moving its cursor is the way to pick, so don't spend the target.
+		if (ms.inLoop)
+			return ctx.ui.notify("The inbox is already open — pick the session there.", "info");
+		const id = ms.lastFinished;
+		ms.lastFinished = undefined;
+		if (!id) return ctx.ui.notify("No agent finished — nothing to jump to.", "info");
+		if (!isHome(ctx) && (!ctx.isIdle() || ctx.hasPendingMessages()))
+			return ctx.ui.notify(
+				"This session is working, and jumping away would abort it. shift+tab opens the inbox.",
+				"warning",
+			);
+		const rows = await loadRows(viewedSession(ctx).id);
+		const row = rows.find((r) => r.info.id === id);
+		if (
+			!row ||
+			row.filtered ||
+			row.meta.archivedAt ||
+			!(row.info.path || getAgent(id)?.sessionFile)
+		)
+			return ctx.ui.notify(
+				"That agent's session is no longer in the inbox.",
+				"info",
+			);
+		if (isRunning(getAgent(id)))
+			return ctx.ui.notify(
+				"That agent is working again — the inbox has its live view.",
+				"warning",
+			);
+		// The list asks before opening a session another pi holds; a shortcut must never pop that
+		// dialog, so refuse here and leave the list for the deliberate route.
+		const live = readLive().get(id);
+		if (live && live.pid !== process.pid)
+			return ctx.ui.notify(
+				`That session is open in another pi window (pid ${live.pid}). shift+tab opens the inbox.`,
+				"warning",
+			);
+		if (ctx.mode !== "tui") return ctx.ui.notify(`↪ ${row.title}`, "info");
+		ms.jumpTo = id;
+		try {
+			await openInbox(ctx);
+		} finally {
+			ms.jumpTo = undefined;
+		}
+	}
+
 	async function openInbox(ctx: ExtensionCommandContext) {
 		if (ctx.mode !== "tui") {
 			// Plain-text fallback for non-interactive modes: inbox rows only, archived skipped.
@@ -5308,48 +5373,65 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		let bookmarkCaptured = false;
+		// ctrl+q: the first loop turn opens one row instead of painting the list. A refused open
+		// (working agent, bad file, …) falls through to the list on the next turn.
+		let jumpRow: Row | undefined;
+		const jumpTo = modeState().jumpTo;
+		if (jumpTo) {
+			rowCache = await loadRows(viewed.id, viewWantsArchived(uiState.view));
+			(globalThis as any)[ROWS_KEY] = rowCache;
+			jumpRow = rowCache.find((r) => r.info.id === jumpTo);
+			modeState().jumpTo = undefined;
+			if (jumpRow) uiState.selectedId = jumpRow.info.id;
+		}
 		for (;;) {
 			const atHome = orchestrating() && isHome(ctx);
-			let result = await ctx.ui.custom<InboxResult>(
-				(tui, theme, kb, done) => {
-					(globalThis as any)[INBOX_TUI_KEY] = tui;
-					if (!bookmarkCaptured && !atHome) {
-						rememberScrollBookmark(viewed.id, tui);
-						bookmarkCaptured = true;
-					}
-					coverImagesUnderOverlays(tui);
-					return new InboxComponent(
-						tui,
-						theme,
-						kb,
-						done,
-						uiState,
-						viewed.id,
-						rowCache,
-						(rows) => {
-							rowCache = rows;
-							(globalThis as any)[ROWS_KEY] = rows; // feeds the dir picker's "recent" suggestions
-						},
-						atHome,
-						(row, name) => {
-							// Working (or not saved yet) background agent: its process applies the name itself.
-							if (row.bg && (isRunning(row.bg) || !row.info.path))
-								renameAgent(row.bg.id, name);
-							else if (row.info.id === foregroundId)
-								pi.setSessionName(name);
-							else if (!row.info.path)
-								throw new Error(
-									"session isn't saved yet, try again in a moment",
-								);
-							else
-								SessionManager.open(
-									row.info.path,
-								).appendSessionInfo(name);
-						},
-					);
-				},
-				{ overlay: true, overlayOptions: overlayOpts() },
-			);
+			let result: InboxResult;
+			if (jumpRow) {
+				result = { action: "open", row: jumpRow };
+				jumpRow = undefined;
+			} else {
+				result = await ctx.ui.custom<InboxResult>(
+					(tui, theme, kb, done) => {
+						(globalThis as any)[INBOX_TUI_KEY] = tui;
+						if (!bookmarkCaptured && !atHome) {
+							rememberScrollBookmark(viewed.id, tui);
+							bookmarkCaptured = true;
+						}
+						coverImagesUnderOverlays(tui);
+						return new InboxComponent(
+							tui,
+							theme,
+							kb,
+							done,
+							uiState,
+							viewed.id,
+							rowCache,
+							(rows) => {
+								rowCache = rows;
+								(globalThis as any)[ROWS_KEY] = rows; // feeds the dir picker's "recent" suggestions
+							},
+							atHome,
+							(row, name) => {
+								// Working (or not saved yet) background agent: its process applies the name itself.
+								if (row.bg && (isRunning(row.bg) || !row.info.path))
+									renameAgent(row.bg.id, name);
+								else if (row.info.id === foregroundId)
+									pi.setSessionName(name);
+								else if (!row.info.path)
+									throw new Error(
+										"session isn't saved yet, try again in a moment",
+									);
+								else
+									SessionManager.open(
+										row.info.path,
+									).appendSessionInfo(name);
+							},
+						);
+					},
+					{ overlay: true, overlayOptions: overlayOpts() },
+				);
+			}
 			refreshFooter(ctx);
 
 			if (!result || result.action === "close") {
@@ -5740,7 +5822,7 @@ export default function (pi: ExtensionAPI) {
 					withSession: async (c) => {
 						if (takeover && !working)
 							c.ui.notify(
-								"🎮 Taken over: runs here, like plain pi. ctrl+q: orchestrator · ctrl+q → h: hand back.",
+								"🎮 Taken over: runs here, like plain pi. shift+tab: orchestrator · h: hand back.",
 								"info",
 							);
 						else if (takeover)
@@ -5828,7 +5910,7 @@ export default function (pi: ExtensionAPI) {
 							c.ui.setEditorText(carried.join("\n\n"));
 						if (orchestrating())
 							c.ui.notify(
-								`📥 Taken over${stopped ? ' (background run stopped, send "continue" to resume)' : ""}. ctrl+q: orchestrator · ctrl+q → h: hand back.`,
+								`📥 Taken over${stopped ? ' (background run stopped, send "continue" to resume)' : ""}. shift+tab: orchestrator · h: hand back.`,
 								"info",
 							);
 					},
@@ -5840,7 +5922,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("inbox", {
 		description:
-			"Visual todo-box of all sessions: status, pin, archive (shift+tab / ctrl+q)",
+			"Visual todo-box of all sessions: status, pin, archive (shift+tab). ctrl+q jumps to the last agent that finished",
 		getArgumentCompletions: (prefix) => {
 			const p = prefix.trim();
 			const items = [
@@ -5875,6 +5957,8 @@ export default function (pi: ExtensionAPI) {
 				const rows = await loadRows(viewedSession(ctx).id, true);
 				return showHelp(ctx, filtersReport(rows), "filters");
 			}
+			// internal: the ctrl+q shortcut, which has no command context of its own
+			if (a === "jump") return jumpToFinished(ctx);
 			return openInbox(ctx);
 		},
 	});
@@ -6211,11 +6295,13 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// ctrl+q = "take me to that agent": straight to the session whose finish notification came
+	// last, one press, one notification. shift+tab and /inbox stay the way into the list.
 	pi.registerShortcut("ctrl+q", {
-		description: "Open session inbox (the orchestrator, in orchestrator mode)",
+		description: "Jump to the agent that finished last (shift+tab: session inbox)",
 		handler: async () => {
 			// Shortcuts don't get a command context (needed to switch sessions), so route through the command.
-			pi.sendUserMessage("/inbox", { expandPromptTemplates: true });
+			pi.sendUserMessage("/inbox jump", { expandPromptTemplates: true });
 		},
 	});
 

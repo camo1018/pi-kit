@@ -273,6 +273,7 @@ async function setup(t: TestContext, takenOver = true) {
 		},
 		isProjectTrusted: () => false,
 		isIdle: () => false,
+		hasPendingMessages: () => false,
 		// Orchestrator clone (cloneLatest) lands here; tests can capture the target.
 		switchSession: mock.fn(async () => ({ cancelled: false })),
 	} as unknown as ExtensionCommandContext;
@@ -2443,4 +2444,113 @@ test("row marker slots shrink when takeover is absent and keep child alignment",
 	);
 	list.handleInput("\x1b");
 	await done;
+});
+
+// ── ctrl+q: jump to the agent that finished last ──
+//
+// One notification, one jump. The shortcut routes through `/inbox jump` because shortcuts get
+// no command context; that resolves the target and asks inboxLoop to open the one row without
+// painting the list. The target is spent once the session is looked at.
+
+/** A finished background agent, as the supervisor's "finished" event reports it. */
+function finished(f: Awaited<ReturnType<typeof setup>>, title: string) {
+	const sm = SessionManager.create(dir);
+	sm.appendMessage({ role: "user", content: title, timestamp: 2 });
+	const a: BgAgent = {
+		id: sm.getSessionId(),
+		cwd: dir,
+		sessionFile: sm.getSessionFile(),
+		title,
+		state: "idle",
+		pending: [],
+		createdAt: 0,
+		updatedAt: 0,
+		needsYou: true,
+		runs: 1,
+		log: [],
+		liveText: "",
+	};
+	registry().agents.set(a.id, a);
+	for (const listener of registry().listeners)
+		listener({ type: "finished", agent: a });
+	return a;
+}
+
+/** Run the ctrl+q path; reports whether the list overlay ever got painted. */
+async function jump(f: Awaited<ReturnType<typeof setup>>) {
+	const previous = f.overlay();
+	let painted = false;
+	const done = f.commands.get("inbox").handler("jump", f.ctx);
+	for (let i = 0; i < 200; i++) {
+		if (f.overlay() !== previous) {
+			painted = true;
+			break;
+		}
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	return { painted, done: Promise.resolve(done) };
+}
+
+test("ctrl+q with nothing finished says so and does not open the list", async (t) => {
+	const f = await setup(t);
+	const previous = f.overlay();
+	await f.commands.get("inbox").handler("jump", f.ctx);
+	assert.equal(f.overlay(), previous, "the list must stay closed");
+	assert.match(
+		String((f.ui.notify as any).mock.calls.at(-1).arguments[0]),
+		/No agent finished/,
+	);
+});
+
+test("ctrl+q opens the finished agent itself, without painting the list", async (t) => {
+	const f = await setup(t, false);
+	const a = finished(f, "jumped-to agent");
+	f.ctx.isIdle = () => true;
+	const switched = f.ctx.switchSession as any;
+	switched.mock.resetCalls();
+	const { painted, done } = await jump(f);
+	await done;
+	assert.equal(painted, false, "the list overlay must never mount");
+	assert.equal(switched.mock.calls.length, 1);
+	assert.equal(switched.mock.calls[0].arguments[0], a.sessionFile);
+});
+
+test("ctrl+q spends its target: one notification, one jump", async (t) => {
+	const f = await setup(t, false);
+	finished(f, "only jump target");
+	f.ctx.isIdle = () => true;
+	await (await jump(f)).done;
+	const switched = f.ctx.switchSession as any;
+	switched.mock.resetCalls();
+	await f.commands.get("inbox").handler("jump", f.ctx);
+	assert.equal(switched.mock.calls.length, 0, "a seen agent is not replayed");
+	assert.match(
+		String((f.ui.notify as any).mock.calls.at(-1).arguments[0]),
+		/No agent finished/,
+	);
+});
+
+test("ctrl+q jumps to the latest finisher, not the first", async (t) => {
+	const f = await setup(t, false);
+	finished(f, "first finisher");
+	const second = finished(f, "second finisher");
+	f.ctx.isIdle = () => true;
+	const switched = f.ctx.switchSession as any;
+	switched.mock.resetCalls();
+	await (await jump(f)).done;
+	assert.equal(switched.mock.calls[0].arguments[0], second.sessionFile);
+});
+
+test("ctrl+q refuses a working current session instead of aborting it", async (t) => {
+	const f = await setup(t);
+	finished(f, "jump target");
+	f.ctx.isIdle = () => false;
+	const switched = f.ctx.switchSession as any;
+	switched.mock.resetCalls();
+	await f.commands.get("inbox").handler("jump", f.ctx);
+	assert.equal(switched.mock.calls.length, 0);
+	assert.match(
+		String((f.ui.notify as any).mock.calls.at(-1).arguments[0]),
+		/working, and jumping away would abort it/,
+	);
 });
