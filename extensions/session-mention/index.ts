@@ -8,6 +8,8 @@
  * <skill>-shaped envelope.
  */
 
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 import { transcriptMarkdown } from "../../lib/inbox-agents.ts";
 import { InboxGroups } from "../inbox/groups.ts";
@@ -24,7 +26,9 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { fuzzyFilter } from "@earendil-works/pi-tui";
 
-const COMPLETION_PATTERN = /(?:^|[\s([{<"'`])(@g?\[)([^\]\n]*)$/;
+// `@[` = any saved session; `@g[` = this session's group, archived hidden;
+// `@ga[` = this session's group, archived included.
+const COMPLETION_PATTERN = /(?:^|[\s([{<"'`])(@(?:ga|g)?\[)([^\]\n]*)$/;
 const TOKEN_PATTERN = /(^|[\s([{<"'])@\[([^\]\n]+)\]/g;
 const MAX_SESSION_TRANSCRIPT_CHARS = 24 * 1024;
 const MAX_REQUEST_TRANSCRIPT_CHARS = 64 * 1024;
@@ -64,10 +68,45 @@ function byModified(a: SessionRef, b: SessionRef): number {
 let cachedAt = 0;
 let cachedSessions: SessionRef[] | undefined;
 let inflight: Promise<SessionRef[]> | undefined;
+let cachedArchivedAt = 0;
+let cachedArchived: Set<string> | undefined;
 export function clearSessionCache(): void {
 	cachedAt = 0;
 	cachedSessions = undefined;
 	inflight = undefined;
+	cachedArchivedAt = 0;
+	cachedArchived = undefined;
+}
+
+/**
+ * Session ids the Inbox has archived. Archive state lives in inbox.json, not
+ * in the session file, and only the Inbox writes it. A short cache keeps
+ * autocomplete keystrokes from re-reading it; 1s matches the session cache.
+ */
+function archivedSessionIds(): Set<string> {
+	const now = Date.now();
+	if (cachedArchived && now - cachedArchivedAt < 1000) return cachedArchived;
+	const ids = new Set<string>();
+	try {
+		const raw = fs.readFileSync(
+			path.join(getAgentDir(), "inbox.json"),
+			"utf8",
+		);
+		const sessions = JSON.parse(raw)?.sessions;
+		if (sessions && typeof sessions === "object") {
+			for (const [id, meta] of Object.entries(sessions)) {
+				if (
+					meta && typeof meta === "object" &&
+					(meta as { archivedAt?: number }).archivedAt
+				) ids.add(id);
+			}
+		}
+	} catch {
+		// Missing or unreadable inbox.json means nothing is archived.
+	}
+	cachedArchived = ids;
+	cachedArchivedAt = now;
+	return ids;
 }
 
 async function listSessions(): Promise<SessionRef[]> {
@@ -345,9 +384,10 @@ export default function (pi: ExtensionAPI): void {
 					);
 				}
 
-				const trigger = match[1]; // "@[" or "@g["
+				const trigger = match[1]; // "@[", "@g[" or "@ga["
 				const query = match[2] ?? "";
-				const isGroupOnly = trigger === "@g[";
+				const isGroupOnly = trigger === "@g[" || trigger === "@ga[";
+				const includeArchived = trigger === "@ga[";
 
 				let groupName: string | undefined;
 				let groupSessionIds: Set<string> | undefined;
@@ -403,15 +443,25 @@ export default function (pi: ExtensionAPI): void {
 					sessions = sessions.filter((s) =>
 						groupSessionIds!.has(s.info.id),
 					);
+					if (!includeArchived) {
+						const archived = archivedSessionIds();
+						sessions = sessions.filter(
+							(s) => !archived.has(s.info.id),
+						);
+					}
 					if (sessions.length === 0) {
 						return {
 							prefix: `${trigger}${query}`,
 							items: [
 								{
 									value: "",
-									label: `(No other sessions in ${groupName})`,
-									description:
-										"No other saved sessions found in this group",
+									label: includeArchived
+										? `(No sessions in ${groupName})`
+										: `(No other sessions in ${groupName})`,
+									description: includeArchived
+										? "No saved sessions found in this group"
+										: "No unarchived sessions in this group; " +
+											"try @ga[ to include archived ones",
 								},
 							],
 						};
@@ -485,7 +535,7 @@ export default function (pi: ExtensionAPI): void {
 					);
 				}
 
-				const trigger = match[1]; // "@[" or "@g["
+				const trigger = match[1]; // "@[", "@g[" or "@ga["
 				const query = match[2] ?? "";
 				const tokenStart = cursorCol - (query.length + trigger.length);
 

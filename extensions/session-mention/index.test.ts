@@ -231,3 +231,158 @@ test("@g[ filters specifically for other sessions in the same group", async () =
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}
 });
+
+const infoArchived = {
+	id: "session-archived",
+	name: "archived sibling title",
+	path: "/missing/archived.jsonl",
+	cwd: "/tmp/project",
+	firstMessage: "archived sibling prompt",
+	messageCount: 4,
+	modified: new Date(),
+} as SessionInfo;
+
+function groupFixture(tmpDir: string) {
+	fs.writeFileSync(
+		path.join(tmpDir, "inbox-groups.json"),
+		JSON.stringify({
+			version: 1,
+			groups: [{
+				id: "grp-1",
+				name: "Feature Team",
+				templateEnabled: false,
+				template: "",
+			}],
+			sessions: {
+				"current-session": "grp-1",
+				"session-in-group": "grp-1",
+				"session-archived": "grp-1",
+			},
+		}),
+	);
+	fs.writeFileSync(
+		path.join(tmpDir, "inbox.json"),
+		JSON.stringify({
+			version: 1,
+			sessions: { "session-archived": { archivedAt: 1 } },
+		}),
+	);
+}
+
+test("@g[ hides archived siblings; @ga[ includes them", async () => {
+	clearSessionCache();
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mention-test-"));
+	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = tmpDir;
+	groupFixture(tmpDir);
+
+	const originalListAll = SessionManager.listAll;
+	(SessionManager as any).listAll = async () =>
+		[infoInGroup, infoArchived];
+	const handlers = new Map<string, (...args: any[]) => any>();
+	const pi = {
+		on(event: string, handler: (...args: any[]) => any) {
+			handlers.set(event, handler);
+		},
+	} as unknown as ExtensionAPI;
+
+	try {
+		sessionMention(pi);
+		let providerFactory: ((current: any) => any) | undefined;
+		handlers.get("session_start")?.({}, {
+			sessionManager: {
+				getSessionId: () => "current-session",
+			},
+			ui: {
+				addAutocompleteProvider(factory: (current: any) => any) {
+					providerFactory = factory;
+				},
+			},
+		});
+		const provider = providerFactory?.({
+			getSuggestions() {
+				return null;
+			},
+			applyCompletion() {
+				throw new Error("not used");
+			},
+		});
+
+		const active = await provider.getSuggestions(["@g["], 0, 3, {});
+		assert.deepEqual(
+			active.items.map((item: any) => item.value),
+			["@[session-in-group]"],
+		);
+
+		const all = await provider.getSuggestions(["@ga["], 0, 4, {});
+		assert.deepEqual(
+			all.items.map((item: any) => item.value).sort(),
+			["@[session-archived]", "@[session-in-group]"],
+		);
+		assert.equal(all.prefix, "@ga[");
+
+		const applied = provider.applyCompletion(
+			["read @ga["],
+			0,
+			9,
+			all.items.find(
+				(item: any) => item.value === "@[session-archived]",
+			),
+			"@ga[",
+		);
+		assert.deepEqual(applied.lines, ["read @[session-archived] "]);
+	} finally {
+		(SessionManager as any).listAll = originalListAll;
+		process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("@g[ placeholder points at @ga[ when only archived siblings exist", async () => {
+	clearSessionCache();
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mention-test-"));
+	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = tmpDir;
+	groupFixture(tmpDir);
+
+	const originalListAll = SessionManager.listAll;
+	(SessionManager as any).listAll = async () => [infoArchived];
+	const handlers = new Map<string, (...args: any[]) => any>();
+	const pi = {
+		on(event: string, handler: (...args: any[]) => any) {
+			handlers.set(event, handler);
+		},
+	} as unknown as ExtensionAPI;
+
+	try {
+		sessionMention(pi);
+		let providerFactory: ((current: any) => any) | undefined;
+		handlers.get("session_start")?.({}, {
+			sessionManager: {
+				getSessionId: () => "current-session",
+			},
+			ui: {
+				addAutocompleteProvider(factory: (current: any) => any) {
+					providerFactory = factory;
+				},
+			},
+		});
+		const provider = providerFactory?.({
+			getSuggestions() {
+				return null;
+			},
+			applyCompletion() {
+				throw new Error("not used");
+			},
+		});
+
+		const active = await provider.getSuggestions(["@g["], 0, 3, {});
+		assert.equal(active.items.length, 1);
+		assert.equal(active.items[0].value, "");
+		assert.match(active.items[0].description, /@ga\[/);
+	} finally {
+		(SessionManager as any).listAll = originalListAll;
+		process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});

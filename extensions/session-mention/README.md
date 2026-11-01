@@ -1,6 +1,6 @@
 # session-mention
 
-Reference other Pi sessions from a prompt with `@[...]` (or sessions in your current inbox group with `@g[...]`).
+Reference other Pi sessions from a prompt with `@[...]` (or sessions in your current inbox group with `@g[...]` / `@ga[...]`).
 
 - Typing `@[` opens a fuzzy picker over all saved sessions (all projects),
   matched by name, first message, cwd basename, or id. The picker displays the
@@ -8,9 +8,17 @@ Reference other Pi sessions from a prompt with `@[...]` (or sessions in your cur
   renamed titles cannot redirect the mention. Plain `@` file completion is
   untouched.
 - Typing `@g[` restricts the autocomplete suggestions specifically to other
-  saved sessions that belong to the current session's inbox group. If the current
+  saved sessions that belong to the current session's inbox group, **excluding
+  sessions the Inbox has archived**. Typing `@ga[` uses the same group filter
+  but **includes archived sessions too**.
+- Archive state comes from `~/.pi/agent/inbox.json` (`sessions[id].archivedAt`),
+  re-read at most once per second. Only the Inbox writes that file; if it is
+  missing or unreadable, nothing counts as archived.
+- If the current
   session is ungrouped (or if no other sessions exist in that group), an
   informative placeholder item is shown instead of inserting arbitrary sessions.
+  When every sibling in the group is archived, the `@g[` placeholder points at
+  `@ga[`.
   Selecting a suggestion inserts the standard `@[id]` token.
 - On each model request, every recognized `@[id]` token expands in Pi's
   in-flight context clone. The referenced active-branch transcript is placed
@@ -34,6 +42,7 @@ Reference other Pi sessions from a prompt with `@[...]` (or sessions in your cur
 | --- | --- | --- |
 | `lib/inbox-agents.ts` → `transcriptMarkdown()` | rendering another session's branch | the inbox extension's transcript format changes; the extension still loads, mention blocks then render a `_Could not read session_` body |
 | `SessionManager.listAll()` / `.open()` / `SessionInfo` (public API) | listing sessions, resolving ids, reading branches | public API surface change in pi core |
+| `~/.pi/agent/inbox.json` (`sessions[id].archivedAt`) | deciding which group siblings `@g[` hides | the Inbox moves archive state to another file; `@g[` then shows archived sessions again (`@ga[` is unaffected) |
 
 No private components or prototypes are patched. Request-time expansion uses
 Pi's documented `context` event, and autocomplete uses
