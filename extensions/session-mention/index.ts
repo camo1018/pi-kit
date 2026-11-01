@@ -104,12 +104,17 @@ let cachedSessions: SessionRef[] | undefined;
 let inflight: Promise<SessionRef[]> | undefined;
 let cachedArchivedAt = 0;
 let cachedArchived: Set<string> | undefined;
+/** Group-id → its members' refs. A group has a handful of members, not 500. */
+const groupCache = new Map<string, { at: number; refs: SessionRef[] }>();
+const groupInflight = new Map<string, Promise<SessionRef[]>>();
 export function clearSessionCache(): void {
 	cachedAt = 0;
 	cachedSessions = undefined;
 	inflight = undefined;
 	cachedArchivedAt = 0;
 	cachedArchived = undefined;
+	groupCache.clear();
+	groupInflight.clear();
 }
 
 /**
@@ -143,6 +148,14 @@ function archivedSessionIds(): Set<string> {
 	return ids;
 }
 
+function toRef(info: SessionInfo): SessionRef {
+	return {
+		info,
+		preview: previewOf(info),
+		dir: info.cwd.split("/").filter(Boolean).pop() ?? info.cwd,
+	};
+}
+
 async function listSessions(): Promise<SessionRef[]> {
 	const now = Date.now();
 	if (cachedSessions && now - cachedAt < 1000) return cachedSessions;
@@ -152,12 +165,7 @@ async function listSessions(): Promise<SessionRef[]> {
 			const infos = await SessionManager.listAll();
 			return infos
 				.filter((info) => info.messageCount > 0)
-				.map((info) => ({
-					info,
-					preview: previewOf(info),
-					dir:
-						info.cwd.split("/").filter(Boolean).pop() ?? info.cwd,
-				}))
+				.map(toRef)
 				.sort(byModified);
 		} catch {
 			return [];
@@ -169,6 +177,181 @@ async function listSessions(): Promise<SessionRef[]> {
 	cachedSessions = result;
 	cachedAt = now;
 	return result;
+}
+
+/**
+ * Session files whose name ends in one of `ids`, one pass over the session tree.
+ *
+ * Pi names files `<timestamp>_<session-id>.jsonl`, so the folder layout plus the
+ * filename suffix identifies a session without opening anything. This is the
+ * whole point of the group path: `SessionManager.listAll()` reads every line of
+ * every session (496 files / 543 MB here) to answer a question the filenames
+ * already answer for a group of a few dozen. Unreadable dirs are skipped, and a
+ * missing id just isn't found — the caller falls back to the full listing.
+ */
+function findSessionFiles(ids: Set<string>): Map<string, string> {
+	const found = new Map<string, string>();
+	if (ids.size === 0) return found;
+	const root = path.join(getAgentDir(), "sessions");
+	let dirs: fs.Dirent[];
+	try {
+		dirs = fs.readdirSync(root, { withFileTypes: true });
+	} catch {
+		return found;
+	}
+	for (const dir of dirs) {
+		if (!dir.isDirectory() && !dir.isSymbolicLink()) continue;
+		let names: string[];
+		try {
+			names = fs.readdirSync(path.join(root, dir.name));
+		} catch {
+			continue;
+		}
+		for (const name of names) {
+			if (!name.endsWith(".jsonl")) continue;
+			const stem = name.slice(0, -".jsonl".length);
+			for (const id of ids) {
+				if (stem.endsWith(id) && !found.has(id)) {
+					found.set(id, path.join(root, dir.name, name));
+					break;
+				}
+			}
+		}
+	}
+	return found;
+}
+
+/**
+ * Header + name only, without pi's full parse. A mention needs the title and
+ * the transcript path; `messageCount` is taken from the manager's entry count.
+ */
+function refFromFile(file: string, id: string): SessionRef | undefined {
+	try {
+		const stat = fs.statSync(file);
+		const fd = fs.openSync(file, "r");
+		let head = "";
+		try {
+			const buf = Buffer.alloc(64 * 1024);
+			const read = fs.readSync(fd, buf, 0, buf.length, 0);
+			head = buf.subarray(0, read).toString("utf8");
+		} finally {
+			fs.closeSync(fd);
+		}
+		const firstLine = head.split("\n", 1)[0] ?? "";
+		const header = JSON.parse(firstLine);
+		if (header?.type !== "session") return undefined;
+		const name = sessionNameFromFile(file);
+		const info = {
+			path: file,
+			id,
+			cwd: typeof header.cwd === "string" ? header.cwd : "",
+			name,
+			created: new Date(header.timestamp),
+			modified: stat.mtime,
+			messageCount: 1, // a real, readable session; 0 would hide it
+			firstMessage: "",
+			allMessagesText: "",
+		} as unknown as SessionInfo;
+		return { info, preview: name ?? "", dir: shortDir(info.cwd) };
+	} catch {
+		return undefined;
+	}
+}
+
+function shortDir(cwd: string): string {
+	return cwd.split("/").filter(Boolean).pop() ?? cwd;
+}
+
+/** Last session_info name in the file, read backwards a chunk at a time. */
+function sessionNameFromFile(file: string): string | undefined {
+	try {
+		const size = fs.statSync(file).size;
+		let fd: number | undefined;
+		try {
+			fd = fs.openSync(file, "r");
+			let pos = size;
+			while (pos > 0) {
+				const len = Math.min(64 * 1024, pos);
+				pos -= len;
+				const buf = Buffer.alloc(len);
+				fs.readSync(fd, buf, 0, len, pos);
+				const lines = buf.toString("utf8").split("\n");
+				for (let i = lines.length - 1; i >= 0; i--) {
+					const line = lines[i];
+					if (!line || !line.includes("session_info")) continue;
+					try {
+						const entry = JSON.parse(line);
+						if (
+							entry?.type === "session_info" &&
+							typeof entry.name === "string"
+						) return entry.name.trim() || undefined;
+					} catch {
+						// partial line from a chunk boundary; skip it
+					}
+				}
+			}
+		} finally {
+			if (fd !== undefined) fs.closeSync(fd);
+		}
+	} catch {
+		// unreadable → unnamed
+	}
+	return undefined;
+}
+
+/**
+ * The full listing, narrowed to `memberIds`. Used when filename resolution can't
+ * account for every member, so the picker still shows exactly the group.
+ */
+async function listSessionsIn(
+	memberIds: Set<string>,
+): Promise<SessionRef[]> {
+	return (await listSessions()).filter((ref) =>
+		memberIds.has(ref.info.id),
+	);
+}
+
+/**
+ * Members of one group, resolved from filenames instead of pi's full scan.
+ * Falls back to the full listing when any member id has no file (a renamed or
+ * copied session), so the picker is never silently missing a session.
+ */
+async function listGroupSessions(
+	groupId: string,
+	memberIds: Set<string>,
+): Promise<SessionRef[]> {
+	const now = Date.now();
+	const cached = groupCache.get(groupId);
+	if (cached && now - cached.at < 1000) return cached.refs;
+	const pending = groupInflight.get(groupId);
+	if (pending) return pending;
+	const work = (async () => {
+		try {
+			const files = findSessionFiles(memberIds);
+			if (files.size !== memberIds.size) {
+				return await listSessionsIn(memberIds);
+			}
+			const refs: SessionRef[] = [];
+			for (const [id, file] of files) {
+				const ref = refFromFile(file, id);
+				if (ref) refs.push(ref);
+			}
+			// A file that exists but doesn't parse is a real session we can't
+			// describe; the full listing has its own tolerant parser.
+			if (refs.length !== files.size) {
+				return await listSessionsIn(memberIds);
+			}
+			return refs.sort(byModified);
+		} catch {
+			return await listSessionsIn(memberIds);
+		} finally {
+			groupInflight.delete(groupId);
+		}
+	})();
+	groupInflight.set(groupId, work);
+	const refs = await work;
+	groupCache.set(groupId, { at: now, refs });
+	return refs;
 }
 
 function codeRanges(text: string): Array<[number, number]> {
@@ -425,11 +608,11 @@ export default function (pi: ExtensionAPI): void {
 
 				let groupName: string | undefined;
 				let groupSessionIds: Set<string> | undefined;
+				let currentGroupId: string | undefined;
 
 				if (isGroupOnly) {
 					const currentSessionId =
 						ctx.sessionManager?.getSessionId?.();
-					let currentGroupId: string | undefined;
 					if (currentSessionId) {
 						try {
 							const groupsStore = new InboxGroups(
@@ -477,10 +660,13 @@ export default function (pi: ExtensionAPI): void {
 					}
 				}
 
-				let sessions = await listSessions();
-				if (isGroupOnly && groupSessionIds) {
-					sessions = sessions.filter((s) =>
-						groupSessionIds!.has(s.info.id),
+				let sessions: SessionRef[];
+				if (isGroupOnly && groupSessionIds && currentGroupId) {
+					// Filename resolution: only this group's files are touched, so the
+					// picker doesn't read the whole session tree on every keystroke.
+					sessions = await listGroupSessions(
+						currentGroupId,
+						groupSessionIds,
 					);
 					if (!includeArchived) {
 						const archived = archivedSessionIds();
@@ -505,6 +691,8 @@ export default function (pi: ExtensionAPI): void {
 							],
 						};
 					}
+				} else {
+					sessions = await listSessions();
 				}
 
 				const matches = query

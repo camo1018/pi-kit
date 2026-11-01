@@ -559,3 +559,188 @@ test("@g[ does not borrow a view filter's group outside the orchestrator", async
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}
 });
+
+/**
+ * The group path resolves members from filenames so it never full-parses the
+ * session tree. These tests write real session files and assert both the
+ * result and that non-member files are never opened.
+ */
+function writeSession(
+	dir: string,
+	cwdSlug: string,
+	id: string,
+	options: { name?: string; messages?: number; mtime?: Date } = {},
+): string {
+	const dirPath = path.join(dir, "sessions", cwdSlug);
+	fs.mkdirSync(dirPath, { recursive: true });
+	const file = path.join(
+		dirPath,
+		`2026-01-01T00-00-00-000Z_${id}.jsonl`,
+	);
+	const lines = [
+		JSON.stringify({
+			type: "session",
+			version: 3,
+			id,
+			timestamp: "2026-01-01T00:00:00.000Z",
+			cwd: `/tmp/${cwdSlug}`,
+		}),
+		JSON.stringify({
+			type: "message",
+			id: "m1",
+			parentId: null,
+			message: {
+				role: "user",
+				content: `first prompt for ${id}`,
+				timestamp: 1,
+			},
+		}),
+	];
+	if (options.name) {
+		lines.push(JSON.stringify({
+			type: "session_info",
+			id: "n1",
+			parentId: "m1",
+			name: options.name,
+		}));
+	}
+	for (let i = 1; i < (options.messages ?? 1); i++) {
+		lines.push(JSON.stringify({
+			type: "message",
+			id: `m${i + 1}`,
+			parentId: `m${i}`,
+			message: {
+				role: "assistant",
+				content: `reply ${i}`,
+				timestamp: 2,
+			},
+		}));
+	}
+	fs.writeFileSync(file, lines.join("\n") + "\n");
+	if (options.mtime) fs.utimesSync(file, options.mtime, options.mtime);
+	return file;
+}
+
+test("@g[ resolves members from filenames, without listAll()", async () => {
+	clearSessionCache();
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mention-test-"));
+	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = tmpDir;
+
+	fs.writeFileSync(
+		path.join(tmpDir, "inbox-groups.json"),
+		JSON.stringify({
+			version: 1,
+			groups: [{
+				id: "grp-1",
+				name: "Feature Team",
+				templateEnabled: false,
+				template: "",
+			}],
+			sessions: {
+				"current-session": "grp-1",
+				"member-named": "grp-1",
+				"member-plain": "grp-1",
+				"outsider": "grp-2",
+			},
+		}),
+	);
+	fs.writeFileSync(
+		path.join(tmpDir, "inbox.json"),
+		JSON.stringify({ version: 1, sessions: {} }),
+	);
+	writeSession(tmpDir, "--tmp-project--", "member-named", {
+		name: "a named sibling",
+		messages: 3,
+	});
+	writeSession(tmpDir, "--tmp-project--", "member-plain");
+	const outsider = writeSession(tmpDir, "--tmp-other--", "outsider", {
+		name: "must not be read",
+		mtime: new Date(),
+	});
+
+	// Any call to pi's full scan means the fast path was skipped.
+	let listed = 0;
+	const originalListAll = SessionManager.listAll;
+	(SessionManager as any).listAll = async () => {
+		listed++;
+		return originalListAll();
+	};
+	// Provenance: a corrupt non-member file would break the listing if the
+	// group path ever read it, so make one and assert the listing still works.
+	fs.writeFileSync(outsider, "{not json\n");
+
+	try {
+		const suggestions = await suggestionsFor("@g[", "current-session");
+		const values = suggestions.items.map((item: any) => item.value).sort();
+		assert.deepEqual(
+			values,
+			["@[member-named]", "@[member-plain]"],
+		);
+		assert.equal(listed, 0, "group lookup must not full-scan");
+		// The real name is shown, read from the tail of the member's file.
+		const named = suggestions.items.find(
+			(item: any) => item.value === "@[member-named]",
+		);
+		assert.equal(named.label, "a named sibling");
+	} finally {
+		(SessionManager as any).listAll = originalListAll;
+		process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("@g[ falls back to the full scan when a member has no file", async () => {
+	clearSessionCache();
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mention-test-"));
+	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = tmpDir;
+
+	fs.writeFileSync(
+		path.join(tmpDir, "inbox-groups.json"),
+		JSON.stringify({
+			version: 1,
+			groups: [{
+				id: "grp-1",
+				name: "Feature Team",
+				templateEnabled: false,
+				template: "",
+			}],
+			sessions: {
+				"current-session": "grp-1",
+				"member-named": "grp-1",
+				"member-missing": "grp-1",
+			},
+		}),
+	);
+	fs.writeFileSync(
+		path.join(tmpDir, "inbox.json"),
+		JSON.stringify({ version: 1, sessions: {} }),
+	);
+	writeSession(tmpDir, "--tmp-project--", "member-named", {
+		name: "a named sibling",
+	});
+	// member-missing deliberately has no file on disk: the listing must still
+	// show the members it can see, via the full-scan fallback.
+	const originalListAll = SessionManager.listAll;
+	(SessionManager as any).listAll = async () =>
+		[
+			{
+				...infoInGroup,
+				id: "member-missing",
+				name: "only the full scan can see this",
+			},
+		] as SessionInfo[];
+
+	try {
+		const suggestions = await suggestionsFor("@g[", "current-session");
+		assert.deepEqual(
+			suggestions.items.map((item: any) => item.value),
+			["@[member-missing]"],
+		);
+	} finally {
+		(SessionManager as any).listAll = originalListAll;
+		process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
