@@ -12,7 +12,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 import { transcriptMarkdown } from "../../lib/inbox-agents.ts";
-import { InboxGroups } from "../inbox/groups.ts";
+import { InboxGroups, type GroupStore } from "../inbox/groups.ts";
 import {
 	indexSessionIdentities,
 	renderQuotedSession,
@@ -63,6 +63,40 @@ function previewOf(info: SessionInfo): string {
 
 function byModified(a: SessionRef, b: SessionRef): number {
 	return b.info.modified.getTime() - a.info.modified.getTime();
+}
+
+/**
+ * Destination group of the session being composed, when the current session has
+ * no membership of its own.
+ *
+ * The inbox only writes membership to inbox-groups.json at spawn time, so while
+ * you are typing the first prompt of a new background agent the chosen group
+ * lives on the inbox's pending reply target (ctrl+g) or its one-off/default
+ * pre-pick. Read those globals with the inbox's own precedence; without this,
+ * `@g[` always claimed the composing session was ungrouped.
+ */
+function composedGroupId(store: GroupStore): string | undefined {
+	const global = globalThis as any;
+	const target = global[Symbol.for("pi.inbox.reply-target")];
+	if (target?.kind === "new" && typeof target.groupId === "string") {
+		return target.groupId;
+	}
+	const preset = global[Symbol.for("pi.inbox.next-agent-group")];
+	if (preset === "ungrouped") return undefined;
+	if (typeof preset === "string" && preset !== "all") {
+		return store.groups.some((group) => group.id === preset)
+			? preset
+			: store.defaultGroupId;
+	}
+	// Mirrors the inbox's newAgentGroup(): the current group view, else the
+	// default group for the All view. Only when orchestrator mode is on: a plain
+	// foreground session must not borrow a view filter's group.
+	if (!global[Symbol.for("pi.inbox.mode")]?.on) return undefined;
+	const view = global[Symbol.for("pi.inbox.group-view")] ?? "all";
+	if (view === "ungrouped") return undefined;
+	return store.groups.some((group) => group.id === view)
+		? view
+		: store.defaultGroupId;
 }
 
 let cachedAt = 0;
@@ -403,6 +437,10 @@ export default function (pi: ExtensionAPI): void {
 							).load();
 							currentGroupId =
 								groupsStore.sessions[currentSessionId];
+							if (!currentGroupId) {
+								// A new agent's group is picked before it exists.
+								currentGroupId = composedGroupId(groupsStore);
+							}
 							if (currentGroupId) {
 								const grp = groupsStore.groups.find(
 									(g) => g.id === currentGroupId,
@@ -429,9 +467,10 @@ export default function (pi: ExtensionAPI): void {
 							items: [
 								{
 									value: "",
-									label: "(Current session is ungrouped)",
+									label: "(No group for this session)",
 									description:
-										"Assign this session to an inbox group to reference group sessions",
+										"Ungrouped: pick a destination with ctrl+g, " +
+										"or use @[ to search every session",
 								},
 							],
 						};

@@ -20,6 +20,11 @@ Reference other Pi sessions from a prompt with `@[...]` (or sessions in your cur
   When every sibling in the group is archived, the `@g[` placeholder points at
   `@ga[`.
   Selecting a suggestion inserts the standard `@[id]` token.
+- A session that is still being composed (no membership on disk yet) resolves
+  its group the same way the Inbox starts the agent: the pending new-agent reply
+  target (`ctrl+g`), then the `F` one-off pre-pick, then — only in orchestrator
+  mode — the current group view and the default group. Without this, `@g[` in a
+  brand-new session always claimed there was no group.
 - On each model request, every recognized `@[id]` token expands in Pi's
   in-flight context clone. The referenced active-branch transcript is placed
   in a `<skill>`-shaped block and the token becomes a readable `«title»`
@@ -43,6 +48,7 @@ Reference other Pi sessions from a prompt with `@[...]` (or sessions in your cur
 | `lib/inbox-agents.ts` → `transcriptMarkdown()` | rendering another session's branch | the inbox extension's transcript format changes; the extension still loads, mention blocks then render a `_Could not read session_` body |
 | `SessionManager.listAll()` / `.open()` / `SessionInfo` (public API) | listing sessions, resolving ids, reading branches | public API surface change in pi core |
 | `~/.pi/agent/inbox.json` (`sessions[id].archivedAt`) | deciding which group siblings `@g[` hides | the Inbox moves archive state to another file; `@g[` then shows archived sessions again (`@ga[` is unaffected) |
+| Inbox globals `pi.inbox.reply-target`, `pi.inbox.next-agent-group`, `pi.inbox.group-view`, `pi.inbox.mode` | resolving the group of a session that is still being composed | the Inbox renames those keys or stops tracking a pending new-agent group; `@g[` in a brand-new session then reports no group until the agent spawns |
 
 No private components or prototypes are patched. Request-time expansion uses
 Pi's documented `context` event, and autocomplete uses
