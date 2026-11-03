@@ -38,6 +38,11 @@ Ask one concise question only if there is no identifiable unfinished task.
   automatically when configured. The parent keeps its own (frontier) model
   for integration and the final answer.
 - Use the parent's cwd and inbox group unless the user says otherwise.
+- **Propagate every other invoked skill.** `$parallel` is never the only skill
+  in a prompt. Any *other* skill token invoked alongside it (`$code-search`,
+  `$query-logs`, `$sql-query`, `$pr-review`, `$ci-fix`, …) is part of the
+  user's instructions for the whole job and applies to **every** worker, not
+  just to you. Only the `parallel` skill itself is withheld from workers.
 - Delegation is one level only. Workers are leaves, not further coordinators.
 - If `session_workers` is unavailable, explain that its extension must be
   enabled/reloaded. Do not simulate delegation with ad-hoc shell processes.
@@ -56,6 +61,12 @@ Ask one concise question only if there is no identifiable unfinished task.
    bounded task, relevant context, and expected deliverables. Include evidence,
    constraints, base/worktree information, and file ownership. History is not
    cloned. Do not forward this skill or the `$parallel` marker to workers.
+   Do forward every other skill invoked in the same prompt: reproduce its
+   `$skill-name` token verbatim in each worker's task text so inline-skills
+   expands it, and name the skill file (e.g. `skills/<name>/SKILL.md`) so the
+   worker can read it even if expansion does not fire. Say plainly that the
+   skill governs the worker's slice. Never paraphrase a skill down to "use the
+   code-search skill" — the instructions must reach the worker intact.
 4. **Tell workers how to collaborate.** Each worker should recall relevant
    bigbrain knowledge when available, publish useful findings or blockers with
    `share`, and consult the shared notes/sibling results where relevant. Notes
@@ -82,5 +93,8 @@ Ask one concise question only if there is no identifiable unfinished task.
 - Do not commit, push, merge, or publish task changes unless authorized.
 - Interrupting or closing the parent does not stop its workers. Use `cancel`
   explicitly when abandoning delegated work; keep their completed steps intact.
-- Tell the user briefly which workers started and how their work was split.
+- Tell the user briefly which workers started and how their work was split,
+  and confirm which skills were propagated to them.
   Workers are ordinary sessions visible in `/inbox` or Ctrl+Q.
+- If a worker's reply shows it ignored a propagated skill, correct it with
+  `send` rather than redoing the work yourself.
