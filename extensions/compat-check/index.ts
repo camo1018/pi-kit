@@ -268,6 +268,27 @@ const PROBES: Probe[] = [
 	// ── inbox ────────────────────────────────────────────────────────
 	{
 		ext: "inbox",
+		id: "footer-render",
+		check: () =>
+			need(
+				hasMethod(A.FooterComponent, "render") &&
+				typeof A.FooterComponent.prototype.setSession === "function",
+				"FooterComponent render/setSession is gone (reordered footer line breaks)",
+			),
+	},
+	{
+		ext: "inbox",
+		id: "footer-patch-installed",
+		check: () =>
+			need(
+				(globalThis as any)[
+					Symbol.for("pi.ext.inbox.footer")
+				]?.patched === true,
+				"inbox loaded but the footer render patch was not installed",
+			),
+	},
+	{
+		ext: "inbox",
 		id: "tui-composite-methods",
 		check: () => {
 			const missing = ["TuiMainScreen", "TuiAltScreen"].flatMap((n) =>

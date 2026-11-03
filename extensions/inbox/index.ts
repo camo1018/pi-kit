@@ -75,6 +75,11 @@ import {
 	templateDraft,
 	type GroupScope,
 } from "./groups.ts";
+import {
+	createGroupNameReader,
+	footerState,
+	patchFooterRender,
+} from "./footer.ts";
 import * as fs from "node:fs";
 import * as readline from "node:readline";
 import { installBackgroundMcpAutoApproval } from "../../lib/background-mcp-approval.ts";
@@ -95,6 +100,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
 	AssistantMessageComponent,
+	FooterComponent,
 	getAgentDir,
 	getMarkdownTheme,
 	getSelectListTheme,
@@ -4357,16 +4363,29 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	// The footer's first line leads with the session's group and name, with the
+	// directory and branch right-aligned. The group name is read through a short
+	// cache because the footer renders on every frame.
+	const footerGroupName = createGroupNameReader(readGroups);
+
+	/** Reorder the built-in footer's first line (see footer.ts). */
+	const installFooter = (ctx: ExtensionContext) => {
+		if (ctx.mode !== "tui") return;
+		const state = footerState();
+		state.groupName = footerGroupName;
+		state.theme = ctx.ui.theme;
+		patchFooterRender(FooterComponent);
+	};
+
 	const refreshFooter = (ctx: ExtensionContext) => {
 		if (!ctx.hasUI) return;
+		footerGroupName.invalidate();
 		const id = viewedSession(ctx).id;
 		const meta = loadStore().sessions[id] ?? {};
 		const parts: string[] = [];
 		if (meta.pinnedAt) parts.push(ctx.ui.theme.fg("warning", "★ pinned"));
 		if (meta.archivedAt) parts.push("archived");
 		if (meta.filter === "hide") parts.push("filtered");
-		const group = sessionGroup(readGroups(), id);
-		if (group) parts.push(`group: ${group.name}`);
 		ctx.ui.setStatus("inbox", parts.length ? parts.join(" · ") : undefined);
 	};
 
@@ -4432,6 +4451,7 @@ export default function (pi: ExtensionAPI) {
 			viewing = ctx.sessionManager.getSessionId();
 			markRead(viewing); // opening a session counts as looking at it
 		}
+		installFooter(ctx);
 		refreshFooter(ctx);
 		const ms = modeState();
 		if (!ms.flagApplied) {
