@@ -106,6 +106,31 @@ function firstText(content: unknown): string | undefined {
 	return undefined;
 }
 
+/** One name on one line, capped at the length pi stores. */
+function cleanName(name: string): string {
+	return name.replace(/[\r\n]+/g, " ").trim().slice(0, 200);
+}
+
+/** `"… (empty = auto-title)"` labels mean an empty box is meaningful, so the prompt allows it. */
+function autoTitleHint(label: string): string | undefined {
+	return /empty =/.test(label) ? "empty = auto-title" : undefined;
+}
+
+/**
+ * Open the rename box. The inbox extension registers `pi.inbox.rename-prompt` to pre-fill the
+ * current name (↑ restores it); without it, pi's own dialog puts the name in a placeholder and
+ * opens empty.
+ */
+function renameAsker(
+	ctx: ExtensionContext,
+): (title: string, current: string, emptyHint?: string) => Promise<string | undefined> {
+	const prompt = (globalThis as any)[Symbol.for("pi.inbox.rename-prompt")];
+	return (title, current, emptyHint) =>
+		typeof prompt === "function"
+			? prompt(ctx, { title, current, emptyHint })
+			: ctx.ui.input(title, current);
+}
+
 export default function renameChatExtension(pi: ExtensionAPI) {
 	registerLoadedExtension("rename-chat");
 	pi.registerTool({
@@ -239,9 +264,22 @@ export default function renameChatExtension(pi: ExtensionAPI) {
 			// tool above deliberately stays bound to its executing session.
 			const hook = (globalThis as any)[Symbol.for("pi.inbox.rename-target")];
 			const target = typeof hook === "function" ? hook(ctx) : undefined;
+			const ask = renameAsker(ctx);
+			const clean = cleanName;
+
 			if (target) {
-				const name = args.replace(/[\r\n]+/g, " ").trim().slice(0, 200);
-				const message = target.apply(name);
+				if (args.trim()) {
+					const message = target.apply(clean(args));
+					if (message) ctx.ui.notify(message, "info");
+					return;
+				}
+				const name = await ask(
+					target.label,
+					target.current ?? "",
+					autoTitleHint(target.label),
+				);
+				if (name === undefined || name === null) return;
+				const message = target.apply(clean(name));
 				if (message) ctx.ui.notify(message, "info");
 				return;
 			}
@@ -251,9 +289,17 @@ export default function renameChatExtension(pi: ExtensionAPI) {
 				ctx.ui.notify(`Session renamed: ${title}`, "info");
 				return;
 			}
-			// Auto-title: reuse the tool logic in-process.
+			// No args: ask in a box that already holds the current name. Submitting it unchanged is
+			// a no-op; clearing it auto-titles from the first user message.
 			const file = ctx.sessionManager.getSessionFile();
-			const auto = file ? titleFromFirstMessage(file) : undefined;
+			const name = await ask(
+				"Rename session",
+				pi.getSessionName() ?? "",
+				"empty = auto-title",
+			);
+			if (name === undefined || name === null) return;
+			const next = clean(name);
+			const auto = next || (file ? titleFromFirstMessage(file) : undefined) || "";
 			if (!auto) {
 				ctx.ui.notify("No user message yet — pass a title: /rename <title>", "warning");
 				return;
@@ -268,24 +314,30 @@ export default function renameChatExtension(pi: ExtensionAPI) {
 	pi.registerShortcut("ctrl+r", {
 		description: "Rename current session",
 		handler: async (ctx) => {
-			// Orchestrator: name the viewed session or a pending new agent.
+			const ask = renameAsker(ctx);
+			const clean = cleanName;
+			// Orchestrator: name the viewed session or a pending new agent. Both boxes are pre-filled
+			// with the current name (↑ restores it after edits).
 			const hook = (globalThis as any)[Symbol.for("pi.inbox.rename-target")];
 			const inbox = typeof hook === "function" ? hook(ctx) : undefined;
 			if (inbox) {
-				const v = await ctx.ui.input(inbox.label, inbox.current ?? "new agent name");
+				const v = await ask(
+					inbox.label,
+					inbox.current ?? "",
+					autoTitleHint(inbox.label),
+				);
 				if (v === undefined || v === null) return;
-				const msg = inbox.apply(v.replace(/[\r\n]+/g, " ").trim().slice(0, 200));
+				const msg = inbox.apply(clean(v));
 				if (msg) ctx.ui.notify(msg, "info");
 				return;
 			}
-			const current = pi.getSessionName();
-			const input = await ctx.ui.input(
-				"Rename session (empty = auto-title)",
-				current ?? "new session name",
-			);
+			const current = pi.getSessionName() ?? "";
+			const input = await ask("Rename session", current, "empty = auto-title");
 			// esc / cancel
 			if (input === undefined || input === null) return;
-			let title = input.replace(/[\r\n]+/g, " ").trim();
+			let title = clean(input);
+			// Submitting the name unchanged saves nothing (and avoids a pointless session_info entry).
+			if (title === clean(current)) return;
 			if (!title) {
 				const file = ctx.sessionManager.getSessionFile();
 				title = (file ? titleFromFirstMessage(file) : undefined) ?? "";

@@ -22,9 +22,9 @@ Source: `~/Code/pi-kit/extensions/inbox/index.ts` (background agents: `~/Code/pi
 | `/group` | Move the session on screen into a group (including busy sessions) |
 | `/pin` | Toggle pin on the current session |
 | `/archive` | Archive/restore the session on screen; a parent includes its delegated workers |
-| `/rename [title]` | Rename the current session (no title: auto-title from its first user message). Also available to the agent as the `rename-chat` tool — same naming, works on background-agent sessions too via its `session` param |
+| `/rename [title]` | Rename the current session. With no title, the box opens pre-filled with the current name (`↑` restores it, clearing it auto-titles from the first user message). Also available to the agent as the `rename-chat` tool — same naming, works on background-agent sessions too via its `session` param |
 | `/bookmark`, `ctrl+b`, or `ctrl+shift+b` | Fullscreen mode: return to the transcript position saved when you last opened the inbox or switched away |
-| `ctrl+r` | Rename the current session. On orchestrator home / while typing a new agent's first prompt (`n`), names that new agent instead (empty = name from its prompt); after sending, renames the just-started agent |
+| `ctrl+r` | Rename the current session, with the box pre-filled by its current name (`↑` restores it, `enter` saves, `esc` cancels). On orchestrator home / while typing a new agent's first prompt (`n`), names that new agent instead (empty = name from its prompt); after sending, renames the just-started agent |
 
 Pi-kit's `config/keybindings.json` binds `app.thinking.cycle` to `ctrl+shift+e`, leaving `shift+tab` for the inbox. For an existing installation, set `"app.thinking.cycle": ["ctrl+shift+e"]` in `~/.pi/agent/keybindings.json` and run `/reload`. `/thinking` also opens the level picker. In iTerm2, enable CSI u key reporting so Ctrl+Shift+E is distinct from Ctrl+E.
 
@@ -63,7 +63,7 @@ Pi-kit's `config/keybindings.json` binds `app.thinking.cycle` to `ctrl+shift+e`,
 | `tab` / `shift+tab` | Cycle views |
 | `1` `2` `3` `4` | Inbox · Archived · All · Filtered |
 | `/` | Full-text search (type, `enter` keeps the filter, `esc` clears it) |
-| `r` | Rename session inline in the list (`enter` save · `esc` cancel). Works on agents still working or not saved yet: the agent process applies the name itself within ~1s (or the window applies it when the run ends) |
+| `r` | Rename session inline in the list: the current name is pre-filled, so you edit it instead of retyping (↑ restores it) · `enter` save · `esc` cancel. Works on agents still working or not saved yet: the agent process applies the name itself within ~1s (or the window applies it when the run ends) |
 | `R` / `ctrl+r` | Refresh now (auto-refreshes every 2.5s) |
 | `?` | This help |
 | `esc` / `q` | Close (first `esc` clears an active filter) |

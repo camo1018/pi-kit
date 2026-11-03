@@ -1462,8 +1462,7 @@ class InboxComponent {
 	private scroll = 0;
 	private searching = false;
 	/** Inline rename of the selected row (edited in place, no trip to pi's chat view). */
-	/** `replace`: the original name is shown but the first typed char wipes it; cleared once you move the cursor. */
-	private renaming?: { id: string; input: Input; replace: boolean };
+	private renaming?: { id: string; input: Input; current: string };
 	private loading = false;
 	/** Set once archived sessions have been parsed at least once (refresh keeps them warm). */
 	private archivedLoaded = false;
@@ -1810,13 +1809,11 @@ class InboxComponent {
 		this.rebuild();
 	}
 
-	/**
-	 * Cursor at the start, original name still shown; the first typed char replaces the whole name.
-	 * Moving the cursor first (arrows, home/end, …) keeps the name and edits it in place.
-	 */
+	/** The current name is pre-filled, so you can edit it instead of retyping; ↑ restores it. */
 	private startRename(row: Row) {
+		const current = row.info.name || cleanTitle(row.title).slice(0, 60);
 		const input = new Input({ prompt: this.theme.fg("accent", "✎ ") });
-		input.setValue(row.info.name || cleanTitle(row.title).slice(0, 60)); // a fresh Input's cursor sits at 0
+		input.setValue(current);
 		const id = row.info.id;
 		input.onEscape = () => {
 			this.renaming = undefined;
@@ -1838,7 +1835,7 @@ class InboxComponent {
 			this.rebuild();
 			void this.refresh();
 		};
-		this.renaming = { id, input, replace: true };
+		this.renaming = { id, input, current };
 	}
 
 	private renameInput(data: string) {
@@ -1849,14 +1846,8 @@ class InboxComponent {
 			r.input.onSubmit?.(r.input.getValue());
 			return;
 		}
-		if (r.replace && !matchesKey(data, "escape")) {
-			r.replace = false;
-			const typing = printable(data) !== undefined || data.includes("\x1b[200~");
-			const deleting = matchesKey(data, "backspace") || matchesKey(data, "delete");
-			if (typing || deleting) r.input.setValue("");
-			if (deleting) return;
-			// any other key (arrows, home/end, …) just keeps the name and edits it in place
-		}
+		// ↑ re-shows the current name (rather than moving around this single line).
+		if (matchesKey(data, "up")) return restoreName(r.input, r.current);
 		r.input.handleInput(data);
 	}
 
@@ -2496,8 +2487,8 @@ class InboxComponent {
 		const foldHint = foldable ? [k("space", "workers")] : [];
 		const help = this.renaming
 			? [
-					k("type", this.renaming.replace ? "to replace" : "to edit"),
-					...(this.renaming.replace ? [k("←→", "edit instead")] : []),
+					k("type", "to edit"),
+					k("↑", "current name"),
 					k("enter", "save"),
 					k("esc", "cancel"),
 				].join(th.fg("dim", " · "))
@@ -2863,6 +2854,103 @@ class ConfirmComponent {
 				` ${th.fg("accent", "↑↓")} ${th.fg("dim", "choose")} · ${th.fg("accent", "enter")} ${th.fg("dim", "select")} · ${th.fg("accent", "y/n")} · ${th.fg("accent", "esc")} ${th.fg("dim", "no")}`,
 			),
 		);
+		out.push(b(`╰${"─".repeat(innerW)}╯`));
+		return out.slice(0, rows).map((l) => truncateToWidth(l, width));
+	}
+}
+
+/**
+ * Put a current name back in a rename box with the cursor at the front. `setValue` only clamps the
+ * cursor, so clearing first is what resets it — otherwise `↑` after typing left it mid-string.
+ */
+function restoreName(input: Input, name: string) {
+	input.setValue("");
+	input.setValue(name);
+}
+
+/**
+ * Full-screen rename prompt for `ctrl+r` / `/rename`: pi's `ctx.ui.input` only shows the current
+ * name as a placeholder, so it opens an empty box. This pre-fills the name instead, so you edit it
+ * rather than retype it; ↑ restores it after edits.
+ */
+class RenamePromptComponent implements Focusable {
+	private input = new Input();
+	private current: string;
+	private error?: string;
+	private _focused = false;
+	get focused() {
+		return this._focused;
+	}
+	set focused(v: boolean) {
+		this._focused = v;
+		this.input.focused = v;
+	}
+
+	constructor(
+		private tui: TUI,
+		private theme: Theme,
+		private done: (value: string | undefined) => void,
+		private title: string,
+		private detail: string,
+		current: string,
+		/** "(empty = …)" hint: an empty box means auto-title rather than a no-op. */
+		private emptyHint?: string,
+	) {
+		this.current = current;
+		this.input.setValue(current);
+		this.input.onSubmit = (value) => {
+			// An empty box is only a mistake when it has no meaning (auto-title is one).
+			if (value.trim() || this.emptyHint) return this.done(value);
+			this.error = "type a name — the box is empty (↑ brings the current one back)";
+			this.tui.requestRender();
+		};
+	}
+
+	invalidate() {}
+
+	handleInput(data: string) {
+		if (matchesKey(data, "escape")) return this.done(undefined);
+		if (matchesKey(data, "up")) {
+			this.error = undefined;
+			restoreName(this.input, this.current);
+			return this.tui.requestRender();
+		}
+		if (matchesKey(data, "enter") || data === "\n" || getKeybindings().matches(data, "tui.input.submit"))
+			return this.input.onSubmit?.(this.input.getValue());
+		this.error = undefined;
+		this.input.handleInput(data);
+		this.tui.requestRender();
+	}
+
+	render(width: number): string[] {
+		const th = this.theme;
+		const innerW = Math.max(20, width - 2);
+		const b = (s: string) => th.fg("borderMuted", s);
+		const line = (s: string) => b("│") + fit(s, innerW) + b("│");
+		const rows = Math.max(12, this.tui.terminal?.rows ?? 30);
+		const title = ` ${th.bold(th.fg("accent", `${orchestrating() ? "📥 Pi Inbox · orchestrator · " : ""}${this.title}`))} `;
+		const out = [
+			b("╭─") +
+				title +
+				b("─".repeat(Math.max(0, innerW - 1 - visibleWidth(title)))) +
+				b("╮"),
+		];
+		out.push(line(` ${th.fg("dim", this.detail)}`));
+		if (this.emptyHint) out.push(line(` ${th.fg("dim", this.emptyHint)}`));
+		out.push(line(""));
+		this.input.focused = this._focused;
+		out.push(line(` ${this.input.render(Math.max(10, innerW - 2))[0] ?? ""}`));
+		out.push(line(""));
+		while (out.length < rows - 2) out.push(line(""));
+		const foot = this.error
+			? th.fg("error", ` ✗ ${this.error}`)
+			: [
+					`${th.fg("accent", "type")} ${th.fg("dim", "to edit")}`,
+					`${th.fg("accent", "↑")} ${th.fg("dim", "current name")}`,
+					`${th.fg("accent", "enter")} ${th.fg("dim", "save")}`,
+					`${th.fg("accent", "esc")} ${th.fg("dim", "cancel")}`,
+				].join(th.fg("dim", " · "));
+		out.push(line(` ${foot}`));
 		out.push(b(`╰${"─".repeat(innerW)}╯`));
 		return out.slice(0, rows).map((l) => truncateToWidth(l, width));
 	}
@@ -4233,6 +4321,47 @@ export default function (pi: ExtensionAPI) {
 	installHangupGuard();
 	const uiState: UIState = { view: "inbox", query: "" };
 	let rowCache: Row[] = [];
+
+	/**
+	 * Text prompt for `ctrl+r` / `/rename`, pre-filled with the current name (↑ restores it).
+	 * In orchestrator mode this also keeps the prompt full-screen instead of dropping back to the
+	 * chat view; the non-TUI fallback keeps the plain dialog.
+	 */
+	async function promptRename(
+		ctx: ExtensionContext,
+		opts: { title: string; detail: string; current: string; emptyHint?: string },
+	): Promise<string | undefined> {
+		if (ctx.mode !== "tui" || !ctx.hasUI)
+			return ctx.ui.input(opts.title, opts.current);
+		return ctx.ui.custom<string | undefined>(
+			(tui, theme, _kb, done) => (
+				coverImagesUnderOverlays(tui),
+				new RenamePromptComponent(
+					tui,
+					theme,
+					done,
+					opts.title,
+					opts.detail,
+					opts.current,
+					opts.emptyHint,
+				)
+			),
+			{ overlay: true, overlayOptions: overlayOpts() },
+		);
+	}
+
+	// ctrl+r / `/rename` in a pi window ask here for their box (see rename-chat), so the name starts
+	// filled in rather than in a placeholder.
+	(globalThis as any)[Symbol.for("pi.inbox.rename-prompt")] = (
+		ctx: ExtensionContext,
+		opts: { title: string; current: string; emptyHint?: string },
+	) =>
+		promptRename(ctx, {
+			title: opts.title,
+			detail: `Current: ${opts.current || "(none)"}`,
+			current: opts.current,
+			emptyHint: opts.emptyHint,
+		});
 
 	async function pickGroup(
 		ctx: ExtensionContext,
