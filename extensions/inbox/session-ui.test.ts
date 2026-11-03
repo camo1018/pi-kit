@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
 	existsSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	mkdirSync,
 	rmSync,
@@ -1964,6 +1965,102 @@ test("first active prompt clones to empty history", async (t) => {
 	assert.ok(file, "empty clone must be persisted");
 	assert.equal(SessionManager.open(file).getBranch()
 		.filter((e) => e.type === "message").length, 0);
+});
+
+/** Session files on disk (the fixture keeps the main plus anything cloned). */
+function sessionFiles(): string[] {
+	return readdirSync(join(dir, "sessions")).flatMap((slug) =>
+		readdirSync(join(dir, "sessions", slug)).map((name) =>
+			join(dir, "sessions", slug, name)));
+}
+
+/** The list loop handles `c`/`C` after `done` and reopens a list, so poll then close it. */
+async function until(ok: () => boolean, what: string) {
+	for (let i = 0; i < 400 && !ok(); i++) await nextTick();
+	assert.ok(ok(), what);
+}
+
+async function closeReopened(f: any, previous: any, done: Promise<unknown>) {
+	for (let i = 0; i < 400 && f.overlay() === previous; i++) await nextTick();
+	assert.notEqual(f.overlay(), previous, "the inbox should reopen");
+	f.overlay().handleInput("\x1b");
+	await done;
+}
+
+test("c clones the selected row without opening it; C cancels", async (t) => {
+	const f = await setup(t);
+	const groups = new InboxGroups(dir);
+	const group = await groups.create("Reviews");
+	const main = f.main;
+	main.appendMessage({ role: "user", content: "clone me", timestamp: 3 });
+	await groups.assign(main.getSessionId(), group.id);
+	const before = readFileSync(main.getSessionFile()!, "utf8");
+	const beforeFiles = sessionFiles();
+	const { list, done } = await f.openInbox();
+	const index = list.visible.findIndex(
+		(row: any) => row.info.id === main.getSessionId(),
+	);
+	assert.notEqual(index, -1, "the current session is listed");
+	while (list.selected !== index) {
+		list.handleInput(list.selected < index ? "j" : "k");
+	}
+	list.handleInput("c");
+	// Clone only: nothing is switched to, and no agent view is opened.
+	assert.equal((f.ctx.switchSession as any).mock.calls.length, 0);
+	await until(
+		() => sessionFiles().length === beforeFiles.length + 1,
+		"the clone session file should exist",
+	);
+	const clone = sessionFiles().find((p) => !beforeFiles.includes(p))!;
+	assert.ok(clone);
+	const cloneId = SessionManager.open(clone).getSessionId();
+	assert.equal(groups.load().sessions[cloneId], group.id);
+	assert.match(SessionManager.open(clone).getSessionName()!, / - Clone$/);
+	// Cloning must not disturb the original session file.
+	assert.equal(readFileSync(main.getSessionFile()!, "utf8"), before);
+	await until(
+		() =>
+			f.ui.notify.mock.calls.some((call: any) =>
+				/Cloned/.test(String(call.arguments[0]))),
+		"the clone should be announced",
+	);
+	await closeReopened(f, list, done);
+});
+
+test("C cancels a running background agent and c does not", async (t) => {
+	const f = await setup(t);
+	const a = await f.visit("cancellable agent");
+	a.pending.push("queued reply");
+	const beforeFiles = sessionFiles();
+	const { list: first, done: firstDone } = await f.openInbox();
+	const index = first.visible.findIndex((row: any) => row.info.id === a.id);
+	while (first.selected !== index) {
+		first.handleInput(first.selected < index ? "j" : "k");
+	}
+	first.handleInput("c");
+	// Lowercase c cloned it instead of cancelling the run.
+	assert.equal(a.state, "working");
+	assert.deepEqual(a.pending, ["queued reply"]);
+	await until(
+		() => sessionFiles().length === beforeFiles.length + 1,
+		"c should write a clone",
+	);
+	await closeReopened(f, first, firstDone);
+
+	const { list, done } = await f.openInbox();
+	const row = list.visible.findIndex((r: any) => r.info.id === a.id);
+	while (list.selected !== row) {
+		list.handleInput(list.selected < row ? "j" : "k");
+	}
+	list.handleInput("C");
+	await nextTick();
+	// Cancelling asks first; answer the confirmation overlay.
+	assert.equal(f.overlay().constructor.name, "ConfirmComponent");
+	f.overlay().handleInput("y");
+	await nextTick();
+	assert.equal(a.state, "cancelled");
+	assert.deepEqual(a.pending, []);
+	await closeReopened(f, list, done);
 });
 
 test("deleted destinations preserve the draft and start no agent", async (t) => {

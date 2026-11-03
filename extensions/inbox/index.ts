@@ -18,7 +18,7 @@
  *   ctrl+w   pick a working directory: for a new agent (while typing its prompt / at home), and
  *            inside an attached/taken-over session: move that session to another directory
  *   d              move the selected session to another directory (orchestrator mode)
- *   c              cancel a running background agent
+ *   c              clone the selected session (c = clone, C = cancel in the list and agent view)
  *   p              pin / unpin   a           archive / unarchive (done)
  *   tab / 1 2 3 4  Inbox · Archived · All · Filtered    /  search (full-text)
  *   x              filter out / back in (overrides the rules in ~/.pi/agent/inbox-filters.json)
@@ -1430,6 +1430,7 @@ type InboxResult =
 	| { action: "view"; row: Row }
 	| { action: "new"; pickModel: boolean; /** Present when started with G on a row: explicit group join (id undefined = Ungrouped). */ rowGroup?: { id?: string } }
 	| { action: "cancel"; row: Row }
+	| { action: "clone"; row: Row }
 	| { action: "queue"; row: Row }
 	| { action: "movedir"; row: Row }
 	| { action: "groupView" }
@@ -1954,9 +1955,11 @@ class InboxComponent {
 						id: sessionGroup(this.groups, row.info.id)?.id,
 					},
 				});
-		} else if (ch === "c") {
+		} else if (ch === "C") {
 			if (row && isRunning(row.bg)) this.done({ action: "cancel", row });
 			else this.say("not a running background agent");
+		} else if (ch === "c") {
+			if (row) this.done({ action: "clone", row });
 		} else if (ch === "m") {
 			if (row?.bg?.pending.length) {
 				this.done({ action: "queue", row });
@@ -2021,7 +2024,7 @@ class InboxComponent {
 				);
 			else if (row)
 				this.say(
-					"wait for the agent to finish (or cancel it with c) before moving it",
+					"wait for the agent to finish (or cancel it with C) before moving it",
 				);
 		} else if (ch === "?") {
 			this.done({ action: "help" });
@@ -2509,7 +2512,8 @@ class InboxComponent {
 							k("N", "new (pick model)"),
 							k("G", "new (in this group)"),
 							k("v", "peek"),
-							...(isRunning(r?.bg) ? [k("c", "cancel")] : []),
+							...(isRunning(r?.bg) ? [k("C", "cancel")] : []),
+							...(r ? [k("c", "clone")] : []),
 							...(r?.bg?.pending.length
 								? [k("m", "manage queue")]
 								: []),
@@ -2540,7 +2544,8 @@ class InboxComponent {
 							k("o", "open here"),
 							k("n", "new agent"),
 							k("G", "new (in this group)"),
-							...(isRunning(r?.bg) ? [k("c", "cancel")] : []),
+							...(isRunning(r?.bg) ? [k("C", "cancel")] : []),
+							...(r ? [k("c", "clone")] : []),
 							...(r?.bg?.pending.length
 								? [k("m", "manage queue")]
 								: []),
@@ -5174,7 +5179,7 @@ export default function (pi: ExtensionAPI) {
 		const dir = typeof o.dir === "string" ? o.dir : undefined;
 		if (!id || !dir) return;
 		if (isRunning(getAgent(id)))
-			return ctx.ui.notify("That agent is working: wait for it to finish or stop it (c) before moving it.", "warning");
+			return ctx.ui.notify("That agent is working: wait for it to finish or stop it (C) before moving it.", "warning");
 		const live = readLive().get(id);
 		const ours = live && (live.pid === process.pid || live.pid === getAgent(id)?.pid || live.bgParent === process.pid);
 		if (live && !ours) {
@@ -5568,6 +5573,55 @@ export default function (pi: ExtensionAPI) {
 				continue;
 			}
 
+			if (result.action === "clone") {
+				const row = result.row;
+				const file = row.info.path || getAgent(row.info.id)?.sessionFile;
+				if (!file || !fs.existsSync(file)) {
+					ctx.ui.notify(
+						"That session isn't saved yet — nothing to clone.",
+						"warning",
+					);
+					continue;
+				}
+				// Cut before the active prompt of a working agent, exactly like `/clone` on an
+				// attached session: the original run keeps going and its current work is excluded.
+				const agent = getAgent(row.info.id);
+				const leaf = isRunning(agent)
+					? beforeRun(SessionManager.open(file), agent!)
+					: SessionManager.open(file).getLeafId();
+				if (leaf === undefined) {
+					ctx.ui.notify(
+						"Can't locate the run's checkpoint, so nothing was cloned.",
+						"warning",
+					);
+					continue;
+				}
+				let clone: { file: string; id: string; name: string };
+				try {
+					clone = await writeClone({
+						file,
+						sessionDir: path.dirname(file),
+						leaf,
+						groupId: sessionGroup(readGroups(), row.info.id)?.id,
+					});
+				} catch (e) {
+					ctx.ui.notify(
+						`Clone failed: ${e instanceof Error ? e.message : String(e)}.`,
+						"error",
+					);
+					continue;
+				}
+				uiState.view = "inbox";
+				uiState.selectedId = clone.id;
+				rowCache = await loadRows(viewed.id, viewWantsArchived(uiState.view));
+				(globalThis as any)[ROWS_KEY] = rowCache;
+				ctx.ui.notify(
+					`⧉ Cloned ${coloredName(ctx.ui.theme, row.info.id, row.title.slice(0, 50))} → ${coloredName(ctx.ui.theme, clone.id, clone.name.slice(0, 60))}`,
+					"info",
+				);
+				continue;
+			}
+
 			if (result.action === "queue") {
 				await manageQueue(ctx, result.row.info.id, result.row.title);
 				rowCache = await loadRows(
@@ -5589,7 +5643,7 @@ export default function (pi: ExtensionAPI) {
 						live.bgParent === process.pid);
 				if (isRunning(getAgent(row.info.id))) {
 					ctx.ui.notify(
-						"That agent is working: wait for it to finish or cancel it (c) before moving it.",
+						"That agent is working: wait for it to finish or cancel it (C) before moving it.",
 						"warning",
 					);
 					continue;
@@ -5852,7 +5906,7 @@ export default function (pi: ExtensionAPI) {
 				if (isRunning(getAgent(row.info.id))) {
 					if (!orchestrating()) {
 						ctx.ui.notify(
-							"That agent is still working: wait for it to finish, or cancel it (c), then open it here.",
+							"That agent is still working: wait for it to finish, or cancel it (C), then open it here.",
 							"warning",
 						);
 						continue;
@@ -6175,6 +6229,62 @@ export default function (pi: ExtensionAPI) {
 		return { cancel: true };
 	});
 
+	/**
+	 * Write a clone of a session file at `leaf` (`null` = empty history). The caller resolves the
+	 * leaf, so a working background agent can be cut before its active prompt. `/clone` switches
+	 * to the result; the list's `c` only selects it, so this returns instead of switching.
+	 */
+	async function writeClone(opts: {
+		file: string;
+		sessionDir: string;
+		leaf: string | null;
+		groupId?: string;
+	}): Promise<{ file: string; id: string; name: string }> {
+		const sm = SessionManager.open(opts.file, opts.sessionDir);
+		const name = branchName(sourceName(sm), "Clone");
+		// A first-ever prompt has no parent: produce an empty, named clone.
+		const cloned =
+			opts.leaf === null
+				? (() => {
+						const empty = SessionManager.create(
+							sm.getCwd(),
+							opts.sessionDir,
+						);
+						empty.newSession({ parentSession: opts.file });
+						empty.appendSessionInfo(name);
+						const destination = empty.getSessionFile()!;
+						// Pi defers saving setup-only sessions until a user prompt.
+						// This explicit empty clone must be reopenable right away.
+						fs.writeFileSync(
+							destination,
+							[empty.getHeader(), ...empty.getEntries()]
+								.map((entry) => JSON.stringify(entry))
+								.join("\n") + "\n",
+							{ flag: "wx" },
+						);
+						return destination;
+					})()
+				: sm.createBranchedSession(opts.leaf);
+		if (!cloned || !fs.existsSync(cloned))
+			throw new Error("couldn't write the new session");
+		SessionManager.open(cloned).appendSessionInfo(name);
+		const id = SessionManager.open(cloned, opts.sessionDir).getSessionId();
+		try {
+			// Mark the clone: its tail ends at a tool result, which the inbox would otherwise
+			// call stalled/working until it has activity of its own.
+			updateMeta(id, (m) => {
+				m.clonedAt = Date.now();
+			});
+			// The clone inherits the original's group. `/clone` switches here, which fires
+			// session_start with reason "resume" (not "fork"), where native fork inheritance
+			// can't see it.
+			if (opts.groupId) await inboxGroups.assign(id, opts.groupId);
+		} catch {
+			// best effort — only the status badge and the clone's group are affected
+		}
+		return { file: cloned, id, name };
+	}
+
 	/** Clone without including any work from the active background prompt. */
 	async function cloneLatest(ctx: ExtensionCommandContext) {
 		const file = ctx.sessionManager.getSessionFile();
@@ -6197,49 +6307,23 @@ export default function (pi: ExtensionAPI) {
 				"warning",
 			);
 		}
-		const name = branchName(sourceName(sm), "Clone");
 		const behind = sm.getLeafId() !== leaf;
-		// A first-ever prompt has no parent: produce an empty, named clone.
-		const cloned =
-			leaf === null
-				? (() => {
-						const empty = SessionManager.create(
-							sm.getCwd(),
-							ctx.sessionManager.getSessionDir(),
-						);
-						empty.newSession({ parentSession: file });
-						empty.appendSessionInfo(name);
-						const destination = empty.getSessionFile()!;
-						// Pi defers saving setup-only sessions until a user prompt.
-						// This explicit empty clone must be reopenable right away.
-						fs.writeFileSync(
-							destination,
-							[empty.getHeader(), ...empty.getEntries()]
-								.map((entry) => JSON.stringify(entry))
-								.join("\n") + "\n",
-							{ flag: "wx" },
-						);
-						return destination;
-					})()
-				: sm.createBranchedSession(leaf);
-		if (!cloned || !fs.existsSync(cloned)) return ctx.ui.notify("Clone failed: couldn't write the new session.", "error");
-		SessionManager.open(cloned).appendSessionInfo(name);
+		let clone: { file: string; id: string; name: string };
 		try {
-			// Mark the clone: its tail ends at a tool result, which the inbox would otherwise
-			// call stalled/working until it has activity of its own.
-			const cloneId = SessionManager.open(cloned, ctx.sessionManager.getSessionDir()).getSessionId();
-			updateMeta(cloneId, (m) => {
-				m.clonedAt = Date.now();
+			clone = await writeClone({
+				file,
+				sessionDir: ctx.sessionManager.getSessionDir(),
+				leaf,
+				// sessionGroup returns the Group itself; assign() wants its id.
+				groupId: sessionGroup(readGroups(), ctx.sessionManager.getSessionId())?.id,
 			});
-			// The clone inherits the original's group. This switch fires session_start with
-			// reason "resume" (not "fork"), where native fork inheritance can't see it.
-			const sourceId = ctx.sessionManager.getSessionId();
-			const group = sessionGroup(readGroups(), sourceId);
-			if (group) await inboxGroups.assign(cloneId, group.id);
-		} catch {
-			// best effort — only the status badge and the clone's group are affected
+		} catch (e) {
+			return ctx.ui.notify(
+				`Clone failed: ${e instanceof Error ? e.message : String(e)}.`,
+				"error",
+			);
 		}
-		await ctx.switchSession(cloned, {
+		await ctx.switchSession(clone.file, {
 			withSession: async (c) => {
 				c.ui.notify(
 					behind

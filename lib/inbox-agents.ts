@@ -1704,7 +1704,7 @@ export class AgentViewComponent {
 		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || ch === "q") return this.done({ action: "close" });
 		if (this.kb.matches(data, "tui.select.confirm") || matchesKey(data, "enter") || ch === "r") return this.done({ action: "reply" });
 		if (ch === "o") return this.done({ action: "takeover" });
-		if (ch === "c") {
+		if (ch === "C") {
 			if (isRunning(getAgent(this.target.id))) return this.done({ action: "cancel" });
 			this.say("agent isn't running", "err");
 		} else if (matchesKey(data, "up") || ch === "k") scrollBy(-1);
@@ -1780,7 +1780,7 @@ export class AgentViewComponent {
 		const help = [
 			k("enter/r", "reply"),
 			k("o", "open here"),
-			...(isRunning(a) ? [k("c", "cancel")] : []),
+			...(isRunning(a) ? [k("C", "cancel")] : []),
 			k("↑↓ PgUp PgDn", "scroll"),
 			k("esc", "close"),
 		].join(
