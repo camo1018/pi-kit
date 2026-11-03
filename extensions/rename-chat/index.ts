@@ -117,9 +117,9 @@ function autoTitleHint(label: string): string | undefined {
 }
 
 /**
- * Open the rename box. The inbox extension registers `pi.inbox.rename-prompt` to pre-fill the
- * current name (↑ restores it); without it, pi's own dialog puts the name in a placeholder and
- * opens empty.
+ * Open the rename box. The inbox extension registers `pi.inbox.rename-prompt` for a full-screen
+ * prompt whose box starts empty and fills in the current name on ↑; without it, pi's own dialog
+ * puts the name in a placeholder instead.
  */
 function renameAsker(
 	ctx: ExtensionContext,
@@ -316,8 +316,8 @@ export default function renameChatExtension(pi: ExtensionAPI) {
 		handler: async (ctx) => {
 			const ask = renameAsker(ctx);
 			const clean = cleanName;
-			// Orchestrator: name the viewed session or a pending new agent. Both boxes are pre-filled
-			// with the current name (↑ restores it after edits).
+			// Orchestrator: name the viewed session or a pending new agent. Both boxes start empty;
+			// ↑ fills in the current name on demand.
 			const hook = (globalThis as any)[Symbol.for("pi.inbox.rename-target")];
 			const inbox = typeof hook === "function" ? hook(ctx) : undefined;
 			if (inbox) {

@@ -1809,11 +1809,10 @@ class InboxComponent {
 		this.rebuild();
 	}
 
-	/** The current name is pre-filled, so you can edit it instead of retyping; ↑ restores it. */
+	/** Inline rename of the selected row. The box starts empty; ↑ fills in the current name. */
 	private startRename(row: Row) {
 		const current = row.info.name || cleanTitle(row.title).slice(0, 60);
 		const input = new Input({ prompt: this.theme.fg("accent", "✎ ") });
-		input.setValue(current);
 		const id = row.info.id;
 		input.onEscape = () => {
 			this.renaming = undefined;
@@ -1846,7 +1845,8 @@ class InboxComponent {
 			r.input.onSubmit?.(r.input.getValue());
 			return;
 		}
-		// ↑ re-shows the current name (rather than moving around this single line).
+		// ↑ fills in the current name (rather than moving around this single line), so an unchanged
+		// name is one keystroke away and a fresh name needs no clearing first.
 		if (matchesKey(data, "up")) return restoreName(r.input, r.current);
 		r.input.handleInput(data);
 	}
@@ -2487,8 +2487,8 @@ class InboxComponent {
 		const foldHint = foldable ? [k("space", "workers")] : [];
 		const help = this.renaming
 			? [
-					k("type", "to edit"),
-					k("↑", "current name"),
+					k("type", "new name"),
+					k("↑", "reuse current"),
 					k("enter", "save"),
 					k("esc", "cancel"),
 				].join(th.fg("dim", " · "))
@@ -2860,8 +2860,9 @@ class ConfirmComponent {
 }
 
 /**
- * Put a current name back in a rename box with the cursor at the front. `setValue` only clamps the
- * cursor, so clearing first is what resets it — otherwise `↑` after typing left it mid-string.
+ * Fill a rename box with the current name, cursor at the front, from an input that may already hold
+ * text. `setValue` only clamps the cursor, so clearing first is what resets it — otherwise ↑ after
+ * typing left the cursor mid-string and produced a corrupted name.
  */
 function restoreName(input: Input, name: string) {
 	input.setValue("");
@@ -2869,9 +2870,9 @@ function restoreName(input: Input, name: string) {
 }
 
 /**
- * Full-screen rename prompt for `ctrl+r` / `/rename`: pi's `ctx.ui.input` only shows the current
- * name as a placeholder, so it opens an empty box. This pre-fills the name instead, so you edit it
- * rather than retype it; ↑ restores it after edits.
+ * Full-screen rename prompt for `ctrl+r` / `/rename`, so the prompt stays full-screen in
+ * orchestrator mode instead of dropping back to the chat view. The box starts empty; ↑ fills in the
+ * current name on demand.
  */
 class RenamePromptComponent implements Focusable {
 	private input = new Input();
@@ -2897,11 +2898,10 @@ class RenamePromptComponent implements Focusable {
 		private emptyHint?: string,
 	) {
 		this.current = current;
-		this.input.setValue(current);
 		this.input.onSubmit = (value) => {
 			// An empty box is only a mistake when it has no meaning (auto-title is one).
 			if (value.trim() || this.emptyHint) return this.done(value);
-			this.error = "type a name — the box is empty (↑ brings the current one back)";
+			this.error = "type a name — or ↑ to reuse the current one";
 			this.tui.requestRender();
 		};
 	}
