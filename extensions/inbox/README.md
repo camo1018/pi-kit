@@ -243,6 +243,23 @@ A new background agent runs in this window's directory by default — that's whe
 - **`d` on a session in the orchestrator list** moves that session to another directory: rewrites its stored `cwd`, re-files the `.jsonl` under the new directory's session folder, and re-points its background agent (if any) so the next reply runs there. Blocked while the agent is working (`C` to cancel first, or wait) or while the session is open in another window. If this window holds the session, it reopens it at the new path. Useful when a session started in the wrong repo, or a project moved. (Outside orchestrator mode, `d` is still archive.)
 - **`ctrl+w` while inside an attached or taken-over session** does the same for the session on screen: pick a directory and it's re-homed (the chat reopens at the new path, any text you were typing stays in the editor). Same guards: its background run must be idle. In a normal (non-orchestrator) window, `ctrl+w` keeps its usual delete-word meaning.
 
+## Footer
+
+The footer's first line leads with the session's group, then its name, while
+the directory and git branch move to the right-hand side of the window:
+
+```text
+GSI Data Platform • EC Feedback Follow-up PRs      ~/…/notes-hide-machine/tickets (ppark/feat/notes-hide-machine)
+```
+
+Ungrouped sessions drop the group and lead with the name. Paths are
+abbreviated to their last two segments (`…/parent/leaf`) so the line stays
+readable in narrow windows; when space runs out the branch goes first, then
+the directory, and the group and title are truncated last. Pin, archive, and
+manual-filter state stay on the footer's status line underneath. This only
+changes how the built-in footer draws its first line (see `footer.ts`); the
+model, context, cost, and extension statuses are unchanged.
+
 ## Views
 
 - **Inbox**: everything not archived. Pinned sessions sit in a `★ PINNED` section at the top, newest pin first. The rest are sorted by last activity. There's no separate agents section: background agents stay in place, and the status column plus the unread `•` tell you which ones need you.
@@ -565,6 +582,8 @@ methods or undocumented file layout. Last verified on **Pi 0.99.1**.
 | `json-mode-events` | `pi --mode json` emits `agent_start`, `tool_execution_start/end`, `message_update`, `message_end`, `auto_retry_start/end`, `compaction_start` (documented in `docs/json.md`) | Live status/transcript of background agents | Agent view goes blank or status sticks |
 | `visit-model-selectors` | Native `ModelSelectorComponent` / `ThinkingSelectorComponent` exports; model picker uses a read-only registry facade (`getAvailableSnapshot`, `getModel`, `getError`, `refresh`) | Model/thinking controls for visited sessions | Picker errors are reported without mutating the taken-over main |
 | `visit-chat-container` | pi-tui `Container` keeps plain-array `children` + `addChild/removeChild/clear` semantics | Sticky-takeover visits (`lib/visit-runtime.ts`): stash the main's live chat tree, mount the visit view, restore on return | Visiting is refused so the taken-over main cannot be interrupted; `/compat` names it |
+| `footer-render` | `FooterComponent#render` (patched on the prototype) and `#setSession` (visits swap it) | `extensions/inbox/footer.ts`: the footer's first line leads with the group and session name, with the directory and branch right-aligned | The footer goes back to pi's `~/path (branch) • session name` order; the rest of the inbox works |
+| `footer-patch-installed` | The patch actually installed (shared state on `globalThis[Symbol.for("pi.ext.inbox.footer")]`) | Same | Same, silently |
 
 Other assumptions (not probed):
 
