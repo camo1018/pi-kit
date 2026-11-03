@@ -353,6 +353,28 @@ async function setup(t: TestContext, takenOver = true) {
 		return { list: overlay, done };
 	}
 
+	/**
+	 * Run a rename entry point (`ctrl+r`, `/rename`) through the prompt it opens: asserts the box is
+	 * pre-filled with `expectedCurrent`, then types `typed` and submits.
+	 */
+	async function renameViaPrompt(
+		start: () => Promise<void>,
+		expectedCurrent: string,
+		typed: string,
+	) {
+		const previous = overlay;
+		const pending = start();
+		for (let i = 0; i < 200 && overlay === previous; i++)
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		assert.notEqual(overlay, previous, "the rename prompt should open");
+		const prompt = overlay;
+		assert.equal(prompt.constructor.name, "RenamePromptComponent");
+		assert.equal(prompt.input.getValue(), expectedCurrent);
+		prompt.handleInput(typed);
+		prompt.handleInput("\r");
+		await pending;
+	}
+
 	return {
 		commands,
 		shortcuts,
@@ -369,6 +391,7 @@ async function setup(t: TestContext, takenOver = true) {
 		editor,
 		visit,
 		widgets,
+		renameViaPrompt,
 		autocomplete: () => autocomplete,
 		key: (data: string) => {
 			for (const handler of terminalInputs) {
@@ -812,8 +835,12 @@ test("interactive rename follows the view but agent tools stay on their runtime"
 	assert.equal(savedName(), "renamed in the list");
 	await f.commands.get("rename").handler("renamed via command", f.ctx);
 	assert.equal(savedName(), "renamed via command");
-	await f.shortcuts.get("ctrl+r").handler(f.ctx);
-	assert.equal(savedName(), "renamed via shortcut");
+	await f.renameViaPrompt(
+		() => f.shortcuts.get("ctrl+r").handler(f.ctx),
+		"renamed via command",
+		"",
+	);
+	assert.equal(savedName(), "renamed via command");
 	assert.equal((f.pi.setSessionName as any).mock.calls.length, 0);
 
 	// A tool call from the running main must not rename whatever we are viewing.
@@ -827,7 +854,62 @@ test("interactive rename follows the view but agent tools stay on their runtime"
 			f.ctx,
 		);
 	assert.equal(f.main.getSessionName(), "main renamed by its agent");
-	assert.equal(savedName(), "renamed via shortcut");
+	assert.equal(savedName(), "renamed via command");
+});
+
+test("inline rename pre-fills the current name and ↑ restores it", async (t) => {
+	const f = await setup(t);
+	const visited = await f.visit("original visited title", false);
+	const { list, done } = await f.openInbox();
+	// Select the viewed row, then start the inline rename.
+	const index = list.visible.findIndex((r: any) => r.info.id === visited.id);
+	assert.notEqual(index, -1);
+	while (list.selected !== index)
+		list.handleInput(list.selected < index ? "j" : "k");
+	list.handleInput("r");
+	assert.ok(list.renaming, "r should start an inline rename");
+	// The whole current name is in the box, ready to edit rather than retype.
+	const name = "original visited title";
+	assert.equal(list.renaming.input.getValue(), name);
+	// Typing edits in place (the cursor sits at the front), then ↑ brings the name back.
+	list.handleInput("II ");
+	assert.equal(list.renaming.input.getValue(), `II ${name}`);
+	list.handleInput("\x1b[A");
+	assert.equal(list.renaming.input.getValue(), name);
+	// Backspace is a no-op at the front (it used to wipe the whole box).
+	list.handleInput("\x7f");
+	assert.equal(list.renaming.input.getValue(), name);
+	// Deleting forward trims the name in place.
+	for (let i = 0; i < "original ".length; i++) list.handleInput("\x1b[3~");
+	assert.equal(list.renaming.input.getValue(), "visited title");
+	list.handleInput("\r");
+	assert.equal(list.renaming, undefined, "enter saves and ends the inline rename");
+	list.handleInput("\x1b");
+	await done;
+	assert.equal(
+		SessionManager.open(visited.sessionFile!).getSessionName(),
+		"visited title",
+	);
+});
+
+test("ctrl+r and /rename open pre-filled with the current name", async (t) => {
+	const f = await setup(t);
+	const visited = await f.visit("shortcut target", false);
+	const savedName = () =>
+		SessionManager.open(visited.sessionFile!).getSessionName();
+
+	await f.renameViaPrompt(
+		() => f.shortcuts.get("ctrl+r").handler(f.ctx),
+		"shortcut target",
+		"v2: ",
+	);
+	assert.equal(savedName(), "v2: shortcut target");
+	await f.renameViaPrompt(
+		() => f.commands.get("rename").handler("", f.ctx),
+		"v2: shortcut target",
+		"v3: ",
+	);
+	assert.equal(savedName(), "v3: v2: shortcut target");
 });
 
 test("pin and archive target the viewed session", async (t) => {
