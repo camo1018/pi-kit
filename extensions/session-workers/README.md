@@ -40,6 +40,21 @@ explicitly asks to parallelize, delegate, or fan out — never on the agent's
 own initiative. If a session starts workers you did not ask for, treat that
 as a bug in the guideline wording, not an invitation.
 
+## Short form: `$orchestrate`
+
+The bundled `orchestrate` skill uses the same delegation layer with a stricter
+role split: the parent stays in the planning layer and workers do all
+retrieval, synthesis, implementation, and validation.
+
+```text
+$orchestrate research this bug and propose a fix
+```
+
+Use `/skill:orchestrate <task>` without `inline-skills`, or append
+`$orchestrate` to an existing request. Choose it over `$parallel` when the
+parent should plan, write handoffs, judge evidence, and decide rather than
+contribute hands-on work itself.
+
 ## Tool: `session_workers`
 
 | Action | Inputs | Behavior |

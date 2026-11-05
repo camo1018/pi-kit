@@ -132,6 +132,23 @@ Requires `session-workers`; `$parallel` also needs `inline-skills`. The skill
 ships in `skills/parallel/SKILL.md`. Reload to refresh skill commands and
 completion in an existing window; new background runs discover it automatically.
 
+### Orchestrated fan-out: `$orchestrate`
+
+Use `$orchestrate <task>` when the parent should stop doing hands-on work:
+
+```text
+$orchestrate research the retry bug and propose a fix
+```
+
+Like `$parallel` it accepts the shorthand at the start or end of a request;
+`/skill:orchestrate <task>` works without `inline-skills`. The difference is
+the role split. With `$parallel` the parent still participates while workers
+handle slices of the job. With `$orchestrate` the parent stays in planning:
+it plans, writes handoffs, coordinates, judges evidence, and makes the
+decision, while workers do all retrieval, source-grounded synthesis,
+implementation, and validation. A task that merely looks parallelizable is not
+a reason to use either skill; both are opt-in on an explicit request.
+
 ## Config
 
 - `config/keybindings.json`: `cmd/ctrl+enter` submits, `enter` adds a newline.
