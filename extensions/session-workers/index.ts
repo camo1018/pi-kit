@@ -12,6 +12,13 @@ import {
 import { installBackgroundMcpAutoApproval } from "../../lib/background-mcp-approval.ts";
 import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 import { bounded, WorkerTeam } from "./workers.ts";
+import {
+	installWorkerWake,
+	resetWakeBudget,
+	uninstallWorkerWake,
+	WAKE_CUSTOM_TYPE,
+	type WakeOptions,
+} from "./wake.ts";
 
 const CUSTOM_TYPE = "pi-kit:worker-notes";
 
@@ -94,6 +101,7 @@ const Parameters = Type.Object({
 export function registerSessionWorkers(
 	pi: ExtensionAPI,
 	team = new WorkerTeam(getAgentDir()),
+	wake: WakeOptions = {},
 ): void {
 	registerLoadedExtension("session-workers");
 	const extensionPath = fileURLToPath(import.meta.url);
@@ -109,6 +117,20 @@ export function registerSessionWorkers(
 		) {
 			team.supervise(caller);
 		}
+		// A settled team wakes an idle parent once, so it can spawn and end its
+		// turn instead of polling `wait` (each poll return costs a full turn).
+		installWorkerWake(pi, ctx, team, wake);
+	});
+
+	pi.on("session_shutdown", () => {
+		uninstallWorkerWake();
+	});
+
+	pi.on("input", (event) => {
+		// Only real user input reopens the wake budget; extension sends bypass
+		// this hook, so a wake cannot re-arm itself.
+		if (event.source !== "extension") resetWakeBudget();
+		return { action: "continue" as const };
 	});
 
 	const lastFingerprints = new Map<string, string>();
@@ -116,11 +138,24 @@ export function registerSessionWorkers(
 	pi.on("context", (event, ctx) => {
 		if (process.env.BIGBRAIN_MAINT === "1") return;
 		const sessionId = ctx.sessionManager.getSessionId();
+		// Keep only the newest wake: it stays in the transcript and would
+		// otherwise cost a little context on every later request.
+		let newestWake = -1;
+		event.messages.forEach((message, index) => {
+			if (
+				message.role === "custom" &&
+				message.customType === WAKE_CUSTOM_TYPE
+			) {
+				newestWake = index;
+			}
+		});
 		const messages = event.messages.filter(
-			(message) =>
+			(message, index) =>
 				!(
 					message.role === "custom" &&
-					message.customType === CUSTOM_TYPE
+					(message.customType === CUSTOM_TYPE ||
+						(message.customType === WAKE_CUSTOM_TYPE &&
+							index !== newestWake))
 				),
 		);
 		const content = team.context(sessionId);
@@ -150,7 +185,9 @@ export function registerSessionWorkers(
 			"Delegate parallel work to persistent Pi sessions, only on " +
 			"explicit user request. " +
 			"spawn returns immediately; list/read show results, wait waits " +
-			"up to 60 seconds for one worker or the team. send queues a " +
+			"up to 60 seconds for one worker or the team. The parent is woken " +
+			"automatically once when the whole team settles, so prefer " +
+			"spawning and ending your turn over polling wait. send queues a " +
 			"follow-up (not mid-run steering); cancel clears its queue. " +
 			"share publishes a team note; retract removes a note by noteId; " +
 			"notes reads the shared board. " +
@@ -174,6 +211,9 @@ export function registerSessionWorkers(
 			"Shared notes refresh on model requests, not during a running " +
 				"tool. An idle worker may be blocked; inspect its reply. " +
 				"Check all worker results before declaring the task complete.",
+			"After spawning, end your turn instead of polling. A settled " +
+				"team wakes you exactly once; re-read every worker reply then. " +
+				"Use wait only when you need a bounded in-turn check.",
 		],
 		parameters: Parameters,
 		executionMode: "sequential",

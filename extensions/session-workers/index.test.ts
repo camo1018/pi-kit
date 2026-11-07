@@ -9,15 +9,22 @@ import {
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentEvent } from "../../lib/inbox-agents.ts";
 import { registerSessionWorkers } from "./index.ts";
+import { resetWakeListeners } from "./wake.ts";
 import { setup } from "./test-utils.ts";
 
 function harness(
 	t: TestContext,
-	options: { settings?: Record<string, unknown> } = {},
+	options: {
+		settings?: Record<string, unknown>;
+		debounceMs?: number;
+	} = {},
 ) {
 	const s = setup(t);
 	const handlers = new Map<string, unknown>();
+	const sent: { message: any; options: any }[] = [];
+	let failSend = false;
 	let tool: ToolDefinition | undefined;
 	const pi = {
 		on(name: string, handler: unknown) {
@@ -27,8 +34,25 @@ function harness(
 			tool = definition;
 		},
 		getSettings: () => options.settings ?? {},
+		sendMessage(message: any, sendOptions: any) {
+			if (failSend) throw new Error("stale context");
+			sent.push({ message, options: sendOptions });
+		},
 	} as unknown as ExtensionAPI;
-	registerSessionWorkers(pi, s.team);
+	// Tests drive agent events directly; the process-wide registry would leak
+	// state between cases.
+	let emit: ((event: AgentEvent) => void) | undefined;
+	resetWakeListeners();
+	t.after(() => resetWakeListeners());
+	registerSessionWorkers(pi, s.team, {
+		subscribe(fn) {
+			emit = fn;
+			return () => {
+				emit = undefined;
+			};
+		},
+		debounceMs: options.debounceMs ?? 0,
+	});
 	let caller = "parent";
 	const ctx = {
 		cwd: s.dir,
@@ -60,6 +84,20 @@ function harness(
 		) => void;
 		handler({}, ctx);
 	};
+	const shutdown = () => {
+		const handler = handlers.get("session_shutdown") as (
+			event: unknown,
+			ctx: ExtensionToolContext,
+		) => void;
+		handler({ reason: "quit" }, ctx);
+	};
+	const input = (source: "interactive" | "extension" = "interactive") => {
+		const handler = handlers.get("input") as (
+			event: { source: string },
+			ctx: ExtensionToolContext,
+		) => void;
+		handler({ source }, ctx);
+	};
 	return {
 		...s,
 		tool,
@@ -67,6 +105,17 @@ function harness(
 		context,
 		ctx,
 		start,
+		shutdown,
+		input,
+		sent,
+		setFailSend(value: boolean) {
+			failSend = value;
+		},
+		emit(event: AgentEvent) {
+			assert.ok(emit, "worker wake listener is not installed");
+			emit(event);
+		},
+		hasListener: () => !!emit,
 		switchTo(id: string) {
 			caller = id;
 		},
@@ -396,4 +445,250 @@ test("memory maintenance cannot delegate", async (t) => {
 	assert.equal(await s.context([]), undefined);
 	assert.equal(s.calls.length, 0);
 	assert.equal(s.supervision.length, 0);
+});
+
+/** The wake evaluation is debounced, so every settle needs a macrotask. */
+const tick = () => new Promise((resolve) => setTimeout(resolve, 10));
+
+async function settle(
+	s: ReturnType<typeof harness>,
+	id: string,
+	patch = {},
+) {
+	const agent = s.agents.get(id);
+	assert.ok(agent);
+	Object.assign(agent, {
+		state: "idle",
+		proc: undefined,
+		pending: [],
+		...patch,
+	});
+	s.emit({ type: "finished", agent } as AgentEvent);
+	await tick();
+}
+
+function working(s: ReturnType<typeof harness>, id: string) {
+	const agent = s.agents.get(id);
+	assert.ok(agent);
+	agent.state = "working";
+	agent.proc = { kill() {} };
+}
+
+/** The hook only wakes after it has seen the team busy at least once. */
+async function arm(s: ReturnType<typeof harness>, id: string) {
+	working(s, id);
+	s.emit({ type: "changed" });
+	await tick();
+}
+
+test("wake fires exactly once when the last worker settles", async (t) => {
+	const s = harness(t);
+	s.start();
+	const first = await s.spawn();
+	const second = await s.spawn();
+	await settle(s, first.id);
+	assert.equal(s.sent.length, 0);
+	await settle(s, second.id);
+	assert.equal(s.sent.length, 1);
+	const [{ message, options }] = s.sent;
+	assert.equal(message.customType, "pi-kit:worker-wake");
+	assert.equal(message.display, false);
+	assert.equal(options.triggerTurn, true);
+	assert.equal(options.deliverAs, "followUp");
+	assert.match(message.content, /have settled/);
+	assert.equal(message.details.workers.length, 2);
+});
+
+test("no wake when the team never ran", (t) => {
+	const s = harness(t);
+	s.start();
+	// No worker is registered in this team, so nothing can arm the hook.
+	s.emit({ type: "changed" });
+	assert.equal(s.sent.length, 0);
+});
+
+test("no wake while a sibling is still working", async (t) => {
+	const s = harness(t);
+	s.start();
+	const first = await s.spawn();
+	const second = await s.spawn();
+	await settle(s, first.id);
+	working(s, second.id);
+	s.emit({ type: "changed" });
+	assert.equal(s.sent.length, 0);
+});
+
+test("run_end with queued messages is not a settle", async (t) => {
+	const s = harness(t);
+	s.start();
+	const worker = await s.spawn();
+	const agent = s.agents.get(worker.id);
+	assert.ok(agent);
+	Object.assign(agent, {
+		state: "queued",
+		proc: undefined,
+		pending: ["continue"],
+	});
+	s.emit({ type: "run_end", agent } as AgentEvent);
+	assert.equal(s.sent.length, 0);
+});
+
+test("a worker error still wakes and reports the error", async (t) => {
+	const s = harness(t);
+	s.start();
+	const worker = await s.spawn();
+	await arm(s, worker.id);
+	await settle(s, worker.id, { state: "error", error: "boom" });
+	assert.equal(s.sent.length, 1);
+	assert.match(JSON.stringify(s.sent[0].message), /boom/);
+});
+
+test("a cancelled worker wakes through the changed event", async (t) => {
+	const s = harness(t);
+	s.start();
+	const worker = await s.spawn();
+	await arm(s, worker.id);
+	await settle(s, worker.id, { state: "cancelled" });
+	s.emit({ type: "changed" });
+	assert.equal(s.sent.length, 1);
+});
+
+test("two settles in one debounce window coalesce to one wake", async (t) => {
+	const s = harness(t, { debounceMs: 5 });
+	s.start();
+	const first = await s.spawn();
+	const second = await s.spawn();
+	await settle(s, first.id);
+	await settle(s, second.id);
+	await new Promise((resolve) => setTimeout(resolve, 40));
+	assert.equal(s.sent.length, 1);
+});
+
+test("an unchanged terminal state never wakes twice", async (t) => {
+	const s = harness(t);
+	s.start();
+	const worker = await s.spawn();
+	await arm(s, worker.id);
+	await settle(s, worker.id);
+	assert.equal(s.sent.length, 1);
+	s.emit({ type: "changed" });
+	await tick();
+	await settle(s, worker.id);
+	s.emit({ type: "changed" });
+	await tick();
+	assert.equal(s.sent.length, 1);
+});
+
+test("wake cycles are capped until real user input", async (t) => {
+	const s = harness(t);
+	s.start();
+	const worker = await s.spawn();
+	// Three fan-outs may wake on their own; a fourth cycle may not.
+	for (let cycle = 0; cycle < 5; cycle += 1) {
+		await arm(s, worker.id);
+		await settle(s, worker.id, { runs: cycle + 2 });
+	}
+	assert.equal(s.sent.length, 3);
+	// Extension-originated input must not reopen the budget.
+	s.input("extension");
+	await arm(s, worker.id);
+	await settle(s, worker.id, { runs: 90 });
+	assert.equal(s.sent.length, 3);
+	// Real user input does, and the cap applies again from there.
+	s.input("interactive");
+	for (let cycle = 0; cycle < 5; cycle += 1) {
+		await arm(s, worker.id);
+		await settle(s, worker.id, { runs: cycle + 100 });
+	}
+	assert.equal(s.sent.length, 6);
+});
+
+test("child processes never install the wake hook", (t) => {
+	const key = Symbol.for("pi.inbox.agentChild");
+	const globals = globalThis as unknown as Record<symbol, unknown>;
+	const before = globals[key];
+	globals[key] = true;
+	t.after(() => {
+		if (before === undefined) delete globals[key];
+		else globals[key] = before;
+	});
+	const s = harness(t);
+	s.start();
+	assert.equal(s.hasListener(), false);
+	assert.equal(s.sent.length, 0);
+});
+
+test("one listener follows the active session across a switch", async (t) => {
+	const s = harness(t);
+	s.start();
+	const worker = await s.spawn();
+	s.switchTo("elsewhere");
+	s.start();
+	// The worker's parent is no longer the active session: never inject there.
+	await settle(s, worker.id);
+	assert.equal(s.sent.length, 0);
+	const other = await s.spawn("elsewhere");
+	await arm(s, other.id);
+	await settle(s, other.id);
+	assert.equal(s.sent.length, 1);
+	assert.equal(s.sent[0].message.details.parentId, "elsewhere");
+});
+
+test("a throwing sendMessage does not break the listener", async (t) => {
+	const s = harness(t);
+	s.start();
+	const worker = await s.spawn();
+	await arm(s, worker.id);
+	s.setFailSend(true);
+	await settle(s, worker.id);
+	assert.equal(s.sent.length, 0);
+	s.setFailSend(false);
+	// The failed send must not consume the wake this fan-out was owed.
+	await arm(s, worker.id);
+	await settle(s, worker.id, { runs: 7 });
+	assert.equal(s.sent.length, 1);
+});
+
+test("only the newest wake message survives the context filter", async (t) => {
+	const s = harness(t);
+	const wake = (at: number) => ({
+		role: "custom" as const,
+		customType: "pi-kit:worker-wake",
+		content: `wake ${at}`,
+		display: false,
+		timestamp: at,
+	});
+	const history = [
+		wake(1),
+		{ role: "user" as const, content: "hi", timestamp: 2 },
+		wake(3),
+	] as unknown as AgentMessage[];
+	const result = await s.context(history);
+	const kept = result.messages.filter(
+		(message) => message.role === "custom",
+	);
+	assert.equal(kept.length, 1);
+	assert.match(JSON.stringify(kept[0]), /wake 3/);
+});
+
+test("a team member owned by another process blocks the wake", async (t) => {
+	const s = harness(t);
+	s.start();
+	const mine = await s.spawn();
+	const foreign = await s.spawn();
+	// Another Pi process owns this run, so it emits nothing here.
+	s.agents.delete(foreign.id);
+	await arm(s, mine.id);
+	await settle(s, mine.id);
+	assert.equal(s.sent.length, 0);
+});
+
+test("session shutdown disarms a pending wake", async (t) => {
+	const s = harness(t, { debounceMs: 20 });
+	s.start();
+	const worker = await s.spawn();
+	await settle(s, worker.id);
+	s.shutdown();
+	await new Promise((resolve) => setTimeout(resolve, 60));
+	assert.equal(s.sent.length, 0);
 });

@@ -81,7 +81,8 @@ Example spawn:
 }
 ```
 
-The agent can spawn several workers, do its own work, then call `wait` and
+The agent can spawn several workers, end its turn, and pick the work up when
+the team-settled wake arrives, or call `wait` for a bounded in-turn check and
 inspect their replies. Follow-up messages are FIFO next-run prompts, **not**
 mid-run steering. Waiting or interrupting a parent tool does not cancel its
 workers; cancel them explicitly.
@@ -157,8 +158,20 @@ already have the same filesystem permissions. Do not put credentials in notes.
   background parent also starts its team supervisor; ownership still follows
   the existing heartbeat grace period. Queues wait while no eligible
   supervisor is running.
-- Completion doesn't automatically wake an idle parent or launch another
-  parent model turn. Use `wait` while coordinating, or check the inbox later.
+- **A settled team wakes the parent.** When the last worker of a team stops
+  running, a foreground parent that is idle (its turn already ended) gets one
+  wake message and runs exactly one new turn. That is the cheap pattern:
+  spawn, end the turn, and spend nothing until the wake. `wait` is still there
+  for a bounded check inside a turn, and it remains the way for background
+  parents, which are agent children and are not woken.
+  Guards: the wake needs a worker that was observed running (so loading a
+  session with already-finished workers does not fire), coalesces settles
+  inside a short debounce window, fires once per team state, never targets a
+  session other than the workers' own parent, and stops after three
+  consecutive wakes until real user input arrives. Only the newest wake
+  message is kept in context. If any team member is owned by another Pi
+  process (no events reach this one), the wake stays suppressed rather than
+  firing early; `wait` covers that mixed case.
 
 ## Try a real-model smoke test
 
