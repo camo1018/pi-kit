@@ -66,7 +66,7 @@ contribute hands-on work itself.
 | `send` | `id`, `text` | Queue a follow-up in the same worker session |
 | `cancel` | `id` | Stop the run and clear its queue |
 | `share` | `text` (1–4000 characters) | Append an attributed finding to the team notes board |
-| `retract` | `id` | Remove a stale or superseded note from the team notes board |
+| `retract` | `noteId` | Remove a stale or superseded note from the team notes board |
 | `notes` | None | Read the latest 24 notes and the directory for full history |
 
 Example spawn:
@@ -84,8 +84,26 @@ Example spawn:
 The agent can spawn several workers, end its turn, and pick the work up when
 the team-settled wake arrives, or call `wait` for a bounded in-turn check and
 inspect their replies. Follow-up messages are FIFO next-run prompts, **not**
-mid-run steering. Waiting or interrupting a parent tool does not cancel its
-workers; cancel them explicitly.
+mid-run steering. `messageDelivery: "next_run_only"` makes this explicit in
+status results. Do not stack corrections while busy expecting immediate effect.
+Waiting or interrupting a parent tool does not cancel its workers; cancel them
+explicitly.
+
+Status separates **ownership** from **activity**: an idle foreign-owned session
+is still `controlledElsewhere`, but is not `busy`. The ownership guard remains
+in force; status never authorizes a second writer. `stateSource` identifies the
+foreground, local runner, saved runner, or transcript source. `runStartedAt`,
+`updatedAt`, `replyAt`, and `replyIsStale` distinguish a prior run's answer from
+current work. Timestamps and tool activity are observations, not proof of useful
+progress.
+
+`parentAction` identifies the coordination boundary. An idle result requires
+`inspect_result_and_decide_next_step`; it is not an instruction to wait again.
+`wait` returns `outcome: "settled"`, `"timeout"`, or `"needs_attention"` alongside
+the existing `timedOut` and `workers` fields. Unknown status without a running
+process returns attention immediately rather than burning the wait deadline.
+Settled means the run ended, **not** that the assigned task succeeded. Check the
+reply, then deliver the next handoff or report the blocker.
 
 ## Knowledge sharing
 

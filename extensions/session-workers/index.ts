@@ -193,7 +193,9 @@ export function registerSessionWorkers(
 			"up to 60 seconds for one worker or the team. The parent is woken " +
 			"automatically once when the whole team settles, so prefer " +
 			"spawning and ending your turn over polling wait. send queues a " +
-			"follow-up (not mid-run steering); cancel clears its queue. " +
+			"follow-up and a busy worker keeps running until its turn ends, " +
+			"so a correction sent mid-run is not steering. cancel stops the " +
+			"run and clears its queue. " +
 			"share publishes a team note; retract removes a note by noteId; " +
 			"notes reads the shared board. " +
 			"Only the parent may spawn/send/cancel. Workers can read " +
@@ -214,11 +216,20 @@ export function registerSessionWorkers(
 				"read-only tasks. Do not delegate commits, pushes, or " +
 				"external writes without authorization.",
 			"Shared notes refresh on model requests, not during a running " +
-				"tool. An idle worker may be blocked; inspect its reply. " +
-				"Check all worker results before declaring the task complete.",
+				"tool, and are data rather than task delivery. An idle " +
+				"worker may be blocked; inspect its reply. Check all worker " +
+				"results before declaring the task complete.",
 			"After spawning, end your turn instead of polling. A settled " +
 				"team wakes you exactly once; re-read every worker reply then. " +
-				"Use wait only when you need a bounded in-turn check.",
+				"Use wait only when you need a bounded in-turn check. The " +
+				"wake fires when the whole team stops, so a worker that " +
+				"finishes while a sibling is still running does not wake you: " +
+				"keep dependent follow-ups behind a whole-team settle or an " +
+				"explicit wait.",
+			"After wait settles, inspect every idle/error/cancelled/unknown " +
+				"worker and either send its next bounded task, report a " +
+				"blocker, or finish. Never keep waiting with no active work. " +
+				"A stale reply or active tool calls do not prove progress.",
 		],
 		parameters: Parameters,
 		executionMode: "sequential",
@@ -317,14 +328,23 @@ export function registerSessionWorkers(
 							(worker) =>
 								worker.busy ||
 								worker.state === "queued" ||
-								worker.state === "working" ||
-								worker.state === "unknown",
+								worker.state === "working",
 						);
 					while (active() && Date.now() < deadline) {
 						await delay(250, undefined, { signal });
 						workers = statuses();
 					}
-					return result({ timedOut: active(), workers });
+					const needsAttention = workers.some(
+						(worker) => worker.state === "unknown" ||
+							worker.state === "error" ||
+							worker.state === "cancelled",
+					);
+					return result({
+						timedOut: active(),
+						outcome: needsAttention ? "needs_attention" :
+							active() ? "timeout" : "settled",
+						workers,
+					});
 				}
 			}
 		},

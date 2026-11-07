@@ -125,19 +125,56 @@ propagated.
    - a requirement that the slice be completable in the worker's own session
      (never hand a worker a "fan out" or "coordinate more workers" subtask);
    - the propagated skills, verbatim.
-4. **Coordinate.** Each worker should publish useful findings or blockers with
-   `share` and consult the shared notes board where relevant. Once every worker
-   is started, **end your turn** instead of polling: a settled team wakes you
-   exactly once with one new turn, which costs less than any number of `wait`
-   returns. Use bounded `wait` only when you need an in-turn check, and `send`
-   for scope changes or targeted follow-ups; messages to busy workers queue for
-   the next run. Ending the turn is safe either way: the wake is recorded
-   durably first, so it is delivered whether you are an interactive window, a
-   background agent that exits with the turn, or a window closed mid-run.
+4. **Coordinate.** Maintain an explicit per-worker ledger: current milestone,
+   assigned workspaces/files, last observed progress, disposition, dependency,
+   and the parent's next action. Do not treat launching workers as delegation
+   complete, and give each worker one bounded milestone rather than a sprawling
+   sequence whose first checkpoint can be mistaken for its final deliverable.
+
+   Each worker should publish useful findings or blockers with `share` and read
+   the shared notes board. Once every worker is started, **end your turn**
+   instead of polling: a settled team wakes you exactly once with one new turn,
+   which costs less than any number of `wait` returns. Use bounded `wait` only
+   when you need an in-turn check, and `send` for scope changes or follow-ups.
+   Ending the turn is safe either way: the wake is recorded durably first, so
+   it is delivered whether you are an interactive window, a background agent
+   that exits with the turn, or a window closed mid-run.
+
+   The wake fires when the **whole team** stops. A worker that finishes while a
+   sibling is still running does not wake you, so keep dependent follow-ups
+   behind a team-settle or an explicit `wait`, and run a dependent synthesis
+   step only after the retrieval workers have reported.
+
+   After **every** wake, `wait`, or `read` result:
+   - **Idle/settled:** inspect the actual reply now; either send the next task,
+     decide its dependency, report the human blocker, or mark the slice done.
+     Never wait again on an all-idle team, and never say a re-review or
+     validation is running until its `send`/`spawn` actually succeeded.
+   - **Working:** compare concrete progress (a new finding, diff, test result,
+     or completed phase), not fresh tool calls. Two consecutive checks with the
+     same inspection loop and no deliverable require intervention: ask for one
+     exact failure and next experiment, or cancel and checkpoint the run before
+     narrowing it. Do not keep issuing identical waits indefinitely.
+   - **Unknown/error/cancelled or externally controlled:** surface the state
+     and the ownership limitation. Do not assume success or start a second
+     writer; an unverifiable status is an attention condition, not progress.
+
+   `send` is **FIFO next-run delivery**, not steering. Do not pile corrective
+   messages onto a busy worker expecting its current run to change; a queued
+   message and a shared note do not establish that instructions were delivered.
+   To redirect an unsafe or stalled run, cancel it, preserve its current work,
+   and send one consolidated bounded handoff once control is available. If
+   control is refused, ask the user to act in the owning inbox. Never bypass
+   ownership to "unstick" a worker.
+
+   Require compact checkpoint/final replies to state their disposition
+   explicitly: `done for this slice`, `blocked on human input`, or `waiting for
+   a named dependency`, with the next action and its owner. The parent owns
+   every dependent handoff, including validation and re-review.
+
    Shared notes refresh on model requests, not inside a running tool, so an
-   idle worker may be blocked: inspect its reply before assuming success. Do
-   not poll a stalled worker repeatedly or spawn replacements to dodge a
-   blocker.
+   idle worker may be blocked without having told you. Do not spawn a
+   replacement to dodge a blocker.
 5. **Decide and answer.** Inspect every worker's actual reply; `idle` is not
    proof of success. Reconcile conflicting findings on the evidence, not on
    volume. When a task changes code, delegate the required typecheck, lint, and
@@ -153,6 +190,16 @@ propagated.
 - If `session_workers` is unavailable, say that its extension must be enabled
   and reloaded. Do not simulate delegation with shell processes or pretend
   workers exist.
+- Before any worker writes or commits, require its actual git top-level and
+  branch to match the assigned workspace. Readers may inspect sibling paths;
+  writers may not edit, reset, stash, restore, or commit there. Setup ownership
+  ends when an editing worker starts: do not rebase/reset its active worktree
+  to deliver another integration checkpoint. Use unique `mktemp` paths or
+  direct commit messages, never shared names such as `/tmp/msg.txt`.
+- Do not accept `complete` from helper-only or mocked tests as proof that a
+  deployed constructor and public entry point reach the code. Validation must
+  exercise the promised consumer/runtime path and label real versus fake
+  dependencies. Re-review the combined candidate, not only isolated slices.
 - If auth, approval, or human input blocks a worker or the parent, stop, state
   what is needed and why, and wait. Do not guess around a blocker.
 - Interrupting the parent does not stop its workers; `cancel` explicitly when
