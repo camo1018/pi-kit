@@ -163,18 +163,27 @@ already have the same filesystem permissions. Do not put credentials in notes.
   That is the cheap pattern: spawn, end the turn, and spend nothing until the
   wake. `wait` is still there for a bounded check inside a turn.
 
-  Delivery differs by parent, because the two are very different processes:
+  The wake is always first written as a durable `<id>.wake` request next to
+  the parent's agent record — the same directory, atomic write, and "whoever
+  is alive applies it" convention as `<id>.name` / `<id>.stop`. That file is
+  the single record that a wake is owed: it dedupes across events, processes,
+  and restarts, and it is what makes the wake survive its writer exiting.
 
-  - **Interactive parent:** the session owns a live runtime, so the wake is a
+  Delivery is then chosen at consume time by whether the consuming process
+  keeps that session alive, not by what kind of parent it is:
+
+  - **A process that keeps the session open** (an interactive window) sends a
     custom message with `triggerTurn` and `deliverAs: "followUp"`, which queues
-    instead of steering if the parent is still mid-turn.
-  - **Background parent:** the run is a one-shot `--mode json` child whose
-    process exits as soon as its turn ends, so it cannot deliver its own wake
-    minutes later. Instead the wake is written as a durable `<id>.wake` request
-    next to the parent's agent record, and whichever process holds that session
-    next consumes it and enqueues one run on the parent's own queue — the same
-    durable path every other parent message uses. A real user reply supersedes
-    an undelivered request.
+    instead of steering if the parent is mid-turn. Consuming happens
+    immediately, so there is no added latency.
+  - **Anything else** — a one-shot `--mode json` run, which exits with its
+    turn, or a window that was closed while its workers ran — leaves the
+    request for whichever process holds the session next, which enqueues one
+    run on the parent's own queue: the same durable path every other parent
+    message uses. A real user reply supersedes an undelivered request.
+
+  A background run never delivers in-process even though it is alive at settle
+  time, because its process is about to exit and would take the wake with it.
 
   Guards: the wake needs a worker that was observed running (so loading a
   session with already-finished workers does not fire), coalesces settles

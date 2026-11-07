@@ -14,11 +14,20 @@ import * as path from "node:path";
  * same atomic-write convention, same "whoever is alive applies it" semantics.
  */
 
-interface WakeRequest {
+export interface WakeWorker {
+	id: string;
+	title: string;
+	state: string;
+	pending: number;
+	error?: string;
+}
+
+export interface WakeRequest {
 	v: 1;
 	parentId: string;
 	signature: string;
 	content: string;
+	workers: WakeWorker[];
 	createdAt: number;
 	/** Bumped by every writer so a consumer can tell a newer request exists. */
 	nonce: string;
@@ -34,13 +43,19 @@ function requestFile(agentsDir: string, parentId: string): string {
  */
 export function writeWakeRequest(
 	agentsDir: string,
-	request: { parentId: string; signature: string; content: string },
+	request: {
+		parentId: string;
+		signature: string;
+		content: string;
+		workers: WakeWorker[];
+	},
 ): void {
 	const value: WakeRequest = {
 		v: 1,
 		parentId: request.parentId,
 		signature: request.signature,
 		content: request.content,
+		workers: request.workers,
 		createdAt: Date.now(),
 		nonce: `${process.pid}-${Date.now()}`,
 	};
@@ -66,6 +81,7 @@ export function readWakeRequest(
 			fs.readFileSync(requestFile(agentsDir, parentId), "utf-8"),
 		) as WakeRequest;
 		if (raw?.v !== 1 || raw.parentId !== parentId) return;
+		if (!Array.isArray(raw.workers)) raw.workers = [];
 		return raw;
 	} catch {
 		return undefined;
