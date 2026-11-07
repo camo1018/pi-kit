@@ -170,11 +170,37 @@ test("results survive parent restart and use the active branch", async (t) => {
 	assert.equal(status.state, "idle");
 	assert.equal(status.busy, false);
 	assert.equal(status.reply, "Actual result");
+	assert.equal(status.replyAt, 3);
+	assert.equal(status.replyIsStale, false);
+	const run = {
+		id: worker.id, cwd: s.dir, title: "New run", state: "working" as const,
+		pending: [], proc: { kill() {} }, createdAt: 1, updatedAt: 4,
+		runStartedAt: 4, needsYou: false, runs: 2, log: [], liveText: "",
+		sessionFile: file,
+	};
+	s.agents.set(worker.id, run);
+	const running = s.team.status("parent", worker.id);
+	assert.equal(running.reply, "Actual result");
+	assert.equal(running.replyIsStale, true);
+	assert.equal(running.runStartedAt, 4);
+	assert.equal(running.messageDelivery, "next_run_only");
+	manager.appendMessage({
+		role: "toolResult", toolCallId: "read-1", toolName: "read",
+		content: [{ type: "text", text: "Tool output" }],
+		isError: false, timestamp: 5,
+	});
+	const duringTool = s.team.status("parent", worker.id);
+	assert.equal(duringTool.reply, "Actual result");
+	assert.equal(duringTool.replyAt, 3);
+	assert.equal(duringTool.stopReason, undefined);
+	assert.equal(duringTool.replyIsStale, true);
 });
 
 test("external owners and taken-over workers refuse a second writer", async (t) => {
 	const s = setup(t);
 	const worker = await s.spawn();
+	const agent = s.agents.get(worker.id);
+	assert.ok(agent);
 	s.agents.delete(worker.id);
 	const dir = join(s.dir, "inbox-agents");
 	fs.mkdirSync(dir);
@@ -189,6 +215,14 @@ test("external owners and taken-over workers refuse a second writer", async (t) 
 		() => s.team.cancel("parent", worker.id),
 		/another Pi process/,
 	);
+	fs.writeFileSync(file, JSON.stringify({ state: "idle", pending: [] }));
+	const idleOwner = s.team.status("parent", worker.id);
+	assert.equal(idleOwner.busy, false);
+	assert.equal(idleOwner.controlledElsewhere, true);
+	assert.equal(idleOwner.parentAction, "inspect_result_and_decide_next_step");
+	// Being idle must not weaken the second-writer ownership guard.
+	assert.throws(() => s.team.send("parent", worker.id, "go"),
+		/another Pi process/);
 	fs.rmSync(file);
 	const live = join(s.dir, "inbox-live");
 	fs.mkdirSync(live);
@@ -206,6 +240,17 @@ test("external owners and taken-over workers refuse a second writer", async (t) 
 		() => s.team.send("parent", worker.id, "go"),
 		/open in another Pi process/,
 	);
+	fs.writeFileSync(join(live, "foreground.json"), JSON.stringify({
+		sessionId: worker.id, pid: process.pid, state: "idle",
+	}));
+	// A foreground owner is authoritative even if an old runner remains.
+	s.agents.set(worker.id, agent);
+	const foregroundIdle = s.team.status("parent", worker.id);
+	assert.equal(foregroundIdle.state, "idle");
+	assert.equal(foregroundIdle.busy, false);
+	assert.equal(foregroundIdle.stateSource, "foreground");
+	assert.throws(() => s.team.cancel("parent", worker.id),
+		/open in another Pi process/);
 });
 
 test("ids accept custom session ids, but reject paths and dot entries", () => {

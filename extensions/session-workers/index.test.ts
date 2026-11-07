@@ -365,6 +365,40 @@ test("wait finishes after worker exit; abort leaves detached work intact", async
 	assert.match(JSON.stringify(timed.content), /timedOut\\": true/);
 });
 
+test("wait surfaces idle handoffs and unknown status without polling",
+	async (t) => {
+	const s = harness(t);
+	const worker = await s.spawn();
+	const agent = s.agents.get(worker.id);
+	assert.ok(agent);
+	agent.state = "idle";
+	agent.proc = undefined;
+	const idle = await s.execute({ action: "wait", id: worker.id });
+	const data = idle.details as { data: {
+		outcome: string; timedOut: boolean;
+		workers: { parentAction: string }[];
+	} };
+	assert.equal(data.data.outcome, "settled");
+	assert.equal(data.data.timedOut, false);
+	assert.equal(data.data.workers[0].parentAction,
+		"inspect_result_and_decide_next_step");
+
+	// Dead mid-tool-use transcripts do not imply an active process.
+	s.agents.delete(worker.id);
+	const unknown = await s.execute({
+		action: "wait", id: worker.id, seconds: 60,
+	});
+	const missing = unknown.details as { data: {
+		outcome: string; timedOut: boolean;
+		workers: { state: string; busy: boolean; parentAction: string }[];
+	} };
+	assert.equal(missing.data.outcome, "needs_attention");
+	assert.equal(missing.data.timedOut, false);
+	assert.equal(missing.data.workers[0].state, "unknown");
+	assert.equal(missing.data.workers[0].busy, false);
+	assert.equal(missing.data.workers[0].parentAction, "inspect_status");
+	});
+
 test("real Pi loader registers workers cleanly without starting processes", async (t) => {
 	const s = setup(t);
 	const loader = new DefaultResourceLoader({

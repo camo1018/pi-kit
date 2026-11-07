@@ -217,6 +217,10 @@ export class WorkerTeam {
 			"Do not start more workers. Stay within the assigned scope.",
 			"If blocked on auth, approval, or human input, stop and explain.",
 			"End with findings, changed files, checks run, and blockers.",
+			"State your disposition: done for this slice, blocked on human " +
+				"input, or waiting for a named dependency. Name the next " +
+				"action and who must perform it. An idle worker is not " +
+				"automatically resumed by shared notes.",
 			opts.context ? `\nParent handoff:\n${opts.context}` : "",
 			`\nTask:\n${opts.task}`,
 		]
@@ -242,6 +246,9 @@ export class WorkerTeam {
 					pending?: string[];
 					error?: string;
 					pid?: number;
+					updatedAt?: number;
+					runStartedAt?: number;
+					needsYou?: boolean;
 			  }
 			| undefined;
 	}
@@ -253,15 +260,25 @@ export class WorkerTeam {
 		const foreground = this.foreground(id);
 		const file = local?.sessionFile ?? this.runner.find(id);
 		let reply = "";
+		let replyAt: number | undefined;
 		let stopReason: string | undefined;
 		if (file) {
 			const branch = SessionManager.open(file).getBranch();
 			const last = branch.findLast((entry) => entry.type === "message");
-			if (last?.type === "message" && last.message.role === "assistant") {
-				reply = last.message.content
+			const assistant = branch.findLast(
+				(entry) => entry.type === "message" &&
+					entry.message.role === "assistant",
+			);
+			if (assistant?.type === "message" &&
+				assistant.message.role === "assistant") {
+				reply = assistant.message.content
 					.filter((part) => part.type === "text")
 					.map((part) => part.text)
 					.join("\n");
+				replyAt = assistant.message.timestamp;
+			}
+			// Only the leaf message can establish a finished transcript run.
+			if (last?.type === "message" && last.message.role === "assistant") {
 				stopReason = last.message.stopReason;
 			}
 		}
@@ -272,14 +289,36 @@ export class WorkerTeam {
 			else if (stopReason === "aborted") state = "cancelled";
 			else if (stopReason && stopReason !== "toolUse") state = "idle";
 		}
+		// Ownership records are not evidence of an active model run.
+		const busy = foreground
+			? foreground.state === "working"
+			: local
+				? !!local.proc
+				: saved?.state === "working";
+		const pending = local?.pending.length ?? saved?.pending?.length ?? 0;
+		const runStartedAt = local?.runStartedAt ?? saved?.runStartedAt;
+		const parentAction = state === "unknown"
+			? "inspect_status"
+			: !busy && state !== "queued" && pending === 0
+				? "inspect_result_and_decide_next_step"
+				: "wait_or_cancel";
 		return {
 			...worker,
 			state,
-			busy: foreground?.state === "working" || !!local?.proc || !!saved,
+			busy,
+			stateSource: foreground ? "foreground" : local ? "local" :
+				saved ? "saved" : "transcript",
 			controlledElsewhere: !!foreground || !!saved,
-			pending: local?.pending.length ?? saved?.pending?.length ?? 0,
+			pending,
+			messageDelivery: "next_run_only",
+			parentAction,
+			runStartedAt,
+			updatedAt: local?.updatedAt ?? saved?.updatedAt,
 			activity: local?.activity,
 			error: local?.error ?? saved?.error,
+			replyAt,
+			replyIsStale: busy && (replyAt === undefined ||
+				runStartedAt === undefined || replyAt < runStartedAt),
 			reply: bounded(reply || local?.lastText || ""),
 			stopReason,
 			sessionFile: file,
