@@ -159,19 +159,31 @@ already have the same filesystem permissions. Do not put credentials in notes.
   the existing heartbeat grace period. Queues wait while no eligible
   supervisor is running.
 - **A settled team wakes the parent.** When the last worker of a team stops
-  running, a foreground parent that is idle (its turn already ended) gets one
-  wake message and runs exactly one new turn. That is the cheap pattern:
-  spawn, end the turn, and spend nothing until the wake. `wait` is still there
-  for a bounded check inside a turn, and it remains the way for background
-  parents, which are agent children and are not woken.
+  running, an idle parent gets exactly one wake and runs exactly one new turn.
+  That is the cheap pattern: spawn, end the turn, and spend nothing until the
+  wake. `wait` is still there for a bounded check inside a turn.
+
+  Delivery differs by parent, because the two are very different processes:
+
+  - **Interactive parent:** the session owns a live runtime, so the wake is a
+    custom message with `triggerTurn` and `deliverAs: "followUp"`, which queues
+    instead of steering if the parent is still mid-turn.
+  - **Background parent:** the run is a one-shot `--mode json` child whose
+    process exits as soon as its turn ends, so it cannot deliver its own wake
+    minutes later. Instead the wake is written as a durable `<id>.wake` request
+    next to the parent's agent record, and whichever process holds that session
+    next consumes it and enqueues one run on the parent's own queue — the same
+    durable path every other parent message uses. A real user reply supersedes
+    an undelivered request.
+
   Guards: the wake needs a worker that was observed running (so loading a
   session with already-finished workers does not fire), coalesces settles
-  inside a short debounce window, fires once per team state, never targets a
-  session other than the workers' own parent, and stops after three
-  consecutive wakes until real user input arrives. Only the newest wake
-  message is kept in context. If any team member is owned by another Pi
-  process (no events reach this one), the wake stays suppressed rather than
-  firing early; `wait` covers that mixed case.
+  inside a short debounce window, fires once per team state, stops after three
+  consecutive wakes until real user input arrives, never targets a session
+  other than the workers' own parent, and never stacks a second request while
+  one is still undelivered. Only the newest wake message is kept in context.
+  Adopted workers count as settled normally, which is required for background
+  parents.
 
 ## Try a real-model smoke test
 

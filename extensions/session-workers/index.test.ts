@@ -11,7 +11,8 @@ import {
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AgentEvent } from "../../lib/inbox-agents.ts";
 import { registerSessionWorkers } from "./index.ts";
-import { resetWakeListeners } from "./wake.ts";
+import { pumpWakeRequest, resetWakeListeners } from "./wake.ts";
+import { readWakeRequest } from "./wake-queue.ts";
 import { setup } from "./test-utils.ts";
 
 function harness(
@@ -19,6 +20,8 @@ function harness(
 	options: {
 		settings?: Record<string, unknown>;
 		debounceMs?: number;
+		/** Interactive parents wake themselves; background runs go durable. */
+		mode?: "tui" | "json";
 	} = {},
 ) {
 	const s = setup(t);
@@ -56,7 +59,7 @@ function harness(
 	let caller = "parent";
 	const ctx = {
 		cwd: s.dir,
-		mode: "json",
+		mode: options.mode ?? "tui",
 		hasUI: false,
 		thinkingLevel: "high",
 		model: { provider: "test", id: "model" },
@@ -116,6 +119,12 @@ function harness(
 			emit(event);
 		},
 		hasListener: () => !!emit,
+		/** The durable request a background parent leaves behind. */
+		pendingWake: () => readWakeRequest(s.dir, caller),
+		addParent: s.addParent,
+		pump() {
+			return pumpWakeRequest(s.team, caller);
+		},
 		switchTo(id: string) {
 			caller = id;
 		},
@@ -603,19 +612,113 @@ test("wake cycles are capped until real user input", async (t) => {
 	assert.equal(s.sent.length, 6);
 });
 
-test("child processes never install the wake hook", (t) => {
-	const key = Symbol.for("pi.inbox.agentChild");
-	const globals = globalThis as unknown as Record<symbol, unknown>;
-	const before = globals[key];
-	globals[key] = true;
-	t.after(() => {
-		if (before === undefined) delete globals[key];
-		else globals[key] = before;
-	});
-	const s = harness(t);
+test("a background parent leaves a durable wake, not a message", async (t) => {
+	// A background parent is a one-shot --mode json run: its process exits with
+	// the turn, so an in-memory sendMessage could never reach it.
+	const s = harness(t, { mode: "json" });
+	s.addParent();
 	s.start();
-	assert.equal(s.hasListener(), false);
+	assert.equal(s.hasListener(), true);
+	const worker = await s.spawn();
+	await arm(s, worker.id);
+	await settle(s, worker.id);
 	assert.equal(s.sent.length, 0);
+	const pending = s.pendingWake();
+	assert.ok(pending, "no durable wake request was written");
+	assert.match(pending.content, /settled/);
+	assert.equal(pending.parentId, "parent");
+});
+
+test("a background wake becomes a run on the parent queue", async (t) => {
+	const s = harness(t, { mode: "json" });
+	s.addParent();
+	s.start();
+	const worker = await s.spawn();
+	await arm(s, worker.id);
+	await settle(s, worker.id);
+	assert.ok(s.pendingWake());
+	assert.equal(s.pump(), true);
+	assert.equal(s.pendingWake(), undefined, "request was not consumed");
+	const queued = s.calls.filter((call) => call.kind === "send");
+	assert.equal(queued.length, 1);
+	assert.equal((queued[0].data as { id: string }).id, "parent");
+});
+
+test("a delivered background wake is not re-requested", async (t) => {
+	const s = harness(t, { mode: "json" });
+	s.addParent();
+	s.start();
+	const worker = await s.spawn();
+	await arm(s, worker.id);
+	await settle(s, worker.id);
+	s.pump();
+	// The consumer delivered it; a later settle of the same state must not
+	// stack a second run on the parent queue.
+	await settle(s, worker.id);
+	assert.equal(s.pendingWake(), undefined);
+});
+
+test("a user reply supersedes an undelivered background wake", async (t) => {
+	const s = harness(t, { mode: "json" });
+	s.addParent();
+	s.start();
+	const worker = await s.spawn();
+	await arm(s, worker.id);
+	await settle(s, worker.id);
+	assert.ok(s.pendingWake());
+	s.input("interactive");
+	assert.equal(s.pendingWake(), undefined);
+});
+
+test("an undelivered wake is not stacked by later settles", async (t) => {
+	const s = harness(t, { mode: "json" });
+	s.addParent();
+	s.start();
+	const worker = await s.spawn();
+	await arm(s, worker.id);
+	await settle(s, worker.id);
+	const first = s.pendingWake();
+	assert.ok(first);
+	// A second settle before any consumer ran must not replace or duplicate the
+	// request: the parent would otherwise get two runs for one fan-out.
+	await settle(s, worker.id, { runs: 9 });
+	const second = s.pendingWake();
+	assert.equal(second?.nonce, first.nonce);
+});
+
+test("stale parent agent in another process is still delivered", async (t) => {
+	// The run process exits with its turn, so the next consumer may be a window
+	// that only adopted the parent's record. Delivery must not require local
+	// ownership of the parent agent.
+	const s = harness(t, { mode: "json" });
+	s.addParent();
+	s.start();
+	const worker = await s.spawn();
+	await arm(s, worker.id);
+	await settle(s, worker.id);
+	assert.ok(s.pendingWake());
+	s.agents.get("parent")!.pending = [];
+	assert.equal(s.pump(), true);
+	assert.equal(s.pendingWake(), undefined);
+});
+
+test("a worker session never pumps a wake for itself", async (t) => {
+	const s = harness(t, { mode: "json" });
+	s.addParent();
+	s.start();
+	const worker = await s.spawn();
+	s.switchTo(worker.id);
+	assert.equal(s.pump(), false);
+});
+
+test("an interactive parent still wakes itself with one message", async (t) => {
+	const s = harness(t, { mode: "tui" });
+	s.start();
+	const worker = await s.spawn();
+	await arm(s, worker.id);
+	await settle(s, worker.id);
+	assert.equal(s.sent.length, 1);
+	assert.equal(s.pendingWake(), undefined);
 });
 
 test("one listener follows the active session across a switch", async (t) => {

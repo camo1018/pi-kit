@@ -3,12 +3,17 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import {
-	isAgentChild,
 	onAgentEvent,
 	type AgentEvent,
 	type BgAgent,
 } from "../../lib/inbox-agents.ts";
 import type { WorkerTeam } from "./workers.ts";
+import {
+	clearWakeRequest,
+	readWakeRequest,
+	consumeWakeRequest,
+	writeWakeRequest,
+} from "./wake-queue.ts";
 
 export const WAKE_CUSTOM_TYPE = "pi-kit:worker-wake";
 
@@ -26,6 +31,8 @@ export interface WakeOptions {
 interface WakeState {
 	ctx?: ExtensionContext;
 	pi?: ExtensionAPI;
+	/** True when this process owns the session (TUI), so it can be woken. */
+	interactive: boolean;
 	armed: boolean;
 	signature?: string;
 	wakes: number;
@@ -41,7 +48,7 @@ const LISTENER_VERSION = 1;
 
 function state(): WakeState {
 	const g = globalThis as unknown as Record<symbol, WakeState | undefined>;
-	g[GLOBALS] ??= { armed: false, wakes: 0 };
+	g[GLOBALS] ??= { armed: false, wakes: 0, interactive: false };
 	return g[GLOBALS];
 }
 
@@ -68,28 +75,47 @@ function signature(agents: { id: string; agent: BgAgent }[]): string {
 		.join(",");
 }
 
+/** One durable line: the model must act, but at the smallest context cost. */
 function wakeContent(
 	parentId: string,
 	agents: { id: string; agent: BgAgent }[],
 ): string {
-	const lines = agents.map(({ id, agent }) => {
-		const title = agent.title.replace(/\s+/g, " ").trim();
-		const error = agent.error ? ` error=${agent.error}` : "";
-		return `- ${id} "${title}" state=${agent.state}${error}`;
-	});
-	return [
-		`All delegated workers of session ${parentId} have settled.`,
-		...lines,
-		'Read them with session_workers {action:"list"} before replying.',
-		"Do not spawn more workers unless the user asked.",
-	].join("\n");
+	const settled = agents.length === 1 ? "worker has" : "workers have";
+	const errored = agents.filter(({ agent }) => agent.state === "error");
+	const note = errored.length
+		? ` ${errored.length} errored.`
+		: "";
+	return (
+		`All ${agents.length} delegated ${settled} settled.${note} ` +
+		'Read them with session_workers {action:"list"} before replying. ' +
+		"Do not spawn more workers unless the user asked."
+	);
+}
+
+function teamAgents(
+	team: WorkerTeam,
+	parentId: string,
+): { id: string; agent: BgAgent }[] | undefined {
+	const workers = team.workers(parentId);
+	if (workers.length === 0) return undefined;
+	// Adoption is expected: a background parent's workers outlive the run
+	// process that spawned them, so most settles arrive from the registry.
+	const agents = workers.map((worker) => ({
+		id: worker.id,
+		agent: team.runner.get(worker.id),
+	}));
+	if (agents.some((entry) => !entry.agent)) return undefined;
+	return agents as { id: string; agent: BgAgent }[];
 }
 
 /**
  * Wake an idle parent once, after its whole worker team settles. Without this
  * the parent has to poll `wait`, and every poll return costs a full model
- * turn. A parent that spawns workers and ends its turn spends nothing until
- * this message starts exactly one new turn.
+ * turn.
+ *
+ * Two delivery paths, because a parent is one of two very different things:
+ * an interactive session that stays alive, or a background run whose process
+ * exits the moment its turn ends.
  */
 export function installWorkerWake(
 	pi: ExtensionAPI,
@@ -100,12 +126,14 @@ export function installWorkerWake(
 	const current = state();
 	current.ctx = ctx;
 	current.pi = pi;
+	// A background run dies with its turn, so it can only leave a durable
+	// request behind. A TUI session owns the runtime and can wake itself.
+	current.interactive = ctx.mode === "tui";
 	// A fresh session never inherits an armed team or a stale wake budget.
 	current.armed = false;
 	current.signature = undefined;
 	current.wakes = 0;
 
-	if (isAgentChild()) return;
 	if (process.env.BIGBRAIN_MAINT === "1") return;
 
 	const g = globalThis as unknown as Record<symbol, unknown>;
@@ -116,40 +144,20 @@ export function installWorkerWake(
 
 	const subscribe = options.subscribe ?? onAgentEvent;
 	const debounceMs = options.debounceMs ?? DEFAULT_DEBOUNCE_MS;
+	const agentsDir = team.agentDir;
 
-	const evaluate = () => {
-		current.timer = undefined;
-		try {
-			// Read lazily: a stale ctx throws on every getter after a switch.
-			const live = current.ctx;
-			const livePi = current.pi;
-			if (!live || !livePi) return;
-			const parentId = live.sessionManager.getSessionId();
-			if (team.parent(parentId) !== parentId) return;
-			// Only workers this process owns emit events; a team member owned by
-			// another Pi process can settle unnoticed, so never wake past one.
-			const members = team.workers(parentId);
-			const agents = members.map((worker) => ({
-				id: worker.id,
-				agent: team.runner.get(worker.id),
-			}));
-			if (agents.length === 0) return;
-			if (agents.some((entry) => !entry.agent)) return;
-			const owned = agents as { id: string; agent: BgAgent }[];
-			if (owned.some(({ agent }) => !quiet(agent))) {
-				current.armed = true;
-				return;
-			}
-			if (!current.armed) return;
-			const next = signature(owned);
-			if (next === current.signature) return;
-			if (current.wakes >= MAX_CONSECUTIVE_WAKES) return;
-			// Commit only after a successful send: a stale context throws and
-			// must not consume the wake this fan-out was owed.
-			livePi.sendMessage(
+	const deliver = (
+		parentId: string,
+		owned: { id: string; agent: BgAgent }[],
+		next: string,
+	) => {
+		const content = wakeContent(parentId, owned);
+		if (current.interactive && current.pi) {
+			// Interactive: the runtime is alive, so send a real custom message.
+			current.pi.sendMessage(
 				{
 					customType: WAKE_CUSTOM_TYPE,
-					content: wakeContent(parentId, owned),
+					content,
 					display: false,
 					details: {
 						parentId,
@@ -165,6 +173,36 @@ export function installWorkerWake(
 				},
 				{ triggerTurn: true, deliverAs: "followUp" },
 			);
+			return;
+		}
+		// Background: queue a durable run on the parent's own agent queue. It
+		// survives this process exiting and is pumped by whoever holds the
+		// session next, exactly like a queued user reply.
+		writeWakeRequest(agentsDir, { parentId, signature: next, content });
+	};
+
+	const evaluate = () => {
+		current.timer = undefined;
+		try {
+			// Read lazily: a stale ctx throws on every getter after a switch.
+			const live = current.ctx;
+			if (!live) return;
+			const parentId = live.sessionManager.getSessionId();
+			if (team.parent(parentId) !== parentId) return;
+			const agents = teamAgents(team, parentId);
+			if (!agents) return;
+			if (agents.some(({ agent }) => !quiet(agent))) {
+				current.armed = true;
+				return;
+			}
+			if (!current.armed) return;
+			const next = signature(agents);
+			if (next === current.signature) return;
+			// A request left by an earlier run process is still pending; the
+			// consumer will deliver it, so do not stack a second one.
+			if (readWakeRequest(agentsDir, parentId)) return;
+			if (current.wakes >= MAX_CONSECUTIVE_WAKES) return;
+			deliver(parentId, agents, next);
 			current.armed = false;
 			current.signature = next;
 			current.wakes += 1;
@@ -186,6 +224,44 @@ export function installWorkerWake(
 	g[LISTENER_KEY] = unsubscribe;
 }
 
+/**
+ * Turn a pending durable wake into a run on the parent's own queue. Called
+ * from the supervisor tick of whichever process holds the session, so it works
+ * whether that is the run process or a long-lived window.
+ */
+export function pumpWakeRequest(
+	team: WorkerTeam,
+	callerId: string,
+): boolean {
+	if (process.env.BIGBRAIN_MAINT === "1") return false;
+	if (team.parent(callerId) !== callerId) return false;
+	const request = readWakeRequest(team.agentDir, callerId);
+	if (!request) return false;
+	const saved = team.worker(callerId);
+	const agent = team.runner.get(callerId);
+	const sessionFile = team.runner.find(callerId);
+	// Nobody can ever receive this: drop it rather than leave it on disk.
+	if (!agent && !sessionFile) {
+		clearWakeRequest(team.agentDir, callerId);
+		return false;
+	}
+	// Route through the team's runner so the run is queued in the same durable
+	// record every other parent message uses; needsPersist() then keeps it on
+	// disk, which is what survives this process exiting.
+	team.runner.send({
+		id: callerId,
+		cwd: saved?.cwd ?? process.cwd(),
+		title: saved?.title ?? "delegated workers",
+		sessionFile,
+		text: request.content,
+	});
+	if (!consumeWakeRequest(team.agentDir, callerId, request.nonce)) {
+		// A newer request replaced this one mid-flight; it stays for next tick.
+		return true;
+	}
+	return true;
+}
+
 /** Drop the armed team and any pending evaluation on session end. */
 export function uninstallWorkerWake(): void {
 	const current = state();
@@ -199,6 +275,11 @@ export function uninstallWorkerWake(): void {
 /** Test seam: the wake budget is reset by real user input and new sessions. */
 export function resetWakeBudget(): void {
 	state().wakes = 0;
+}
+
+/** A user reply supersedes any wake still waiting to be delivered. */
+export function dropPendingWake(team: WorkerTeam, callerId: string): void {
+	clearWakeRequest(team.agentDir, callerId);
 }
 
 /** Test seam: drop process-global listener bookkeeping between test cases. */

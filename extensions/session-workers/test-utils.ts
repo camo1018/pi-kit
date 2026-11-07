@@ -72,6 +72,28 @@ export function setup(t: TestContext) {
 			model: "test/model:high",
 			extensionPath: "/extensions/session-workers/index.ts",
 		});
+	/**
+	 * A background parent is itself a registry agent (it owns runs and a queue),
+	 * so durable wake delivery can queue onto it exactly like a user reply.
+	 */
+	const addParent = (id = "parent") => {
+		const agent: BgAgent = {
+			id,
+			cwd: dir,
+			title: "parent",
+			state: "idle",
+			proc: undefined,
+			pending: [],
+			createdAt: 1,
+			updatedAt: 1,
+			needsYou: false,
+			runs: 1,
+			log: [],
+			liveText: "",
+		};
+		agents.set(id, agent);
+		return agent;
+	};
 	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-	return { dir, team, agents, files, calls, supervision, spawn };
+	return { dir, team, agents, files, calls, supervision, spawn, addParent };
 }
