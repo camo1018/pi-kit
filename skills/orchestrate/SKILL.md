@@ -126,9 +126,13 @@ propagated.
      (never hand a worker a "fan out" or "coordinate more workers" subtask);
    - the propagated skills, verbatim.
 4. **Coordinate.** Each worker should publish useful findings or blockers with
-   `share` and consult the shared notes board where relevant. Use `list`,
-   `read`, and bounded `wait` to track progress. Use `send` for scope changes
-   or targeted follow-ups; messages to busy workers queue for the next run.
+   `share` and consult the shared notes board where relevant. Once every worker
+   is started, **end your turn** instead of polling: a settled team wakes you
+   exactly once with one new turn, which costs less than any number of `wait`
+   returns. Use bounded `wait` only when you need an in-turn check, and `send`
+   for scope changes or targeted follow-ups; messages to busy workers queue for
+   the next run. Background parents are agent children and are not woken, so
+   they still poll.
    Shared notes refresh on model requests, not inside a running tool, so an
    idle worker may be blocked: inspect its reply before assuming success. Do
    not poll a stalled worker repeatedly or spawn replacements to dodge a
