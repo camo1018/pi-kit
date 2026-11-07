@@ -22,9 +22,13 @@ function harness(
 		debounceMs?: number;
 		/** Interactive parents wake themselves; background runs go durable. */
 		mode?: "tui" | "json";
+		/** Register the parent as a live agent (background parents always are). */
+		addParent?: boolean;
+		/** Simulate a second process on an existing team directory. */
+		reuseTeam?: ReturnType<typeof setup>["team"];
 	} = {},
 ) {
-	const s = setup(t);
+	const s = setup(t, options.reuseTeam);
 	const handlers = new Map<string, unknown>();
 	const sent: { message: any; options: any }[] = [];
 	let failSend = false;
@@ -56,6 +60,7 @@ function harness(
 		},
 		debounceMs: options.debounceMs ?? 0,
 	});
+	if (options.addParent) s.addParent();
 	let caller = "parent";
 	const ctx = {
 		cwd: s.dir,
@@ -700,6 +705,33 @@ test("stale parent agent in another process is still delivered", async (t) => {
 	s.agents.get("parent")!.pending = [];
 	assert.equal(s.pump(), true);
 	assert.equal(s.pendingWake(), undefined);
+});
+
+test("a wake left by a dead process is delivered next", async (t) => {
+	const first = harness(t, { mode: "json", addParent: true });
+	first.start();
+	const worker = await first.spawn();
+	await arm(first, worker.id);
+	await settle(first, worker.id);
+	const request = first.pendingWake();
+	assert.ok(request, "the exiting run must leave the wake on disk");
+	first.shutdown();
+
+	// A different process, holding the same team, picks it up.
+	const second = harness(t, {
+		mode: "tui",
+		reuse: first.dir,
+		reuseTeam: first.team,
+		addParent: true,
+	});
+	second.start();
+	assert.equal(second.team.parent("parent"), "parent");
+	assert.equal(second.pump(), true);
+	assert.equal(second.pendingWake(), undefined);
+	// Delivered by the new process, in-process, because it holds the runtime.
+	assert.equal(second.sent.length, 1);
+	assert.equal(second.sent[0].options.deliverAs, "followUp");
+	assert.match(String(second.sent[0].message.content), /settled/);
 });
 
 test("a worker session never pumps a wake for itself", async (t) => {

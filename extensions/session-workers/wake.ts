@@ -31,8 +31,8 @@ export interface WakeOptions {
 interface WakeState {
 	ctx?: ExtensionContext;
 	pi?: ExtensionAPI;
-	/** True when this process owns the session (TUI), so it can be woken. */
-	interactive: boolean;
+	/** True when this process keeps the session alive after the turn ends. */
+	persistent: boolean;
 	armed: boolean;
 	signature?: string;
 	wakes: number;
@@ -48,7 +48,7 @@ const LISTENER_VERSION = 1;
 
 function state(): WakeState {
 	const g = globalThis as unknown as Record<symbol, WakeState | undefined>;
-	g[GLOBALS] ??= { armed: false, wakes: 0, interactive: false };
+	g[GLOBALS] ??= { armed: false, wakes: 0, persistent: false };
 	return g[GLOBALS];
 }
 
@@ -126,6 +126,10 @@ export function installWorkerWake(
 	const current = state();
 	current.ctx = ctx;
 	current.pi = pi;
+	// A TUI process keeps the session alive after a turn; a background run is a
+	// one-shot `--mode json` child that exits. Only the former can be woken
+	// in-process.
+	current.persistent = ctx.mode === "tui";
 	// A background run dies with its turn, so it can only leave a durable
 	// request behind. A TUI session owns the runtime and can wake itself.
 	current.interactive = ctx.mode === "tui";
@@ -146,41 +150,6 @@ export function installWorkerWake(
 	const debounceMs = options.debounceMs ?? DEFAULT_DEBOUNCE_MS;
 	const agentsDir = team.agentDir;
 
-	const deliver = (
-		parentId: string,
-		owned: { id: string; agent: BgAgent }[],
-		next: string,
-	) => {
-		const content = wakeContent(parentId, owned);
-		if (current.interactive && current.pi) {
-			// Interactive: the runtime is alive, so send a real custom message.
-			current.pi.sendMessage(
-				{
-					customType: WAKE_CUSTOM_TYPE,
-					content,
-					display: false,
-					details: {
-						parentId,
-						at: Date.now(),
-						workers: owned.map(({ id, agent }) => ({
-							id,
-							title: agent.title,
-							state: agent.state,
-							pending: agent.pending.length,
-							error: agent.error,
-						})),
-					},
-				},
-				{ triggerTurn: true, deliverAs: "followUp" },
-			);
-			return;
-		}
-		// Background: queue a durable run on the parent's own agent queue. It
-		// survives this process exiting and is pumped by whoever holds the
-		// session next, exactly like a queued user reply.
-		writeWakeRequest(agentsDir, { parentId, signature: next, content });
-	};
-
 	const evaluate = () => {
 		current.timer = undefined;
 		try {
@@ -198,14 +167,32 @@ export function installWorkerWake(
 			if (!current.armed) return;
 			const next = signature(agents);
 			if (next === current.signature) return;
-			// A request left by an earlier run process is still pending; the
-			// consumer will deliver it, so do not stack a second one.
+			// A request already on disk means a wake is owed; the consumer will
+			// deliver it, so never stack a second one.
 			if (readWakeRequest(agentsDir, parentId)) return;
 			if (current.wakes >= MAX_CONSECUTIVE_WAKES) return;
-			deliver(parentId, agents, next);
+			// The request file is the single source of truth for "a wake is
+			// owed". It is durable, so it survives this process exiting before
+			// delivery, and it is what dedupes across processes and restarts.
+			writeWakeRequest(agentsDir, {
+				parentId,
+				signature: next,
+				content: wakeContent(parentId, agents),
+				workers: agents.map(({ id, agent }) => ({
+					id,
+					title: agent.title,
+					state: agent.state,
+					pending: agent.pending.length,
+					error: agent.error,
+				})),
+			});
 			current.armed = false;
 			current.signature = next;
 			current.wakes += 1;
+			// Only a process that keeps the session alive can deliver now. A
+			// background run must leave the request for whoever holds the session
+			// next, because this process is about to exit.
+			if (current.persistent) consumeWake(team, parentId);
 		} catch {
 			// A stale context during a session switch must never break the
 			// runner's emit loop.
@@ -225,29 +212,76 @@ export function installWorkerWake(
 }
 
 /**
- * Turn a pending durable wake into a run on the parent's own queue. Called
- * from the supervisor tick of whichever process holds the session, so it works
- * whether that is the run process or a long-lived window.
+ * Deliver a pending wake, choosing the mechanism by whether this process holds
+ * a live runtime for the session right now. That is a property of the moment,
+ * not of the session kind: a TUI window that was closed while its workers ran
+ * must fall back to the durable queue when it comes back.
+ *
+ * - Live runtime: send a custom message and run exactly one turn in-process.
+ *   This is the only safe writer for a session a window is holding.
+ * - Otherwise: enqueue one run on the parent's own queue, the same durable path
+ *   every other parent message takes.
  */
-export function pumpWakeRequest(
+export function consumeWake(
 	team: WorkerTeam,
 	callerId: string,
+	options: { pi?: ExtensionAPI } = {},
 ): boolean {
 	if (process.env.BIGBRAIN_MAINT === "1") return false;
 	if (team.parent(callerId) !== callerId) return false;
 	const request = readWakeRequest(team.agentDir, callerId);
 	if (!request) return false;
+	const current = state();
+	const live = current.ctx;
+	const livePi = options.pi ?? current.pi;
+	// In-process delivery needs both: a runtime that outlives this turn, and one
+	// that is actually for this session. A background run satisfies neither the
+	// first nor the second usefully -- its process exits with the turn, so an
+	// in-process send would be queued into a dying process and lost.
+	let liveForThis =
+		current.persistent &&
+		!!live &&
+		!!livePi &&
+		((): boolean => {
+			try {
+				return live!.sessionManager.getSessionId() === callerId;
+			} catch {
+				return false;
+			}
+		})();
+	if (liveForThis) {
+		if (!consumeWakeRequest(team.agentDir, callerId, request.nonce)) {
+			// A newer request replaced this one mid-flight; leave it.
+			return true;
+		}
+		try {
+			livePi!.sendMessage(
+				{
+					customType: WAKE_CUSTOM_TYPE,
+					content: request.content,
+					display: false,
+					details: {
+						parentId: callerId,
+						at: Date.now(),
+						workers: request.workers,
+					},
+				},
+				{ triggerTurn: true, deliverAs: "followUp" },
+			);
+			return true;
+		} catch {
+			// The runtime went away between the check and the send. Fall through
+			// to the durable queue so the wake is not lost.
+			liveForThis = false;
+		}
+	}
 	const saved = team.worker(callerId);
-	const agent = team.runner.get(callerId);
 	const sessionFile = team.runner.find(callerId);
 	// Nobody can ever receive this: drop it rather than leave it on disk.
-	if (!agent && !sessionFile) {
+	if (!team.runner.get(callerId) && !sessionFile) {
 		clearWakeRequest(team.agentDir, callerId);
 		return false;
 	}
-	// Route through the team's runner so the run is queued in the same durable
-	// record every other parent message uses; needsPersist() then keeps it on
-	// disk, which is what survives this process exiting.
 	team.runner.send({
 		id: callerId,
 		cwd: saved?.cwd ?? process.cwd(),
@@ -255,11 +289,19 @@ export function pumpWakeRequest(
 		sessionFile,
 		text: request.content,
 	});
-	if (!consumeWakeRequest(team.agentDir, callerId, request.nonce)) {
-		// A newer request replaced this one mid-flight; it stays for next tick.
-		return true;
-	}
+	consumeWakeRequest(team.agentDir, callerId, request.nonce);
 	return true;
+}
+
+/**
+ * Supervisor-tick entry point: deliver a pending wake for a session this
+ * process holds but is not currently running a turn on.
+ */
+export function pumpWakeRequest(
+	team: WorkerTeam,
+	callerId: string,
+): boolean {
+	return consumeWake(team, callerId);
 }
 
 /** Drop the armed team and any pending evaluation on session end. */

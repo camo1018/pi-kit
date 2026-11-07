@@ -9,8 +9,9 @@ import type {
 } from "../../lib/inbox-agents.ts";
 import { WorkerTeam, type WorkerRunner } from "./workers.ts";
 
-export function setup(t: TestContext) {
-	const dir = fs.mkdtempSync(join(tmpdir(), "pi-worker-test-"));
+export function setup(t: TestContext, reuseTeam?: WorkerTeam) {
+	const dir = reuseTeam?.agentDir ??
+		fs.mkdtempSync(join(tmpdir(), "pi-worker-test-"));
 	const agents = new Map<string, BgAgent>();
 	const files = new Map<string, string>();
 	const calls: { kind: string; data: unknown }[] = [];
@@ -61,7 +62,7 @@ export function setup(t: TestContext) {
 			supervision.push(options);
 		},
 	};
-	const team = new WorkerTeam(dir, runner);
+	const team = reuseTeam ?? new WorkerTeam(dir, runner);
 	const spawn = (parentId = "parent") =>
 		team.spawn({
 			parentId,
