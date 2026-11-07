@@ -13,6 +13,7 @@ import {
 	spawnAgent,
 	startAgentSupervisor,
 } from "../../lib/inbox-agents.ts";
+import { pumpWakeRequest } from "./wake.ts";
 
 export const inboxRunner = {
 	spawn: spawnAgent,
@@ -165,8 +166,9 @@ export class WorkerTeam {
 					adoptSessionIds: new Set(
 						this.workers(caller).map((worker) => worker.id),
 					),
+					onTick: () => pumpWakeRequest(this, caller),
 				}
-			: undefined;
+			: { onTick: () => pumpWakeRequest(this, caller) };
 		this.runner.supervise(options);
 	}
 

@@ -672,6 +672,12 @@ export interface AgentSupervisorOptions {
 	/** Background parents must restrict adoption to their delegated team. */
 	allowBackground?: boolean;
 	adoptSessionIds?: ReadonlySet<string>;
+	/**
+	 * Called on every supervisor tick, before orphan adoption. Extensions use it
+	 * to apply durable cross-process work (e.g. a queued wake) that must be
+	 * picked up by whichever process holds the session, not by the writer.
+	 */
+	onTick?: () => void;
 }
 
 /** Heartbeat owned runs and adopt orphans; safe across session reloads. */
@@ -684,6 +690,7 @@ export function startAgentSupervisor(options: AgentSupervisorOptions = {}) {
 	if (G[key]) clearInterval(G[key]);
 	const tick = () => {
 		for (const a of listAgents()) if (needsPersist(a)) persist(a);
+		options.onTick?.();
 		adoptOrphans(options.adoptSessionIds);
 	};
 	G[key] = setInterval(tick, OWNER_BEAT_MS);

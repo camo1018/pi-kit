@@ -131,8 +131,9 @@ propagated.
    exactly once with one new turn, which costs less than any number of `wait`
    returns. Use bounded `wait` only when you need an in-turn check, and `send`
    for scope changes or targeted follow-ups; messages to busy workers queue for
-   the next run. Background parents are agent children and are not woken, so
-   they still poll.
+   the next run. Background parents are woken too: the wake is queued durably
+   on the parent's own queue and delivered to the next run, so ending the turn
+   works whether you are in a terminal or a background agent.
    Shared notes refresh on model requests, not inside a running tool, so an
    idle worker may be blocked: inspect its reply before assuming success. Do
    not poll a stalled worker repeatedly or spawn replacements to dodge a

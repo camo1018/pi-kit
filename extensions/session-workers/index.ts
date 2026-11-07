@@ -13,6 +13,7 @@ import { installBackgroundMcpAutoApproval } from "../../lib/background-mcp-appro
 import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 import { bounded, WorkerTeam } from "./workers.ts";
 import {
+	dropPendingWake,
 	installWorkerWake,
 	resetWakeBudget,
 	uninstallWorkerWake,
@@ -126,10 +127,14 @@ export function registerSessionWorkers(
 		uninstallWorkerWake();
 	});
 
-	pi.on("input", (event) => {
+	pi.on("input", (event, ctx) => {
 		// Only real user input reopens the wake budget; extension sends bypass
 		// this hook, so a wake cannot re-arm itself.
-		if (event.source !== "extension") resetWakeBudget();
+		if (event.source !== "extension") {
+			resetWakeBudget();
+			// A real reply supersedes a wake still waiting to be delivered.
+			dropPendingWake(team, ctx.sessionManager.getSessionId());
+		}
 		return { action: "continue" as const };
 	});
 
