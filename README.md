@@ -86,6 +86,7 @@ For a cloned install, `git pull` is equivalent to `pi update --extension`.
 | `rename-chat/` | `rename-chat` tool so the agent can title sessions |
 | `command-case/` | Slash commands ignore caps-lock casing (`/RELOAD` behaves as `/reload`); args keep their casing
 | `inline-skills/` | `$skill` inline skill references |
+| `orch-web/` | A phone front end for the inbox: browse sessions, watch live transcripts, reply, queue, cancel and spawn agents from a browser on the same wifi. Not an extension — a daemon (`scripts/orch-web.sh`, launchd-installable). ⚠️ [docs](extensions/orch-web/README.md) |
 | `session-mention/` | Reference another saved session with `@[id]`; autocomplete shows titles but inserts stable ids, and bounded escaped transcripts expand only in request-time context. [docs](extensions/session-mention/README.md) |
 | `md-fence-render/` | Render ```` ```md ```` blocks as Markdown; `┌─ lang` / `└─` markers instead of ```` ``` ```` fences on code; copy-safe code block prompt rules. ⚠️ [internals](extensions/md-fence-render/README.md) |
 | `click-copy/` | Click a fenced block in fullscreen TUI to copy it exactly; requires `md-fence-render`. [docs](extensions/click-copy/README.md) |
