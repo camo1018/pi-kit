@@ -178,6 +178,51 @@
     bottom: calc(80px + env(safe-area-inset-bottom)); z-index: 40;
     background: #20262e; border: 1px solid var(--line); border-radius: 10px;
     padding: 9px 14px; font-size: 13.5px; max-width: 88vw; }
+
+  /* ── action sheet ── */
+  #scrim { position: fixed; inset: 0; background: #0008; z-index: 50;
+    display: flex; flex-direction: column; justify-content: flex-end;
+    padding-bottom: env(safe-area-inset-bottom); }
+  .sheet { background: var(--panel); border-top: 1px solid var(--line);
+    border-radius: 16px 16px 0 0; max-height: 86vh; display: flex;
+    flex-direction: column; }
+  .sheet h3 { margin: 0; padding: 14px 16px 8px; font-size: 13px;
+    font-weight: 600; color: var(--dim); text-transform: uppercase;
+    letter-spacing: .06em; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; }
+  .sheet .items { overflow-y: auto; -webkit-overflow-scrolling: touch;
+    padding: 0 0 8px; }
+  .sheet .act { display: flex; align-items: center; gap: 12px;
+    padding: 13px 16px; border-bottom: 1px solid var(--line);
+    font-size: 15.5px; }
+  .sheet .act:active { background: var(--panel-2); }
+  .sheet .act .ico { width: 22px; text-align: center; color: var(--dim);
+    flex: 0 0 auto; }
+  .sheet .act .lbl { flex: 1; }
+  .sheet .act .sub { color: var(--dim); font-size: 12.5px; margin-top: 1px; }
+  .sheet .act.danger, .sheet .act.danger .ico { color: var(--err); }
+  .sheet .act.on .lbl::after { content: " ✓"; color: var(--accent); }
+  .sheet .act.disabled { opacity: .4; pointer-events: none; }
+  .sheet .pad { padding: 12px 16px 16px; }
+  .sheet .pad input, .sheet .pad select, .sheet .pad textarea {
+    width: 100%; font: inherit; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 10px; padding: 10px 11px;
+    margin-bottom: 10px; resize: none; }
+  .sheet .pad label { display: block; color: var(--dim); font-size: 12px;
+    text-transform: uppercase; letter-spacing: .05em; margin: 0 0 5px; }
+  .sheet .row2 { display: flex; gap: 8px; }
+  .sheet .row2 > * { flex: 1; }
+  .rowMore { flex: 0 0 auto; align-self: center; color: var(--dim);
+    background: transparent; border: 0; min-height: 32px; padding: 0 4px;
+    font-size: 19px; line-height: 1; }
+  /* tabs above the list */
+  .tabs { display: flex; gap: 6px; padding: 8px 12px 2px; overflow-x: auto;
+    -webkit-overflow-scrolling: touch; }
+  .tabs button { font-size: 13px; padding: 5px 11px; min-height: 30px;
+    border-radius: 20px; background: transparent; color: var(--dim);
+    border: 1px solid var(--line); white-space: nowrap; }
+  .tabs button.on { color: var(--accent); border-color: #23314a;
+    background: #23314a40; }
 </style>
 </head>
 <body>
@@ -185,21 +230,24 @@
 <header id="listHead">
   <h1 id="h1">orch</h1>
   <button class="ghost" id="newBtn" title="New agent">＋</button>
+  <button class="ghost" id="menuBtn" title="More">☰</button>
   <button class="ghost" id="refresh" title="Refresh">⟳</button>
 </header>
 
+<div class="tabs" id="tabs"></div>
 <main id="list"></main>
 
 <section id="detail" class="hidden">
   <header id="detailHead">
     <button class="ghost" id="back" aria-label="Back to the list">‹</button>
     <h1 id="h2">…</h1>
+    <button class="ghost" id="moreBtn" title="Session actions">⋯</button>
   </header>
   <div id="log"></div>
   <div id="queueBox" class="queue hidden"></div>
   <footer>
     <textarea id="input" rows="1" placeholder="Message…"
-      enterkeyhint="send"></textarea>
+      enterkeyhint="enter"></textarea>
     <button class="primary" id="send">Send</button>
   </footer>
 </section>
@@ -212,6 +260,9 @@
     token: localStorage.getItem("orch.token") || "",
     rows: [],
     groups: [],
+    models: null,
+    /** "inbox" | "archived" | "all" | "hidden" — the same four tabs the TUI has. */
+    view: localStorage.getItem("orch.view") || "inbox",
     id: null,
     row: null,
     es: null,
@@ -354,7 +405,7 @@
     const list = $("#list");
     list.textContent = "";
     if (!store.rows.length) {
-      list.append(el("div", "empty", "No sessions yet."));
+      list.append(el("div", "empty", emptyText()));
       return;
     }
     const byGroup = new Map();
@@ -368,6 +419,10 @@
       const g = store.groups.find((x) => x.id === id);
       return g ? g.name : "Sessions";
     };
+    // Pinned first inside each section, like the TUI's ★ PINNED partition.
+    for (const rows of byGroup.values()) {
+      rows.sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0));
+    }
     const order = [...byGroup.keys()].sort((a, b) =>
       a === "__none" ? -1 : b === "__none" ? 1 :
       groupName(a).localeCompare(groupName(b)));
@@ -378,6 +433,41 @@
     }
   }
 
+  function emptyText() {
+    if (store.view === "archived") return "Nothing archived.";
+    if (store.view === "hidden") return "Nothing hidden.";
+    return "No sessions yet.";
+  }
+
+  const VIEWS = [
+    { id: "inbox", label: "Inbox" },
+    { id: "archived", label: "Archived" },
+    { id: "all", label: "All" },
+    { id: "hidden", label: "Hidden" },
+  ];
+
+  function renderTabs() {
+    const bar = $("#tabs");
+    bar.textContent = "";
+    for (const v of VIEWS) {
+      const b = el("button", store.view === v.id ? "on" : "", v.label);
+      b.onclick = () => setView(v.id);
+      bar.append(b);
+    }
+  }
+
+  function setView(id) {
+    if (store.view === id) return;
+    store.view = id;
+    localStorage.setItem("orch.view", id);
+    renderTabs();
+    // The three non-inbox tabs read the whole store, so clear before the fetch
+    // or the old rows show under the new tab's heading.
+    store.rows = [];
+    renderList();
+    refresh();
+  }
+
   function renderRow(row) {
     const n = el("div", row.child ? "row child" : "row");
     n.append(el("div", `dot ${dotClass(row)}`));
@@ -385,6 +475,7 @@
     const title = el("div", "title");
     if (row.pinned) title.append(el("span", "pre", "★ "));
     if (row.unread) title.append(el("span", "pre", "• "));
+    if (row.hidden) title.append(el("span", "pre", "⊘ "));
     // A parent with delegated workers gets a fold chip: tap the chip to open the
     // family, tap the row to open the session. Tapping the row too would make
     // expanding a fan-out cost you a session switch.
@@ -399,9 +490,8 @@
     title.append(document.createTextNode(row.title));
     body.append(title);
     const bits = [label(row), ago(row.updated)].filter(Boolean);
-    // Model ids look like "provider/model"; the provider adds no
-    // information here, the model name does.
-    if (row.model) bits.push(row.model.replace(/^[^/]+\//, ""));
+    if (row.archived) bits.push("archived");
+    if (row.model) bits.push(shortModel(row.model));
     body.append(el("div", "meta", bits.join(" · ")));
     const last = row.lastSaid?.text || row.lastText;
     if (last) {
@@ -414,9 +504,19 @@
     if (row.pending) badges.append(el("span", "pill queue", `${row.pending}⏳`));
     if (row.state === "working") badges.append(el("span", "pill work", "●"));
     n.append(badges);
+    // A row-level menu: the actions a long-press would offer, without making
+    // the row body any less of a "open the session" target.
+    const more = el("button", "rowMore", "⋯");
+    more.onclick = (ev) => { ev.stopPropagation(); rowMenu(row); };
+    n.append(more);
     n.onclick = () => open(row.id);
     return n;
   }
+
+  // Provider prefix is dropped for display only; the full reference is what the
+  // server stores. Strip any prefix rather than a known one, so this file stays
+  // free of any particular provider's name.
+  const shortModel = (m) => m.replace(/^[^/]+\//, "");
 
   /**
    * Open or close a parent's delegated workers. Flip locally first so the tap
@@ -438,8 +538,18 @@
 
   async function refresh() {
     try {
-      const data = await api("/api/rows");
-      store.rows = data.rows;
+      const q =
+        store.view === "archived" ? "?archived=1"
+        : store.view === "all" ? "?archived=1&hidden=1"
+        : store.view === "hidden" ? "?archived=1&hidden=1"
+        : "";
+      const data = await api(`/api/rows${q}`);
+      store.rows = data.rows.filter(
+        store.view === "hidden" ? (r) => r.hidden
+        : store.view === "archived" ? (r) => r.archived
+        : store.view === "all" ? () => true
+        : (r) => !r.archived,
+      );
       store.groups = data.groups;
       if (!store.id) renderList();
       $("#h1").textContent = "orch";
@@ -467,6 +577,7 @@
   /** Hide the overlay and refresh the list. Idempotent; safe to call twice. */
   function leave() {
     if (!store.id) return;
+    dismissSheet();
     inFlight.length = 0;
     stopWatch();
     store.id = null;
@@ -484,8 +595,19 @@
     else leave();
   }
 
-  // Back gesture, or close()'s history.back().
-  window.addEventListener("popstate", leave);
+  // Back gesture, or close()'s history.back(). A sheet is the innermost surface:
+  // if one is open, the gesture should close it rather than the whole session.
+  window.addEventListener("popstate", () => {
+    if (closeSheet) {
+      dismissSheet();
+      // Re-arm our history entry so leaving again still reaches the list.
+      if (store.id && history.state?.orch !== store.id) {
+        history.pushState({ orch: store.id }, "", "#" + store.id);
+      }
+      return;
+    }
+    leave();
+  });
 
   function stopWatch() {
     if (store.es) { store.es.close(); store.es = null; }
@@ -850,27 +972,534 @@
     log.scrollTop = log.scrollHeight;
   }
 
-  // ── new agent sheet (minimal, no framework) ───────────────────────
+  // ── action sheet ─────────────────────────────────────────────────
+  // One bottom sheet, reused for every menu: the session list, the row menu,
+  // and the detail header. Building it from a descriptor list keeps the phone
+  // UI honest about what the daemon actually supports.
+  let closeSheet = null;
+
+  function sheet(title, build) {
+    dismissSheet();
+    const scrim = el("div");
+    scrim.id = "scrim";
+    const box = el("div", "sheet");
+    if (title) box.append(el("h3", null, title));
+    const items = el("div", "items");
+    box.append(items);
+    scrim.append(box);
+    scrim.onclick = (e) => { if (e.target === scrim) dismissSheet(); };
+    document.body.append(scrim);
+    closeSheet = () => {
+      scrim.remove();
+      closeSheet = null;
+    };
+    build(items, dismissSheet);
+    return closeSheet;
+  }
+
+  function dismissSheet() {
+    if (closeSheet) closeSheet();
+  }
+
+  /**
+   * One action row. `run` closes the sheet first, so a following sheet (a
+   * picker, a prompt) opens on its own instead of stacking.
+   */
+  function act(parent, opts) {
+    const n = el("div", "act" + (opts.danger ? " danger" : "") +
+      (opts.on ? " on" : "") + (opts.disabled ? " disabled" : ""));
+    n.append(el("span", "ico", opts.icon || "·"));
+    const labelBox = el("div", "lbl");
+    labelBox.append(document.createTextNode(opts.label));
+    if (opts.sub) labelBox.append(el("div", "sub", opts.sub));
+    n.append(labelBox);
+    n.onclick = () => {
+      dismissSheet();
+      // Let the sheet close before a prompt/dialog steals focus on iOS.
+      setTimeout(() => { try { opts.run?.(); } catch (e) { toast(String(e.message || e)); } }, 0);
+    };
+    parent.append(n);
+    return n;
+  }
+
+  /** A sheet body with free-form fields; `fields` are appended before the buttons. */
+  function pad(parent, title) {
+    const p = el("div", "pad");
+    if (title) parent.append(el("h3", null, title));
+    parent.append(p);
+    return p;
+  }
+
+  function field(parent, { label, value, multiline, placeholder, type }) {
+    if (label) parent.append(el("label", null, label));
+    const n = multiline ? el("textarea") : el("input");
+    if (multiline) n.rows = multiline;
+    if (type) n.type = type;
+    if (placeholder) n.placeholder = placeholder;
+    if (value != null) n.value = value;
+    // iOS zooms the page on a <16px input; keep the font explicit.
+    n.style.fontSize = "16px";
+    parent.append(n);
+    return n;
+  }
+
+  // ── session actions ──────────────────────────────────────────────
+
+  /** The same action set as the TUI's inbox keys, in the order you reach for them. */
+  function rowMenu(row) {
+    sheet(row.title, (items, close) => {
+      act(items, {
+        icon: "↗", label: "Open",
+        run: () => open(row.id),
+      });
+      act(items, {
+        icon: "✎", label: "Rename",
+        run: () => renameSheet(row),
+      });
+      act(items, {
+        icon: "⇄", label: "Change model",
+        sub: row.model ? shortModel(row.model) : undefined,
+        run: () => modelSheet(row),
+      });
+      act(items, {
+        icon: "⧉", label: "Clone",
+        sub: row.state === "working" ? "cut before the active prompt" : undefined,
+        run: () => cloneSession(row),
+      });
+      act(items, {
+        icon: "◧", label: "Move to group",
+        sub: groupLabelOf(row),
+        run: () => groupSheet(row),
+      });
+      act(items, {
+        icon: row.pinned ? "★" : "☆",
+        label: row.pinned ? "Unpin" : "Pin to top",
+        on: row.pinned,
+        run: () => setMeta(row, { pinned: !row.pinned }, row.pinned ? "Unpinned" : "Pinned"),
+      });
+      act(items, {
+        icon: row.unread ? "●" : "○",
+        label: row.unread ? "Mark read" : "Mark unread",
+        run: () => setMeta(row, { unread: !row.unread }, row.unread ? "Marked read" : "Marked unread"),
+      });
+      act(items, {
+        icon: row.archived ? "↩" : "▣",
+        label: row.archived ? "Unarchive" : "Archive",
+        run: () => setMeta(row, { archived: !row.archived }, row.archived ? "Unarchived" : "Archived"),
+      });
+      act(items, {
+        icon: "⊘",
+        label: row.hidden ? "Unhide" : "Hide from inbox",
+        sub: row.hidden ? undefined : "the TUI's x — no rule needed",
+        run: () => setMeta(row, { hidden: !row.hidden }, row.hidden ? "Unhidden" : "Hidden"),
+      });
+      act(items, {
+        icon: "■",
+        label: "Cancel run",
+        sub: row.state === "working" || row.state === "queued" ? undefined : "not running",
+        disabled: !(row.state === "working" || row.state === "queued"),
+        danger: true,
+        run: () => cancelRun(row),
+      });
+    });
+  }
+
+  function groupLabelOf(row) {
+    if (!row.groupId) return "Ungrouped";
+    const g = store.groups.find((x) => x.id === row.groupId);
+    return g ? g.name : "Ungrouped";
+  }
+
+  async function setMeta(row, patch, message) {
+    try {
+      await api("/api/meta", { id: row.id, patch });
+      toast(message);
+      // Keep the open row's copy in step so its ⋯ menu shows the new state
+      // without waiting for the next SSE tick.
+      if (store.id === row.id) store.row = { ...store.row, ...metaToRow(patch) };
+      await refresh();
+    } catch (e) {
+      toast(e.message, 5000);
+    }
+  }
+
+  function metaToRow(patch) {
+    const out = {};
+    if ("pinned" in patch) out.pinned = patch.pinned;
+    if ("archived" in patch) out.archived = patch.archived;
+    if ("unread" in patch) out.unread = patch.unread;
+    if ("hidden" in patch) out.hidden = patch.hidden;
+    return out;
+  }
+
+  function renameSheet(row) {
+    sheet("Rename session", (items) => {
+      const p = pad(items);
+      const input = field(p, {
+        label: "Name",
+        value: row.title,
+        placeholder: "Session name",
+      });
+      input.focus();
+      input.select();
+      const save = el("button", "primary", "Save");
+      save.style.width = "100%";
+      const submit = async () => {
+        const name = input.value.trim();
+        if (!name) return toast("A name is required");
+        dismissSheet();
+        try {
+          const r = await api("/api/rename", { id: row.id, name });
+          toast(r.applied === "now" ? "Renamed" : "Renamed on the next run");
+          await refresh();
+          if (store.id === row.id) $("#h2").textContent = name;
+        } catch (e) {
+          toast(e.message, 6000);
+        }
+      };
+      save.onclick = submit;
+      input.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); submit(); } };
+      p.append(save);
+    });
+  }
+
+  /** Model + thinking level, from the same `enabledModels` list the TUI's N shows. */
+  async function modelSheet(row) {
+    if (!store.models) {
+      try { store.models = await api("/api/models"); } catch (e) { return toast(e.message, 5000); }
+    }
+    const data = store.models;
+    if (!data?.models?.length)
+      return toast("No models are enabled in settings.json", 6000);
+    const current = row.model || "";
+    const currentRef = current.replace(/:(off|minimal|low|medium|high|xhigh|max)$/, "");
+    const currentLevel = (current.match(/:(off|minimal|low|medium|high|xhigh|max)$/) || [])[1];
+
+    sheet("Model", (items) => {
+      for (const m of data.models) {
+        const isCurrent = m.reference === currentRef;
+        act(items, {
+          icon: isCurrent ? "●" : "○",
+          label: shortModel(m.reference),
+          sub: m.defaultLevel ? `default: ${m.defaultLevel}` : undefined,
+          on: isCurrent,
+          // A model row opens the level picker so one tap sets both; the
+          // default level is one more tap away.
+          run: () => levelSheet(row, m, isCurrent ? currentLevel : undefined),
+        });
+      }
+    });
+  }
+
+  function levelSheet(row, model, currentLevel) {
+    sheet(shortModel(model.reference), (items) => {
+      const levels = model.levels?.length ? model.levels : ["low", "medium", "high"];
+      const chosen = currentLevel || model.defaultLevel;
+      act(items, {
+        icon: "•",
+        label: "Model default",
+        sub: model.defaultLevel ? `use ${model.defaultLevel}` : undefined,
+        on: !currentLevel,
+        run: () => applyModel(row, model, undefined),
+      });
+      for (const level of levels) {
+        act(items, {
+          icon: level === chosen ? "●" : "○",
+          label: level,
+          on: level === chosen && !!currentLevel,
+          run: () => applyModel(row, model, level),
+        });
+      }
+    });
+  }
+
+  async function applyModel(row, model, level) {
+    const ref = level ? `${model.reference}:${level}` : model.reference;
+    try {
+      await api("/api/model", { id: row.id, model: ref });
+      toast(row.state === "working" ? "Model set for the next run" : "Model set");
+      await refresh();
+    } catch (e) {
+      toast(e.message, 6000);
+    }
+  }
+
+  function groupSheet(row) {
+    sheet("Move to group", (items) => {
+      act(items, {
+        icon: row.groupId ? "○" : "●",
+        label: "Ungrouped",
+        on: !row.groupId,
+        run: () => moveGroup(row, undefined),
+      });
+      for (const g of store.groups) {
+        act(items, {
+          icon: g.id === row.groupId ? "●" : "○",
+          label: g.name,
+          on: g.id === row.groupId,
+          run: () => moveGroup(row, g.id),
+        });
+      }
+      act(items, {
+        icon: "＋", label: "New group…",
+        run: () => createGroupSheet(row),
+      });
+    });
+  }
+
+  async function moveGroup(row, groupId) {
+    try {
+      await api("/api/group/move", { id: row.id, groupId });
+      toast("Moved");
+      await loadGroups();
+      await refresh();
+    } catch (e) {
+      toast(e.message, 5000);
+    }
+  }
+
+  function createGroupSheet(row) {
+    sheet("New group", (items) => {
+      const p = pad(items);
+      const input = field(p, { label: "Name", placeholder: "e.g. PR reviews" });
+      input.focus();
+      const save = el("button", "primary", "Create");
+      save.style.width = "100%";
+      save.onclick = async () => {
+        const name = input.value.trim();
+        if (!name) return toast("A group name is required");
+        dismissSheet();
+        try {
+          const r = await api("/api/group/edit", { action: "create", name });
+          await loadGroups();
+          if (row && r.group?.id) await moveGroup(row, r.group.id);
+          else { toast("Group created"); await refresh(); }
+        } catch (e) {
+          toast(e.message, 5000);
+        }
+      };
+      p.append(save);
+    });
+  }
+
+  async function loadGroups() {
+    try {
+      const data = await api("/api/rows");
+      store.groups = data.groups;
+    } catch {
+      // keep the old list
+    }
+  }
+
+  async function cloneSession(row) {
+    toast("Cloning…", 10_000);
+    try {
+      const r = await api("/api/clone", { id: row.id });
+      toast("Cloned");
+      await refresh();
+      if (r?.id) open(r.id);
+    } catch (e) {
+      toast(e.message, 6000);
+    }
+  }
+
+  async function cancelRun(row) {
+    try {
+      await api("/api/cancel", { id: row.id });
+      toast("Cancelled");
+      await refresh();
+    } catch (e) {
+      toast(e.message, 5000);
+    }
+  }
+
+  /** The header menu: everything that acts on the list or the app itself. */
+  function listMenu() {
+    sheet("orch", (items) => {
+      act(items, {
+        icon: "＋", label: "New agent",
+        run: () => newAgent(),
+      });
+      act(items, {
+        icon: "◧", label: "New group…",
+        run: () => createGroupSheet(undefined),
+      });
+      act(items, {
+        icon: "⟳", label: "Refresh",
+        run: () => refresh(),
+      });
+      if (store.groups.length) {
+        act(items, {
+          icon: "▤", label: "Groups",
+          sub: `${store.groups.length} defined`,
+          run: () => groupsSheet(),
+        });
+      }
+    });
+  }
+
+  function groupsSheet() {
+    sheet("Groups", (items) => {
+      for (const g of store.groups) {
+        act(items, {
+          icon: "◧",
+          label: g.name,
+          run: () => groupEditSheet(g),
+        });
+      }
+      act(items, { icon: "＋", label: "New group…", run: () => createGroupSheet(undefined) });
+    });
+  }
+
+  function groupEditSheet(group) {
+    sheet(group.name, (items) => {
+      act(items, {
+        icon: "✎", label: "Rename group",
+        run: () => {
+          sheet("Rename group", (sub) => {
+            const p = pad(sub);
+            const input = field(p, { label: "Name", value: group.name });
+            input.focus();
+            input.select();
+            const save = el("button", "primary", "Save");
+            save.style.width = "100%";
+            save.onclick = async () => {
+              const name = input.value.trim();
+              if (!name) return toast("A group name is required");
+              dismissSheet();
+              try {
+                await api("/api/group/edit", { action: "rename", id: group.id, name });
+                toast("Renamed");
+                await loadGroups();
+                await refresh();
+              } catch (e) { toast(e.message, 5000); }
+            };
+            p.append(save);
+          });
+        },
+      });
+      act(items, {
+        icon: "■", label: "Delete group", danger: true,
+        sub: "sessions move to Ungrouped",
+        run: async () => {
+          try {
+            await api("/api/group/edit", { action: "remove", id: group.id });
+            toast("Deleted");
+            await loadGroups();
+            await refresh();
+          } catch (e) { toast(e.message, 5000); }
+        },
+      });
+    });
+  }
+
+  // ── new agent ────────────────────────────────────────────────────
   function newAgent() {
-    const prompt = window.prompt("New agent — prompt:");
-    if (!prompt) return;
-    const cwd = window.prompt("Working directory:", store.row?.cwd || "");
-    if (cwd === null) return;
-    api("/api/new", { prompt, cwd: cwd.trim() || undefined })
-      .then((r) => { toast("Started"); return open(r.id); })
-      .catch((e) => toast(e.message));
+    sheet("New agent", (items) => {
+      const p = pad(items);
+      const prompt = field(p, {
+        label: "Prompt",
+        multiline: 4,
+        placeholder: "What should this agent do?",
+      });
+      const cwd = field(p, {
+        label: "Working directory",
+        value: store.row?.cwd || "",
+        placeholder: "default: the daemon's directory",
+      });
+      const groupRow = el("div", "row2");
+      p.append(groupRow);
+      const groupBox = el("div");
+      const modelBox = el("div");
+      groupRow.append(groupBox, modelBox);
+
+      groupBox.append(el("label", null, "Group"));
+      const groupSel = el("select");
+      groupSel.append(new Option("Ungrouped", ""));
+      for (const g of store.groups) groupSel.append(new Option(g.name, g.id));
+      groupBox.append(groupSel);
+
+      modelBox.append(el("label", null, "Model"));
+      const modelSel = el("select");
+      modelSel.append(new Option("Current default", ""));
+      modelBox.append(modelSel);
+      // The model list may not be loaded yet on a cold start; fill it in place.
+      (async () => {
+        try {
+          store.models ||= await api("/api/models");
+          for (const m of store.models?.models || []) {
+            modelSel.append(new Option(shortModel(m.reference), m.reference));
+          }
+        } catch { /* the default is still usable */ }
+      })();
+
+      const go = el("button", "primary", "Start agent");
+      go.style.width = "100%";
+      go.onclick = async () => {
+        const text = prompt.value.trim();
+        if (!text) return toast("A prompt is required");
+        dismissSheet();
+        toast("Starting…");
+        try {
+          const r = await api("/api/new", {
+            prompt: text,
+            cwd: cwd.value.trim() || undefined,
+            groupId: groupSel.value || undefined,
+            model: modelSel.value || undefined,
+          });
+          toast("Started");
+          await refresh();
+          if (r?.id) open(r.id);
+        } catch (e) {
+          toast(e.message, 6000);
+        }
+      };
+      p.append(go);
+      prompt.focus();
+    });
   }
 
   // ── wiring ────────────────────────────────────────────────────────
   $("#back").onclick = close;
   $("#refresh").onclick = refresh;
   $("#newBtn").onclick = newAgent;
+  $("#menuBtn").onclick = listMenu;
+  $("#moreBtn").onclick = () => { if (store.row) rowMenu(store.row); };
   $("#send").onclick = submit;
+  // Enter writes a newline: the Send button is right there, so the return key
+  // has no reason to be destructive. Cmd/Ctrl+Enter keeps a keyboard send for
+  // a desktop, where reaching for the button is the slower path.
   $("#input").addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.altKey) {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       submit();
     }
+  });
+  // Tapping the transcript dismisses the keyboard, so reading back through a
+  // long answer does not leave the composer covering half the screen.
+  //
+  // Pointer events, not click: the transcript is rebuilt on every stream tick,
+  // and a rebuild landing mid-press detaches the target so no `click` ever
+  // fires. A movement threshold keeps a scroll gesture from blurring instead.
+  let tapStart = null;
+  $("#log").addEventListener("pointerdown", (e) => {
+    tapStart = { x: e.clientX, y: e.clientY };
+  });
+  window.addEventListener("pointerup", (e) => {
+    const start = tapStart;
+    tapStart = null;
+    if (!start) return;
+    if (Math.abs(e.clientX - start.x) > 8 || Math.abs(e.clientY - start.y) > 8)
+      return; // a scroll, not a tap
+    const log = $("#log");
+    if (!log.getBoundingClientRect) return;
+    const r = log.getBoundingClientRect();
+    const inside =
+      e.clientX >= r.left && e.clientX <= r.right &&
+      e.clientY >= r.top && e.clientY <= r.bottom;
+    if (!inside) return;
+    const focused = document.activeElement;
+    if (focused && focused.id === "input") focused.blur();
   });
   $("#input").addEventListener("input", (e) => {
     const n = e.target;
@@ -884,6 +1513,7 @@
   });
 
   refresh();
+  renderTabs();
   setInterval(() => { if (!store.id) refresh(); }, 4000);
 })();
 </script>
