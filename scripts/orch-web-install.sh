@@ -7,6 +7,8 @@
 #   ./scripts/orch-web-install.sh --status         is it loaded?
 #   ./scripts/orch-web-install.sh --pair           print a phone pairing code
 #   ./scripts/orch-web-install.sh --capture-env    save the child environment
+#   ./scripts/orch-web-install.sh --term           install node-pty and enable it
+#   ./scripts/orch-web-install.sh --no-term        disable terminals again
 #   ./scripts/orch-web-install.sh --remove         stop and remove
 #
 # Run --capture-env once from a terminal where pi works, with
@@ -74,9 +76,58 @@ $name='$quoted'"
   echo "restart the daemon to pick it up: launchctl kickstart -k gui/$uid/dev.pi.orch-web"
 }
 
+# Terminals are opt-in and need a native module. Both halves live in the same
+# file so `--no-term` can undo exactly what `--term` did.
+deps="${ORCH_WEB_DEPS:-$HOME/.pi/agent/orch-web-deps}"
+
+toggle_term() {
+  want=$1   # 1 = on, 0 = off
+  if [ "$want" = 1 ]; then
+    # node-pty is a native module, so this needs a compiler toolchain once.
+    # It goes in its own prefix: pi-kit's node_modules is symlinks into the pi
+    # install, and a plain `npm install` there would replace them.
+    mkdir -p "$deps"
+    if [ ! -f "$deps/package.json" ]; then
+      printf '{"name":"orch-web-deps","private":true}\n' > "$deps/package.json"
+    fi
+    echo "installing node-pty into $deps ..."
+    (cd "$deps" && npm install --no-audit --no-fund node-pty) || {
+      echo "npm install failed; terminals stay off" >&2
+      exit 1
+    }
+    # Prebuilt binaries ship without the execute bit, and node-pty spawns the
+    # helper through posix_spawnp: without this every open fails.
+    find "$deps/node_modules/node-pty/prebuilds" -name spawn-helper \
+      -exec chmod +x {} \; 2>/dev/null || true
+  fi
+  mkdir -p "$(dirname "$envfile")"
+  touch "$envfile"
+  chmod 600 "$envfile"
+  # Rewrite only our line, so this never disturbs the captured environment.
+  tmp="$envfile.tmp.$$"
+  grep -v '^ORCH_WEB_ALLOW_TERM=' "$envfile" > "$tmp" || true
+  if [ "$want" = 1 ]; then echo 'ORCH_WEB_ALLOW_TERM=1' >> "$tmp"; fi
+  mv "$tmp" "$envfile"
+  chmod 600 "$envfile"
+  if [ "$want" = 1 ]; then
+    echo "terminals enabled: $envfile"
+  else
+    echo "terminals disabled: $envfile"
+  fi
+  echo "restart the daemon: launchctl kickstart -k gui/$uid/dev.pi.orch-web"
+}
+
 case "${1:-}" in
 --capture-env)
   capture_env
+  exit 0
+  ;;
+--term)
+  toggle_term 1
+  exit 0
+  ;;
+--no-term)
+  toggle_term 0
   exit 0
   ;;
 --remove)
@@ -140,7 +191,7 @@ case "${1:-}" in
   # An unknown flag used to fall through to a full install, which is a bad
   # surprise for something like --pair (that belongs to orch-web.sh).
   echo "orch-web-install.sh: unknown option: $1" >&2
-  echo "try: --capture-env | --status | --remove | --help" >&2
+  echo "try: --capture-env | --term | --no-term | --status | --remove | --help" >&2
   exit 2
   ;;
 esac

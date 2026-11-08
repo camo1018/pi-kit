@@ -286,6 +286,8 @@
     poll: null,
     /** Whether the transcript is pinned to the newest message (null = not yet known). */
     stickToBottom: null,
+    /** Whether the daemon offers a terminal (ORCH_WEB_ALLOW_TERM=1 + node-pty). */
+    term: null,
   };
 
   const $ = (s) => document.querySelector(s);
@@ -555,6 +557,19 @@
     }
   }
 
+  /**
+   * Is the phone allowed to open a shell? Only the daemon knows (the flag is
+   * read from its environment), and it is cheap enough to ask on every refresh.
+   */
+  async function termAvailable() {
+    try {
+      const s = await api("/api/term/status");
+      store.term = s.allowed === true && s.ready === true;
+    } catch {
+      store.term = false;
+    }
+  }
+
   async function refresh() {
     try {
       const q =
@@ -570,6 +585,8 @@
         : (r) => !r.archived,
       );
       store.groups = data.groups;
+      // Asked once per refresh; a daemon without terminals just says so.
+      void termAvailable();
       if (!store.id) renderList();
       $("#h1").textContent = "orch";
     } catch (e) {
@@ -1395,6 +1412,16 @@
           icon: "▤", label: "Groups",
           sub: `${store.groups.length} defined`,
           run: () => groupsSheet(),
+        });
+      }
+      // A terminal is the one thing the agent list cannot stand in for: an
+      // interactive prompt (re-auth, sudo, a TUI). Hidden unless the daemon
+      // was started with ORCH_WEB_ALLOW_TERM=1.
+      if (store.term === true) {
+        act(items, {
+          icon: "▮", label: "Terminal",
+          sub: "shell on the Mac",
+          run: () => location.assign("/terminal"),
         });
       }
     });

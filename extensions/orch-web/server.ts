@@ -23,6 +23,15 @@
  *   POST /api/meta              { id, patch }     pin / archive / unread / hide
  *   POST /api/seen              { id }
  *
+ * Terminals (opt-in, ORCH_WEB_ALLOW_TERM=1 — see terminal.ts):
+ *   GET  /terminal              the terminal client page
+ *   GET  /api/term/status       { allowed, ready, error?, current? }
+ *   POST /api/term/open         { cols, rows, fresh? }   -> TermInfo
+ *   GET  /api/term/:id/stream?since=N   SSE: base64 output chunks
+ *   POST /api/term/:id/input    { data }
+ *   POST /api/term/:id/resize   { cols, rows }
+ *   POST /api/term/:id/close    {}
+ *
  * Ownership rule (see lib/inbox-agents.ts): a session must only be written by
  * one process at a time. sendToAgent adopts a session and queues the message; the
  * supervisor only spawns a run when the session is idle. A live TUI turn on the
@@ -66,6 +75,7 @@ import {
 import { InboxGroups } from "../inbox/groups.ts";
 import { beforeRun } from "../../lib/session-branch.ts";
 import { writeClone } from "../../lib/session-clone.ts";
+import { loadPty, ptyStatus, TermError, TerminalHost } from "./terminal.ts";
 
 const AGENT_DIR = getAgentDir();
 const SESSIONS_DIR = path.join(AGENT_DIR, "sessions");
@@ -1103,8 +1113,38 @@ function config(): Config {
 	return running;
 }
 
+/**
+ * Terminals are the one feature that turns the bearer token into a literal
+ * login shell, so they are off unless the operator asked for them. The flag is
+ * read here, not per request, so one launchd restart is enough to change it.
+ */
+function termEnabled(): boolean {
+	return /^(1|true|yes|on)$/i.test((process.env.ORCH_WEB_ALLOW_TERM ?? "").trim());
+}
+
+let terminals: TerminalHost | undefined;
+export function terminalHost(): TerminalHost {
+	if (!terminals)
+		terminals = new TerminalHost({
+			enabled: termEnabled(),
+			audit: (event, detail) => say(event, detail ?? {}),
+		});
+	return terminals;
+}
+
 export function startOrchWeb(cfg: Config) {
 	running = cfg;
+	// Resolve node-pty once, in the background: a missing native build must not
+	// keep the daemon from serving the inbox.
+	void loadPty().then((spawn) => {
+		const status = ptyStatus();
+		say("term-ready", {
+			allowed: termEnabled(),
+			ready: status.ready,
+			error: status.error,
+		});
+		if (spawn && termEnabled()) terminalHost();
+	});
 	// Adopts agents whose owner stopped beating and keeps their queues draining.
 	startAgentSupervisor({});
 	// The model catalog names only what each provider supports per model, so the
@@ -1237,6 +1277,15 @@ function handlePair(res: http.ServerResponse, remote: string, code: string) {
 
 const PUBLIC_DIR = path.join(import.meta.dirname ?? __dirname, "public");
 
+/**
+ * Vendored browser assets, by exact filename. Listing them beats validating a
+ * path: a name that is not here is a 404, so nothing can walk out of the
+ * directory however it is encoded.
+ */
+const VENDOR_FILES = new Set(
+	["xterm.js", "xterm.css", "addon-fit.js"].map((n) => n.toLowerCase()),
+);
+
 async function handle(
 	req: http.IncomingMessage,
 	res: http.ServerResponse,
@@ -1257,6 +1306,20 @@ async function handle(
 	}
 	if (url.pathname === "/manifest.webmanifest") {
 		return serveStatic(res, path.join(PUBLIC_DIR, "manifest.webmanifest"));
+	}
+	if (url.pathname === "/terminal") {
+		return serveStatic(res, path.join(PUBLIC_DIR, "terminal.html"));
+	}
+	if (url.pathname.startsWith("/vendor/")) {
+		// Vendored xterm assets. The name is matched against the directory listing
+		// rather than joined blindly, so a `..` can never escape it.
+		const name = url.pathname.slice("/vendor/".length);
+		if (!VENDOR_FILES.has(name.toLowerCase())) {
+			res.writeHead(404, { "content-type": "text/plain" });
+			res.end("Not found\n");
+			return;
+		}
+		return serveStatic(res, path.join(PUBLIC_DIR, "vendor", name));
 	}
 	if (url.pathname === "/api/health") return sendJson(res, 200, { ok: true });
 
@@ -1308,6 +1371,31 @@ async function handle(
 	if (req.method === "GET" && url.pathname.startsWith("/api/stream/")) {
 		const id = url.pathname.slice("/api/stream/".length);
 		return streamAgent(res, id);
+	}
+
+	// ── terminals ──────────────────────────────────────────────────
+	if (req.method === "GET" && url.pathname === "/api/term/status") {
+		const host = terminalHost();
+		const status = ptyStatus();
+		return sendJson(res, 200, {
+			allowed: host.allowed,
+			ready: status.ready,
+			error: status.error,
+			current: host.current(),
+		});
+	}
+	if (req.method === "GET" && url.pathname.startsWith("/api/term/")) {
+		const rest = url.pathname.slice("/api/term/".length);
+		const slash = rest.indexOf("/");
+		if (slash < 0) return sendJson(res, 404, { error: "no such route" });
+		const id = decodeURIComponent(rest.slice(0, slash));
+		const verb = rest.slice(slash + 1);
+		if (verb !== "stream") return sendJson(res, 404, { error: "no such route" });
+		const since = Number(url.searchParams.get("since") ?? 0) || 0;
+		if (!terminalHost().attach(res, id, since, req.socket.remoteAddress)) {
+			sendJson(res, 404, { error: "no such terminal" });
+		}
+		return;
 	}
 
 	if (req.method === "POST") {
@@ -1397,6 +1485,60 @@ async function handle(
 				m.seenAt = Date.now();
 			});
 			return sendJson(res, 200, { ok: true });
+		}
+		if (route === "/api/term/open") {
+			const { cols, rows, fresh } = body as {
+				cols?: number;
+				rows?: number;
+				fresh?: boolean;
+			};
+			try {
+				const info = await terminalHost().open({
+					cols,
+					rows,
+					fresh,
+					remote: req.socket.remoteAddress,
+				});
+				return sendJson(res, 200, info);
+			} catch (e) {
+				const status = e instanceof TermError ? e.status : 500;
+				return sendJson(res, status, {
+					error: e instanceof Error ? e.message : String(e),
+				});
+			}
+		}
+		if (route.startsWith("/api/term/")) {
+			const rest = route.slice("/api/term/".length);
+			const slash = rest.indexOf("/");
+			if (slash < 0) return sendJson(res, 404, { error: "no such route" });
+			const id = decodeURIComponent(rest.slice(0, slash));
+			const verb = rest.slice(slash + 1);
+			const host = terminalHost();
+			try {
+				if (verb === "input") {
+					const data = (body as { data?: unknown }).data;
+					if (typeof data !== "string") throw new TermError(400, "data is required");
+					// A phone keyboard pastes whole lines; a runaway paste is not a
+					// reason to let one request stall the daemon.
+					if (data.length > 65_536) throw new TermError(413, "input too large");
+					host.input(id, data);
+					return sendJson(res, 200, { ok: true });
+				}
+				if (verb === "resize") {
+					const { cols, rows } = body as { cols?: number; rows?: number };
+					return sendJson(res, 200, host.resize(id, Number(cols), Number(rows)));
+				}
+				if (verb === "close") {
+					host.close(id, "requested");
+					return sendJson(res, 200, { ok: true });
+				}
+			} catch (e) {
+				const status = e instanceof TermError ? e.status : 500;
+				return sendJson(res, status, {
+					error: e instanceof Error ? e.message : String(e),
+				});
+			}
+			return sendJson(res, 404, { error: "no such route" });
 		}
 	}
 
