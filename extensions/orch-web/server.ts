@@ -50,7 +50,12 @@ import {
 	agentsSummary,
 	type BgAgent,
 } from "../../lib/inbox-agents.ts";
-import { readWorkerLinks, type WorkerLink } from "../inbox/families.ts";
+import {
+	projectFamilies,
+	readWorkerLinks,
+	WorkerFolds,
+	type WorkerLink,
+} from "../inbox/families.ts";
 import { InboxGroups } from "../inbox/groups.ts";
 
 const AGENT_DIR = getAgentDir();
@@ -573,6 +578,14 @@ interface Row {
 	unread: boolean;
 	groupId?: string;
 	parentId?: string;
+	/** True when this session was delegated by another one: drawn under its parent. */
+	child?: boolean;
+	/** Number of delegated children collapsed under this row. */
+	children?: number;
+	/** Whether those children are currently shown. */
+	expanded?: boolean;
+	/** Last child in its family: the client draws the tree tail. */
+	lastChild?: boolean;
 	firstPrompt: string;
 	lastSaid?: { role: string; text: string };
 	lastText: string;
@@ -586,6 +599,19 @@ const MAX_CONCURRENT = Math.max(
 function cleanTitle(s: string): string {
 	const t = (s ?? "").replace(/\s+/g, " ").trim();
 	return t.length > 90 ? `${t.slice(0, 89)}…` : t;
+}
+
+/**
+ * Which parents are expanded, read from the inbox's own fold file so the phone
+ * and the TUI agree. A missing or malformed file means "all collapsed", which is
+ * the useful default: the point of the feature is fewer rows.
+ */
+function readExpanded(): Set<string> {
+	try {
+		return new WorkerFolds(AGENT_DIR).load();
+	} catch {
+		return new Set();
+	}
 }
 
 /** A session is busy when this daemon runs it or another live pi process does. */
@@ -678,8 +704,34 @@ export function buildRows(opts: { currentId?: string; withArchived?: boolean } =
 		});
 	}
 	rows.sort((x, y) => y.updated - x.updated);
+	// Collapse delegated workers under the session that spawned them: a fan-out
+	// is otherwise one row per worker (137 children across 34 parents here) and
+	// buries the sessions the person actually started. projectFamilies is the
+	// same projection the TUI inbox draws, so the two views agree.
+	const projected = projectFamilies(rows, rows, links as WorkerLink[], {
+		id: (row: Row) => row.id,
+		expanded: readExpanded(),
+	});
+	const ordered: Row[] = [];
+	for (const item of projected) {
+		ordered.push({
+			...item.row,
+			child: item.child,
+			children: item.children.length,
+			expanded: item.expanded,
+		});
+		if (item.expanded) {
+			for (const [i, kid] of item.children.entries()) {
+				ordered.push({
+					...kid,
+					child: true,
+					lastChild: i === item.children.length - 1,
+				});
+			}
+		}
+	}
 	return {
-		rows,
+		rows: ordered,
 		groups: groups.groups ?? [],
 		defaultGroupId: groups.defaultGroupId,
 		summary: agentsSummary(),
@@ -1136,6 +1188,17 @@ async function handle(
 				}
 			});
 			return sendJson(res, 200, { ok: true, meta });
+		}
+		if (route === "/api/fold") {
+			const { id, expanded } = body as { id: string; expanded: boolean };
+			try {
+				new WorkerFolds(AGENT_DIR).setExpanded(id, !!expanded);
+			} catch (e) {
+				throw new Error(
+					e instanceof Error ? e.message : "could not save fold state",
+				);
+			}
+			return sendJson(res, 200, { ok: true, id, expanded: !!expanded });
 		}
 		if (route === "/api/seen") {
 			const id = (body as any).id as string;
