@@ -65,6 +65,30 @@
     background: var(--panel-2); border: 1px solid var(--line);
     border-radius: 7px; padding: 3px 7px; }
   #note.err h2 { color: var(--err); }
+
+  /* Paste overlay. A single-line prompt() silently turns newlines into
+     spaces, which turns a pasted block of commands into one compound command:
+     dangerous, and it looks like it worked. This keeps the text verbatim. */
+  #pasteBox {
+    position: fixed; inset: 0; z-index: 45; display: flex;
+    flex-direction: column; gap: 10px; padding: 14px;
+    background: var(--bg);
+    padding-top: calc(14px + env(safe-area-inset-top));
+    padding-bottom: calc(14px + env(safe-area-inset-bottom));
+  }
+  #pasteBox textarea {
+    flex: 1; min-height: 0; resize: none; width: 100%;
+    font: 13px/1.4 var(--mono); color: var(--text);
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px;
+    white-space: pre; overflow: auto;
+  }
+  #pasteBox .bar { display: flex; gap: 8px; align-items: center; }
+  #pasteBox .bar .hint { flex: 1; color: var(--dim); font-size: 12.5px; }
+  #pasteBox button.primary {
+    background: var(--accent); border-color: var(--accent);
+    color: #06101f; font-weight: 600;
+  }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -393,18 +417,68 @@
     location.assign("/");
   };
   $("#restart").onclick = () => { closing = false; start(true); };
+  /**
+   * Ask for a paste, verbatim.
+   *
+   * `navigator.clipboard.readText()` needs a secure context, and orch-web is
+   * plain http over the LAN, so the async clipboard is unavailable here — that
+   * is the normal case, not the exception. The fallback must preserve
+   * newlines: `prompt()` is a single-line field that turns them into spaces,
+   * which merges a pasted block of commands into one compound command.
+   */
+  function askPaste(prefill) {
+    if (document.querySelector("#pasteBox")) return;
+    const box = document.createElement("div");
+    box.id = "pasteBox";
+    const ta = document.createElement("textarea");
+    ta.spellcheck = false;
+    ta.autocapitalize = "off";
+    ta.autocorrect = "off";
+    ta.setAttribute("autocomplete", "off");
+    if (prefill) ta.value = prefill;
+    const bar = document.createElement("div");
+    bar.className = "bar";
+    const hint = document.createElement("span");
+    // Long-press in the field to bring up the system Paste menu; there is no
+    // clipboard read available on http, so this is the honest instruction.
+    hint.className = "hint";
+    hint.textContent = "long-press the box, Paste, then Send";
+    const cancel = document.createElement("button");
+    cancel.textContent = "Cancel";
+    const send = document.createElement("button");
+    send.className = "primary";
+    send.textContent = "Send";
+    bar.append(hint, cancel, send);
+    box.append(ta, bar);
+    document.body.append(box);
+
+    const close = () => { box.remove(); term.focus(); };
+    const commit = () => {
+      // The textarea keeps the newlines; anything else would change what the
+      // shell runs. A trailing newline is added so the last command executes.
+      const text = ta.value;
+      if (text) queue(text.endsWith("\n") ? text : text + "\n");
+      close();
+    };
+    cancel.onclick = close;
+    send.onclick = commit;
+    // Ctrl/Cmd+Enter sends, like a message composer.
+    ta.onkeydown = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); commit(); }
+      if (e.key === "Escape") { e.preventDefault(); close(); }
+    };
+    ta.focus();
+  }
+
   $("#paste").onclick = async () => {
-    // The clipboard API needs a live gesture and https; fall back to a prompt,
-    // which is what a phone can always do.
-    try {
-      const text = await navigator.clipboard.readText();
-      if (text) queue(text);
-      term.focus();
-      return;
-    } catch { /* fall through */ }
-    const text = window.prompt("Paste:");
-    if (text) queue(text);
-    term.focus();
+    const insecure = !window.isSecureContext || !navigator.clipboard?.readText;
+    if (!insecure) {
+      try {
+        const text = await navigator.clipboard.readText();
+        if (text) { askPaste(text); return; }
+      } catch { /* permission denied: fall through to manual paste */ }
+    }
+    askPaste("");
   };
 
   // ── boot ─────────────────────────────────────────────────────────
