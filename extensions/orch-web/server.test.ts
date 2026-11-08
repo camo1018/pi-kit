@@ -21,7 +21,8 @@ const agentDir = path.join(home, ".pi", "agent");
 fs.mkdirSync(path.join(agentDir, "sessions"), { recursive: true });
 
 const { buildRows, eventBytes, firstUserText, lanAddress, liveItems,
-	modelChoices, readLinesAt, readName, readTail } = await import("./server.ts");
+	modelChoices, readLinesAt, readName, readTail, sanitizeForLog } =
+	await import("./server.ts");
 
 function writeSession(opts: {
 	id: string;
@@ -404,6 +405,18 @@ test("delegated workers collapse under the session that spawned them", () => {
 	assert.equal(open[index]?.expanded, true);
 	assert.equal(open[index + 1]?.id, kid, "child sits under its parent");
 	assert.equal(open[index + 1]?.child, true);
+});
+
+test("log lines cannot carry terminal escapes into `tail -f`", () => {
+	// RemoteAddr is attacker-influenced; the log is read in a terminal.
+	const hostile = JSON.stringify({ remote: "1.2.3.4\u001b[2J\u001b]0;pwned\u0007" });
+	const safe = sanitizeForLog(hostile);
+	assert.equal(safe.includes("\u001b"), false, "no raw escape");
+	assert.equal(safe.includes("\u0007"), false, "no raw BEL");
+	assert.ok(safe.includes("\\u001b"), "escaped, still readable");
+	// Ordinary lines are untouched.
+	const plain = '{"event":"term-open","id":"t1"}';
+	assert.equal(sanitizeForLog(plain), plain);
 });
 
 test("lanAddress returns a usable IPv4 literal", () => {

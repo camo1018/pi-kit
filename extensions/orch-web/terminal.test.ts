@@ -123,6 +123,13 @@ test("ring drops from the front and reports the loss on resume", () => {
 	// A client that is current gets nothing at all.
 	assert.equal(ring.since(ring.lastSeq).truncated, false);
 	assert.deepEqual(ring.since(ring.lastSeq).chunks, []);
+
+	// Garbage from a query string is "everything you have", never a crash and
+	// never an unbounded scan.
+	for (const junk of [NaN, -1, -Infinity, Infinity, 1e308, 0.5]) {
+		const r = ring.since(junk);
+		assert.ok(Array.isArray(r.chunks), `since(${junk}) must return chunks`);
+	}
 });
 
 test("output streams to each viewer as base64, and a resume replays", () => {
@@ -370,6 +377,44 @@ test("closing a terminal ends its stream and stops its heartbeat", async () => {
 	assert.equal(viewer.writableEnded, true);
 	assert.ok(viewer.body().includes("event: close"), "client is told why");
 	assert.equal(host.attach(fakeRes(), term.id, 0), false, "gone");
+});
+
+test("the shell never inherits the daemon's bearer token", async () => {
+	// A shell can read its environment, so handing it ORCH_WEB_TOKEN would make
+	// the token survive rotating the token file: `echo $ORCH_WEB_TOKEN` would
+	// keep working long after the phone was revoked.
+	const saved = process.env.ORCH_WEB_TOKEN;
+	process.env.ORCH_WEB_TOKEN = "super-secret-daemon-token";
+	let seen: Record<string, string | undefined> | undefined;
+	try {
+		const host = new TerminalHost({
+			audit: () => {},
+			spawn: (_f, _a, opts) => {
+				seen = opts.env;
+				return fakePty();
+			},
+			enabled: true,
+		});
+		await host.open({});
+		assert.ok(seen, "spawn must have been called");
+		assert.equal(
+			"ORCH_WEB_TOKEN" in seen!,
+			false,
+			"the token must be absent from the child environment",
+		);
+		// Everything else survives: this is not a blank environment.
+		assert.ok(
+			Object.keys(seen!).length > 0,
+			"the shell still needs the daemon's environment",
+		);
+		// The inbox markers must not leak either.
+		assert.equal("PI_INBOX_BG_AGENT" in seen!, false);
+		assert.equal("PI_INBOX_BG_PARENT" in seen!, false);
+		host.dispose();
+	} finally {
+		if (saved === undefined) delete process.env.ORCH_WEB_TOKEN;
+		else process.env.ORCH_WEB_TOKEN = saved;
+	}
 });
 
 test("a terminal records the remote it was opened from", async () => {

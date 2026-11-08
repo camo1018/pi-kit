@@ -109,7 +109,12 @@ export class Ring {
 
 	/** Everything after `since`, plus whether the request fell off the front. */
 	since(since: number): { chunks: Chunk[]; truncated: boolean } {
-		if (since <= 0) return { chunks: [...this.chunks], truncated: false };
+		// The value arrives from a query string: NaN, negative and absurdly
+		// large numbers all mean "give me what you have". Without this a client
+		// could force a full replay on every reconnect by sending garbage.
+		if (!Number.isFinite(since) || since <= 0)
+			return { chunks: [...this.chunks], truncated: false };
+		if (since >= this.lastSeq) return { chunks: [], truncated: false };
 		if (since < this.firstSeq - 1)
 			return { chunks: [...this.chunks], truncated: true };
 		return { chunks: this.chunks.filter((c) => c.seq > since), truncated: false };
@@ -300,6 +305,11 @@ export class TerminalHost {
 		// it was spawned by the inbox supervisor.
 		delete env.PI_INBOX_BG_AGENT;
 		delete env.PI_INBOX_BG_PARENT;
+		// Never hand the shell the credential that authenticates this daemon.
+		// It would otherwise be readable at any prompt (`echo $ORCH_WEB_TOKEN`,
+		// `env`, a build script that dumps its environment), which turns a
+		// revocable token into one that survives rotating the token file.
+		delete env.ORCH_WEB_TOKEN;
 
 		const pty = this.spawnFn(file, args, {
 			name: "xterm-256color",

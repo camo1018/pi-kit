@@ -821,6 +821,11 @@ function run(a: BgAgent) {
 				PI_INBOX_BG_PARENT: String(process.pid),
 				PI_INBOX_BG_AGENT: a.id,
 				[BACKGROUND_MCP_AUTO_APPROVE_ENV]: "1",
+				// The daemon's bearer credential is not a child agent's
+				// business: an agent can read its environment, and a run that
+				// leaks it would defeat rotating the token file. Undefined
+				// deletes the key from the child's environment.
+				ORCH_WEB_TOKEN: undefined,
 			},
 			stdio: ["pipe", outFd, errFd],
 			detached: true,
