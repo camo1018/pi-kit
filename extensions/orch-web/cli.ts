@@ -23,7 +23,12 @@ import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { lanAddress, mintPairCode, startOrchWeb } from "./server.ts";
+import {
+	lanAddress,
+	mintPairCode,
+	startOrchWeb,
+	stopOrchWeb,
+} from "./server.ts";
 
 const TOKEN_PATH = path.join(getAgentDir(), "orch-web-token");
 
@@ -124,7 +129,15 @@ if (process.argv.includes("--pair")) {
 		token,
 		hosts: baseHosts(process.env.ORCH_WEB_HOSTS),
 	});
-	const stop = () => server.close(() => process.exit(0));
+	// launchd sends SIGTERM on restart/stop. Shutting down properly is what
+	// stops a PTY from being orphaned and a restart from hanging on an open
+	// stream; see stopOrchWeb().
+	let stopping = false;
+	const stop = () => {
+		if (stopping) return;
+		stopping = true;
+		void stopOrchWeb(server).finally(() => process.exit(0));
+	};
 	process.on("SIGTERM", stop);
 	process.on("SIGINT", stop);
 }

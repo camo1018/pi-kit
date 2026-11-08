@@ -211,6 +211,8 @@ interface Term {
 	pty: PtyLike;
 	ring: Ring;
 	viewers: Set<http.ServerResponse>;
+	/** Timers for this terminal's viewers, so shutdown can clear them too. */
+	beats: Set<ReturnType<typeof setInterval>>;
 	lastInput: number;
 	lastViewer: number;
 	closed: boolean;
@@ -322,6 +324,7 @@ export class TerminalHost {
 			pty,
 			ring: new Ring(),
 			viewers: new Set(),
+			beats: new Set(),
 			lastInput: now,
 			lastViewer: now,
 			closed: false,
@@ -403,8 +406,10 @@ export class TerminalHost {
 		const beat = setInterval(() => {
 			if (!write(res, ": keep-alive\n\n")) clearInterval(beat);
 		}, HEARTBEAT_MS);
+		term.beats.add(beat);
 		const cleanup = () => {
 			clearInterval(beat);
+			term.beats.delete(beat);
 			term.viewers.delete(res);
 			term.info.viewers = term.viewers.size;
 			term.lastViewer = this.now();
@@ -437,16 +442,14 @@ export class TerminalHost {
 		const term = this.terms.get(id);
 		if (!term) return;
 		term.closed = true;
-		try {
-			term.pty.kill();
-		} catch {
-			// already gone
-		}
+		killTerm(term);
 		for (const res of term.viewers) {
 			write(res, `event: close\ndata: ${JSON.stringify({ reason })}\n\n`);
 			res.end();
 		}
 		term.viewers.clear();
+		for (const beat of term.beats) clearInterval(beat);
+		term.beats.clear();
 		term.info.viewers = 0;
 		this.terms.delete(id);
 		this.audit("term-close", { id, pid: term.info.pid, reason });
@@ -475,6 +478,8 @@ export class TerminalHost {
 		const term = this.terms.get(id);
 		if (!term) return;
 		term.closed = true;
+		for (const beat of term.beats) clearInterval(beat);
+		term.beats.clear();
 		this.terms.delete(id);
 	}
 
@@ -491,7 +496,14 @@ export class TerminalHost {
 		this.timer.unref?.();
 	}
 
-	/** Shut every shell down; used when the daemon stops. */
+	/**
+	 * Shut every shell down; used when the daemon stops.
+	 *
+	 * Ending the viewer responses matters as much as killing the PTYs: an open
+	 * SSE stream keeps `server.close()` from ever completing, so a restart
+	 * would hang until launchd's SIGKILL, and the child shells would be
+	 * re-parented to init rather than dying with us.
+	 */
 	dispose(): void {
 		if (this.timer) clearInterval(this.timer);
 		this.timer = undefined;
@@ -531,6 +543,29 @@ function clamp(n: unknown, lo: number, hi: number, fallback: number): number {
 
 function exitEvent(code: number): string {
 	return `event: exit\ndata: ${JSON.stringify({ code })}\n\n`;
+}
+
+/**
+ * End a shell, and anything it started.
+ *
+ * node-pty's `kill()` signals the leader only; the kernel's SIGHUP to the pty
+ * session covers ordinary children, but a grandchild that calls `setsid` (a
+ * daemonized helper) would slip out of the session and survive. Signalling the
+ * process group first closes that hole; it is belt-and-braces, not the fix for
+ * any observed leak.
+ */
+function killTerm(term: { info: TermInfo; pty: PtyLike }): void {
+	try {
+		// node-pty makes the child a session leader, so its pgid is its pid.
+		process.kill(-term.info.pid, "SIGHUP");
+	} catch {
+		// no such group (already gone, or not a group leader)
+	}
+	try {
+		term.pty.kill();
+	} catch {
+		// already gone
+	}
 }
 
 /** Write, reporting failure instead of throwing into a timer or a data handler. */
