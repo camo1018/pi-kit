@@ -8,14 +8,19 @@
  *
  *   GET  /                      the single-page client (public/index.html)
  *   GET  /api/rows              inbox rows: sessions, live state, groups, unread
+ *   GET  /api/models            selectable models (enabledModels + thinking levels)
  *   GET  /api/agent/:id/stream  SSE: transcript + live run events (poll-based)
  *   POST /api/send              { id, text }      queue or start a run
- *   POST /api/new               { prompt, cwd?, model?, groupId? }
+ *   POST /api/new               { prompt, cwd?, model?, groupId?, title? }
  *   POST /api/cancel            { id }
  *   POST /api/queue/remove      { id, index }
  *   POST /api/queue/now         { id, index }
- *   POST /api/model             { id, model }
- *   POST /api/meta              { id, patch }     pin / archive / seen / unread
+ *   POST /api/model             { id, model }     provider/model[:thinking]
+ *   POST /api/rename            { id, name }
+ *   POST /api/clone             { id }            cut before a run's active prompt
+ *   POST /api/group/move        { id, groupId? }  groupId omitted = Ungrouped
+ *   POST /api/group/edit        { action, id?, name? }  create / rename / remove / default
+ *   POST /api/meta              { id, patch }     pin / archive / unread / hide
  *   POST /api/seen              { id }
  *
  * Ownership rule (see lib/inbox-agents.ts): a session must only be written by
@@ -31,6 +36,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	getAgentDir,
+	ModelRuntime,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -41,6 +47,7 @@ import {
 	listAgents,
 	markSeen,
 	removeQueuedMessage,
+	renameAgent,
 	sendQueuedMessageNow,
 	sessionModel,
 	sendToAgent,
@@ -57,6 +64,8 @@ import {
 	type WorkerLink,
 } from "../inbox/families.ts";
 import { InboxGroups } from "../inbox/groups.ts";
+import { beforeRun } from "../../lib/session-branch.ts";
+import { writeClone } from "../../lib/session-clone.ts";
 
 const AGENT_DIR = getAgentDir();
 const SESSIONS_DIR = path.join(AGENT_DIR, "sessions");
@@ -120,6 +129,19 @@ function updateMeta(id: string, patch: (m: SessionMeta) => void): SessionMeta {
 	const store = loadStore();
 	const meta = (store.sessions[id] ??= {});
 	patch(meta);
+	// Keep the file's shape the same as the inbox's: an unset key is absent, not
+	// present-and-undefined. The TUI treats the presence of these keys as truth.
+	for (const key of [
+		"pinnedAt",
+		"archivedAt",
+		"seenAt",
+		"unreadAt",
+		"clonedAt",
+		"filter",
+	] as const) {
+		if (!meta[key]) delete meta[key];
+	}
+	if (Object.keys(meta).length === 0) delete store.sessions[id];
 	writeAtomic(STORE_PATH, JSON.stringify(store, null, 2));
 	return meta;
 }
@@ -499,6 +521,129 @@ const nameCache = new Map<
 	{ mtimeMs: number; size: number; name: string | undefined }
 >();
 
+// ───────────────────────────── models ─────────────────────────────
+
+/**
+ * The model picker the phone shows.
+ *
+ * The TUI's `N` offers `ctx.scopedModels`, which pi derives from the
+ * `enabledModels` list in settings.json. The daemon has no session and so no
+ * scoped list, and resolving one needs provider auth and (for a gateway
+ * provider) a network round trip. Reading the same settings file is what keeps
+ * the two pickers identical, and it works with the laptop on a plane.
+ */
+export interface ModelChoice {
+	/** `provider/model`; the client appends `:thinking` when one is chosen. */
+	reference: string;
+	provider: string;
+	id: string;
+	/** The level this model would use with no explicit choice. */
+	defaultLevel?: string;
+	/** Levels to offer; narrowed by the model's `thinkingLevelMap` when known. */
+	levels: string[];
+}
+
+const ALL_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+interface SettingsFile {
+	enabledModels?: unknown;
+	defaultThinkingLevel?: unknown;
+	modelThinkingLevels?: Record<string, unknown>;
+}
+
+function readSettings(): SettingsFile {
+	try {
+		return JSON.parse(
+			fs.readFileSync(path.join(AGENT_DIR, "settings.json"), "utf-8"),
+		) as SettingsFile;
+	} catch {
+		return {};
+	}
+}
+
+/**
+ * Per-model supported levels, from the model catalog when it is reachable.
+ * Best effort: a provider that needs the network to enumerate models simply
+ * leaves every level on offer, and pi rejects an unsupported one on use.
+ */
+let levelCache: { at: number; map: Map<string, string[]> } | undefined;
+
+/** Built once at startup; `undefined` until then, and if creation failed. */
+let modelRuntime: ModelRuntime | undefined;
+
+export async function loadModelRuntime() {
+	try {
+		modelRuntime = await ModelRuntime.create({
+			allowModelNetwork: false,
+			refreshOnCreate: false,
+		});
+	} catch {
+		modelRuntime = undefined;
+	}
+	return modelRuntime;
+}
+
+function supportedLevels(): Map<string, string[]> {
+	const now = Date.now();
+	if (levelCache && now - levelCache.at < 60_000) return levelCache.map;
+	const map = new Map<string, string[]>();
+	try {
+		for (const m of modelRuntime?.getModels() ?? []) {
+			// A `null` entry in thinkingLevelMap means that level is unsupported.
+			const allowed = ALL_LEVELS.filter(
+				(level) => m.thinkingLevelMap?.[level] !== null,
+			);
+			if (allowed.length) map.set(`${m.provider}/${m.id}`, allowed);
+		}
+	} catch {
+		// no catalog available; every level stays on offer
+	}
+	levelCache = { at: now, map };
+	return map;
+}
+
+export function modelChoices(): {
+	models: ModelChoice[];
+	defaultLevel?: string;
+	source: "settings" | "none";
+} {
+	const settings = readSettings();
+	const enabled = Array.isArray(settings.enabledModels)
+		? settings.enabledModels.filter((v): v is string => typeof v === "string")
+		: [];
+	const perModel = settings.modelThinkingLevels ?? {};
+	const levels = supportedLevels();
+	const out: ModelChoice[] = [];
+	for (const reference of enabled) {
+		const slash = reference.indexOf("/");
+		if (slash <= 0) continue;
+		const provider = reference.slice(0, slash);
+		const id = reference.slice(slash + 1);
+		const configured = perModel[reference];
+		const defaultLevel =
+			typeof configured === "string"
+				? configured
+				: typeof settings.defaultThinkingLevel === "string"
+					? settings.defaultThinkingLevel
+					: undefined;
+		out.push({
+			reference,
+			provider,
+			id,
+			defaultLevel,
+			levels: levels.get(reference) ?? ALL_LEVELS,
+		});
+	}
+	return {
+		models: out,
+		defaultLevel:
+			typeof settings.defaultThinkingLevel === "string"
+				? settings.defaultThinkingLevel
+				: undefined,
+		source: out.length ? "settings" : "none",
+	};
+}
+
 // ───────────────────────────── live records ─────────────────────────────
 
 interface LiveRecord {
@@ -576,6 +721,8 @@ interface Row {
 	pinned: boolean;
 	archived: boolean;
 	unread: boolean;
+	/** Hidden by a manual override in the inbox's filter store. */
+	hidden?: boolean;
 	groupId?: string;
 	parentId?: string;
 	/** True when this session was delegated by another one: drawn under its parent. */
@@ -621,7 +768,12 @@ function busyState(a: BgAgent | undefined, live?: LiveRecord) {
 	return undefined;
 }
 
-export function buildRows(opts: { currentId?: string; withArchived?: boolean } = {}) {
+export function buildRows(opts: {
+	currentId?: string;
+	withArchived?: boolean;
+	/** Include sessions hidden by a manual `hide` override (the Filtered view). */
+	withHidden?: boolean;
+} = {}) {
 	const store = loadStore();
 	const live = readLive();
 	const links = readWorkerLinks(AGENT_DIR);
@@ -641,6 +793,9 @@ export function buildRows(opts: { currentId?: string; withArchived?: boolean } =
 	for (const h of scanHeaders()) {
 		const meta = store.sessions[h.id] ?? {};
 		if (meta.archivedAt && !opts.withArchived) continue;
+		// A manual `hide` (the TUI's `x` on a session no rule matched) is a filing
+		// decision, not a status: the phone honours it so both lists match.
+		if (meta.filter === "hide" && !opts.withHidden) continue;
 		const tail = readTail(h.path);
 		const bg = getAgent(h.id);
 		const liveRec = live.get(h.id);
@@ -664,6 +819,7 @@ export function buildRows(opts: { currentId?: string; withArchived?: boolean } =
 			needsYou: !!bg?.needsYou,
 			pinned: !!meta.pinnedAt,
 			archived: !!meta.archivedAt,
+			hidden: meta.filter === "hide",
 			unread:
 				(meta.unreadAt ?? 0) > (meta.seenAt ?? 0) || !!bg?.needsYou,
 			groupId: groupOf(h.id),
@@ -678,6 +834,7 @@ export function buildRows(opts: { currentId?: string; withArchived?: boolean } =
 		if (seen.has(a.id)) continue;
 		const meta = store.sessions[a.id] ?? {};
 		if (meta.archivedAt && !opts.withArchived) continue;
+		if (meta.filter === "hide" && !opts.withHidden) continue;
 		rows.push({
 			id: a.id,
 			title: cleanTitle(a.title),
@@ -693,6 +850,7 @@ export function buildRows(opts: { currentId?: string; withArchived?: boolean } =
 			needsYou: !!a.needsYou,
 			pinned: !!meta.pinnedAt,
 			archived: !!meta.archivedAt,
+			hidden: meta.filter === "hide",
 			unread: !!a.needsYou,
 			groupId: groupOf(a.id),
 			parentId: parentOf.get(a.id),
@@ -949,6 +1107,10 @@ export function startOrchWeb(cfg: Config) {
 	running = cfg;
 	// Adopts agents whose owner stopped beating and keeps their queues draining.
 	startAgentSupervisor({});
+	// The model catalog names only what each provider supports per model, so the
+	// phone can hide thinking levels that would be rejected. Optional: a failure
+	// just leaves every level on offer.
+	void loadModelRuntime();
 
 	// A spawned child that dies unnoticed is the failure mode that hid the last
 	// bug: say so on the log the moment the agent reports an error.
@@ -1134,8 +1296,13 @@ async function handle(
 			200,
 			buildRows({
 				withArchived: url.searchParams.get("archived") === "1",
+				withHidden: url.searchParams.get("hidden") === "1",
 			}),
 		);
+	}
+
+	if (req.method === "GET" && url.pathname === "/api/models") {
+		return sendJson(res, 200, modelChoices());
 	}
 
 	if (req.method === "GET" && url.pathname.startsWith("/api/stream/")) {
@@ -1186,8 +1353,31 @@ async function handle(
 					if (patch.unread) m.unreadAt = Date.now();
 					else m.seenAt = Date.now();
 				}
+				// The TUI's `x`: a manual filing that no rule decides. `hide` keeps
+				// the session out of the list; clearing it puts it back.
+				if ("hidden" in patch)
+					m.filter = patch.hidden ? "hide" : undefined;
 			});
 			return sendJson(res, 200, { ok: true, meta });
+		}
+		if (route === "/api/rename") {
+			const { id, name } = body as { id: string; name: string };
+			const next = String(name ?? "").trim();
+			if (!next) throw new Error("a name is required");
+			return sendJson(res, 200, doRename(id, next));
+		}
+		if (route === "/api/clone") {
+			const id = (body as any).id as string;
+			return sendJson(res, 200, doClone(id));
+		}
+		if (route === "/api/group/move") {
+			const { id, groupId } = body as { id: string; groupId?: string };
+			// Ungrouped is the absence of a membership, not a group id.
+			await new InboxGroups(AGENT_DIR).assign(id, groupId || undefined);
+			return sendJson(res, 200, { ok: true, id, groupId: groupId || undefined });
+		}
+		if (route === "/api/group/edit") {
+			return sendJson(res, 200, await doGroupEdit(body as any));
 		}
 		if (route === "/api/fold") {
 			const { id, expanded } = body as { id: string; expanded: boolean };
@@ -1214,7 +1404,7 @@ async function handle(
 }
 
 function doSend(id: string, text: string) {
-	const rows = buildRows({ withArchived: true }).rows;
+	const rows = buildRows({ withArchived: true, withHidden: true }).rows;
 	const row = rows.find((r) => r.id === id);
 	if (!row) throw new Error("session not found");
 	const file = sessionFileOf(id);
@@ -1338,6 +1528,114 @@ function sessionFileOf(id: string): string | undefined {
 	return a?.sessionFile;
 }
 
+/**
+ * Rename a session.
+ *
+ * The TUI has two paths and so does this: a background agent's child process
+ * applies the name itself (writing the file from here would be a second writer
+ * mid-run), while a quiet session is renamed in place. A session another pi is
+ * holding right now is refused outright — that turn could append at any moment,
+ * and the name would race it.
+ */
+function doRename(id: string, name: string) {
+	const agent = getAgent(id);
+	if (agent && (isAgentRunning(agent) || !sessionFileOf(id))) {
+		renameAgent(id, name);
+		return { ok: true, id, name, applied: "next-run" };
+	}
+	const file = sessionFileOf(id);
+	if (!file) throw new Error("that session isn't saved yet — try again in a moment");
+	const live = readLive().get(id);
+	if (live?.state === "working" && live.pid !== process.pid) {
+		throw new Error(
+			`it's working in another pi (pid ${live.pid}) — rename it there, or wait`,
+		);
+	}
+	SessionManager.open(file).appendSessionInfo(name);
+	if (agent) renameAgent(id, name);
+	return { ok: true, id, name, applied: "now" };
+}
+
+function isAgentRunning(a: BgAgent) {
+	return a.state === "working" || a.state === "queued";
+}
+
+/**
+ * Clone a session the way the inbox's `c` does: cut before the active prompt of
+ * a running agent, so the original keeps its in-flight work and the copy starts
+ * from the last completed step. The clone inherits the original's group.
+ */
+function doClone(id: string) {
+	const file = sessionFileOf(id);
+	if (!file || !fs.existsSync(file))
+		throw new Error("that session isn't saved yet — nothing to clone");
+	const agent = getAgent(id);
+	const sm = SessionManager.open(file);
+	const leaf =
+		agent && isAgentRunning(agent) ? beforeRun(sm, agent) : sm.getLeafId();
+	if (leaf === undefined)
+		throw new Error("can't locate the run's checkpoint, so nothing was cloned");
+	const groups = new InboxGroups(AGENT_DIR);
+	let groupId: string | undefined;
+	try {
+		groupId = groups.load().sessions?.[id];
+	} catch {
+		// an unreadable group store must not block the clone
+	}
+	const clone = writeClone({
+		file,
+		sessionDir: path.dirname(file),
+		leaf,
+		// Mark the clone: its tail ends at a tool result, which the row reader
+		// would otherwise call stalled until it has activity of its own.
+		onCloned: (cloneId) => {
+			updateMeta(cloneId, (m) => {
+				m.clonedAt = Date.now();
+			});
+		},
+	});
+	if (groupId) {
+		void groups.assign(clone.id, groupId).catch(() => {});
+	}
+	say("clone", { from: id, to: clone.id });
+	return { ok: true, id: clone.id, name: clone.name, file: clone.file };
+}
+
+/** Create / rename / remove a group, or change the default. */
+async function doGroupEdit(body: {
+	action: "create" | "rename" | "remove" | "default";
+	id?: string;
+	name?: string;
+}) {
+	const groups = new InboxGroups(AGENT_DIR);
+	switch (body?.action) {
+		case "create": {
+			const name = String(body.name ?? "").trim();
+			if (!name) throw new Error("a group name is required");
+			const group = await groups.create(name);
+			return { ok: true, group };
+		}
+		case "rename": {
+			const name = String(body.name ?? "").trim();
+			if (!body.id) throw new Error("id is required");
+			if (!name) throw new Error("a group name is required");
+			await groups.rename(body.id, name);
+			return { ok: true };
+		}
+		case "remove": {
+			if (!body.id) throw new Error("id is required");
+			await groups.remove(body.id);
+			return { ok: true };
+		}
+		case "default": {
+			await groups.setDefaultGroup(body.id || undefined);
+			return { ok: true, defaultGroupId: body.id || undefined };
+		}
+		default:
+			throw new Error("unknown group action");
+	}
+}
+
 function serveStatic(res: http.ServerResponse, file: string) {
 	let data: Buffer;
 	try {
@@ -1432,7 +1730,11 @@ function streamAgent(res: http.ServerResponse, id: string) {
 		if (closed) return;
 		try {
 			const a = getAgent(id);
-			const rows = buildRows({ withArchived: true, currentId: id });
+			const rows = buildRows({
+				withArchived: true,
+				withHidden: true,
+				currentId: id,
+			});
 			const row = rows.rows.find((r) => r.id === id);
 			// A run owned by another process (a TUI, or the parent of this
 			// daemon) has no registry handle here, so its in-flight output comes
