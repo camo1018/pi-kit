@@ -2,8 +2,11 @@
 # Install orch-web as a launchd login agent: starts at login, restarts on crash.
 #
 #   ./scripts/orch-web-install.sh                  install and start
-#   ./scripts/orch-web-install.sh --capture-env    save the child environment
+#   ./scripts/orch-web-install.sh --restart        restart (after code changes)
+#   ./scripts/orch-web-install.sh --stop           stop until next login/start
 #   ./scripts/orch-web-install.sh --status         is it loaded?
+#   ./scripts/orch-web-install.sh --pair           print a phone pairing code
+#   ./scripts/orch-web-install.sh --capture-env    save the child environment
 #   ./scripts/orch-web-install.sh --remove         stop and remove
 #
 # Run --capture-env once from a terminal where pi works, with
@@ -83,12 +86,52 @@ case "${1:-}" in
   exit 0
   ;;
 --status)
-  launchctl print "gui/$uid/$label" 2>/dev/null | grep -E "state|pid" | head -4 ||
-    echo "not loaded"
+  # Distinguish "not installed" from "launchctl refused to answer" — the latter
+  # happens in sandboxed shells and would otherwise look like the service is down.
+  out=$(launchctl print "gui/$uid/$label" 2>&1) || true
+  case "$out" in
+    *"Operation not permitted"*)
+      echo "launchctl unavailable here; run this from a normal Terminal" ;;
+    *"Could not find service"*|"")
+      echo "not loaded" ;;
+    *)
+      echo "loaded: $label"
+      printf '%s\n' "$out" | grep -E "state|pid" | head -4 ;;
+  esac
+  if [ -f "$HOME/.pi/agent/orch-web-token" ]; then
+    port="${ORCH_WEB_PORT:-8787}"
+    echo
+    echo "phone: http://$(hostname -s).local:$port/   (or this Mac's LAN IP)"
+    echo "pair:  $root/scripts/orch-web-install.sh --pair"
+  fi
   exit 0
   ;;
+--restart)
+  if ! launchctl print "gui/$uid/$label" >/dev/null 2>&1; then
+    echo "not installed; run $0 with no arguments first" >&2
+    exit 1
+  fi
+  launchctl kickstart -k "gui/$uid/$label"
+  sleep 3
+  if grep -aq "orch-web listening" "$log" 2>/dev/null; then
+    tail -2 "$log" | grep -a "listening\|local:" || true
+    echo "restarted"
+  else
+    echo "restarted, but no listen line yet; see $log" >&2
+  fi
+  exit 0
+  ;;
+--stop)
+  launchctl kill SIGTERM "gui/$uid/$label" 2>/dev/null ||
+    { echo "not loaded" >&2; exit 0; }
+  echo "stopped (KeepAlive restarts it at next login; use --remove to stop for good)"
+  exit 0
+  ;;
+--pair)
+  exec "$root/scripts/orch-web.sh" --pair
+  ;;
 --help|-h)
-  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
   ;;
 "")

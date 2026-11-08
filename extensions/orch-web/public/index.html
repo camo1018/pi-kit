@@ -373,8 +373,8 @@
     title.append(document.createTextNode(row.title));
     body.append(title);
     const bits = [label(row), ago(row.updated)].filter(Boolean);
-    // Model ids look like "provider/model"; the provider adds no information
-    // here, the model name does.
+    // Model ids look like "provider/model"; the provider adds no
+    // information here, the model name does.
     if (row.model) bits.push(row.model.replace(/^[^/]+\//, ""));
     body.append(el("div", "meta", bits.join(" · ")));
     const last = row.lastSaid?.text || row.lastText;
