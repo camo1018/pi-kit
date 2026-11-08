@@ -369,6 +369,43 @@ test("a session with no name still falls back to the first prompt", () => {
 	assert.equal(row?.title, "the first prompt");
 });
 
+test("delegated workers collapse under the session that spawned them", () => {
+	// A fan-out is one row per worker; uncollapsed it buries the sessions the
+	// person actually started.
+	const parent = "a0000020-0000-0000-0000-000000000020";
+	const kid = "a0000021-0000-0000-0000-000000000021";
+	writeSession({ id: parent, messages: [user("run a fan-out"), assistant("ok")] });
+	writeSession({ id: kid, messages: [user("delegated slice"), assistant("done")] });
+
+	const workerDir = path.join(agentDir, "session-workers", "workers");
+	fs.mkdirSync(workerDir, { recursive: true });
+	fs.writeFileSync(
+		path.join(workerDir, `${kid}.json`),
+		JSON.stringify({ id: kid, parentId: parent, createdAt: 1 }),
+	);
+
+	const collapsed = buildRows().rows;
+	const parentRow = collapsed.find((r) => r.id === parent);
+	assert.equal(parentRow?.children, 1, "parent should report one child");
+	assert.equal(parentRow?.expanded, false, "collapsed by default");
+	assert.equal(
+		collapsed.some((r) => r.id === kid),
+		false,
+		"the child is hidden while collapsed",
+	);
+
+	// Expanding reveals it directly beneath the parent, marked as a child.
+	fs.writeFileSync(
+		path.join(agentDir, "inbox-worker-folds.json"),
+		JSON.stringify({ version: 1, expanded: [parent] }),
+	);
+	const open = buildRows().rows;
+	const index = open.findIndex((r) => r.id === parent);
+	assert.equal(open[index]?.expanded, true);
+	assert.equal(open[index + 1]?.id, kid, "child sits under its parent");
+	assert.equal(open[index + 1]?.child, true);
+});
+
 test("lanAddress returns a usable IPv4 literal", () => {
 	const addr = lanAddress();
 	assert.match(addr, /^\d+\.\d+\.\d+\.\d+$/);

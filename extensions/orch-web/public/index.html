@@ -74,6 +74,21 @@
   .meta { color: var(--dim); font-size: 12.5px; margin-top: 2px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .badges { display: flex; gap: 6px; align-items: center; flex: 0 0 auto; }
+  /* Delegated workers hang under the session that spawned them. */
+  .row.child { padding-left: 34px; }
+  .row.child .title { font-size: 14px; font-weight: 500; }
+  .row.child::before {
+    content: "└"; position: absolute; margin-left: -17px;
+    color: var(--line); font-family: var(--mono);
+  }
+  .row { position: relative; }
+  .fold {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-size: 11.5px; color: var(--accent);
+    border: 1px solid #23314a; border-radius: 20px;
+    padding: 1px 7px; margin-right: 5px;
+  }
+  .fold:active { background: #23314a; }
   .pill { font-size: 11px; color: var(--dim); border: 1px solid var(--line);
     border-radius: 20px; padding: 2px 7px; }
   .pill.work { color: var(--work); border-color: #3a3320; }
@@ -364,12 +379,23 @@
   }
 
   function renderRow(row) {
-    const n = el("div", "row");
+    const n = el("div", row.child ? "row child" : "row");
     n.append(el("div", `dot ${dotClass(row)}`));
     const body = el("div", "body");
     const title = el("div", "title");
     if (row.pinned) title.append(el("span", "pre", "★ "));
     if (row.unread) title.append(el("span", "pre", "• "));
+    // A parent with delegated workers gets a fold chip: tap the chip to open the
+    // family, tap the row to open the session. Tapping the row too would make
+    // expanding a fan-out cost you a session switch.
+    if (!row.child && row.children > 0) {
+      const chip = el("span", "fold", `${row.expanded ? "▾" : "▸"} ${row.children}`);
+      chip.onclick = (ev) => {
+        ev.stopPropagation();
+        toggleFold(row);
+      };
+      title.append(chip);
+    }
     title.append(document.createTextNode(row.title));
     body.append(title);
     const bits = [label(row), ago(row.updated)].filter(Boolean);
@@ -390,6 +416,24 @@
     n.append(badges);
     n.onclick = () => open(row.id);
     return n;
+  }
+
+  /**
+   * Open or close a parent's delegated workers. Flip locally first so the tap
+   * feels instant, then persist; a failure reloads the list from the server so
+   * the UI never lies about what is collapsed.
+   */
+  async function toggleFold(row) {
+    const want = !row.expanded;
+    row.expanded = want;
+    renderList();
+    try {
+      await api("/api/fold", { id: row.id, expanded: want });
+      await refresh();
+    } catch (e) {
+      toast(e.message);
+      await refresh();
+    }
   }
 
   async function refresh() {
