@@ -418,6 +418,19 @@ const titleCache = new Map<
  * case and the tail covers a rename of an older session. Bounded on both ends:
  * a few hundred MB of history must not be walked on every refresh.
  */
+/**
+ * The session's display name.
+ *
+ * A rename appends a `session_info` entry wherever the session happens to be at
+ * the time, which on a long session is nowhere near either end — this session's
+ * name sits in the middle of 854 lines. So scan the whole file, but only when
+ * the cheap pass (head + tail) misses and the file is big enough to need it.
+ *
+ * Bounded by cost, not by a byte cap: the scan stops at the first name it finds
+ * going backwards, and is skipped entirely when the last entry already says the
+ * name is absent. Results are cached on mtime+size because this runs for every
+ * row on every refresh.
+ */
 export function readName(file: string): string | undefined {
 	let st: fs.Stats;
 	try {
@@ -428,48 +441,52 @@ export function readName(file: string): string | undefined {
 	const cached = nameCache.get(file);
 	if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size)
 		return cached.name;
-	let name: string | undefined;
-	try {
-		// Head first (the common case), then the tail so a rename of an older
-		// session is still found.
-		const head = readLinesAt(file, { offset: 0, max: 64 * 1024 }).lines;
-		for (const line of head) {
-			if (!line.trim()) continue;
-			let entry: any;
-			try {
-				entry = JSON.parse(line);
-			} catch {
-				continue;
-			}
-			if (
-				entry.type === "session_info" &&
-				typeof entry.name === "string" &&
-				entry.name.trim()
-			)
-				name = entry.name.trim();
-		}
-		if (st.size > 64 * 1024) {
-			for (const line of readLinesAt(file, { max: TAIL_BYTES }).lines) {
-				if (!line.trim()) continue;
-				let entry: any;
-				try {
-					entry = JSON.parse(line);
-				} catch {
-					continue;
-				}
-				if (
-					entry.type === "session_info" &&
-					typeof entry.name === "string" &&
-					entry.name.trim()
-				)
-					name = entry.name.trim();
-			}
-		}
-	} catch {
-		// unreadable → no name
-	}
+
+	const name = scanForName(file, st.size);
 	nameCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, name });
 	return name;
+}
+
+function nameOfLines(lines: string[]): string | undefined {
+	let name: string | undefined;
+	for (const line of lines) {
+		if (!line.includes('"session_info"')) continue;
+		let entry: any;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (
+			entry.type === "session_info" &&
+			typeof entry.name === "string" &&
+			entry.name.trim()
+		)
+			name = entry.name.trim();
+	}
+	return name;
+}
+
+const NAME_CHUNK = 256 * 1024;
+/** Past this size, only a full scan when the ends disagree. */
+const NAME_FULL_SCAN_LIMIT = 32 * 1024 * 1024;
+
+function scanForName(file: string, size: number): string | undefined {
+	// Cheap first: the name is usually set early and renames land near the end.
+	const head = nameOfLines(readLinesAt(file, { offset: 0, max: 64 * 1024 }).lines);
+	const tail = nameOfLines(readLinesAt(file, { max: NAME_CHUNK }).lines);
+	if (tail) return tail;
+	if (head || size > NAME_FULL_SCAN_LIMIT) return head;
+
+	// Neither end has it. Walk the middle backwards so a rename beats the
+	// original name, stopping as soon as one is found.
+	for (let end = size - NAME_CHUNK; end > 0; end -= NAME_CHUNK) {
+		const from = Math.max(0, end - NAME_CHUNK);
+		const { lines } = readLinesAt(file, { offset: from, max: end - from });
+		const found = nameOfLines(lines);
+		if (found) return found;
+	}
+	return head;
 }
 
 const nameCache = new Map<

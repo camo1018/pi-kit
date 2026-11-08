@@ -21,7 +21,7 @@ const agentDir = path.join(home, ".pi", "agent");
 fs.mkdirSync(path.join(agentDir, "sessions"), { recursive: true });
 
 const { buildRows, eventBytes, firstUserText, lanAddress, liveItems,
-	readLinesAt, readTail } = await import("./server.ts");
+	readLinesAt, readName, readTail } = await import("./server.ts");
 
 function writeSession(opts: {
 	id: string;
@@ -268,6 +268,105 @@ test("a long run keeps producing distinct change-detection keys", () => {
 		seen.add(eventBytes(id));
 	}
 	assert.equal(seen.size, 5);
+});
+
+test("a rename in the middle of a large session is found", () => {
+	// A rename appends a session_info entry wherever the session is at the time;
+	// on a long session that is nowhere near either end, which made the row fall
+	// back to the first prompt.
+	const id = "a0000010-0000-0000-0000-000000000010";
+	const dir = path.join(agentDir, "sessions", "--scratch--");
+	fs.mkdirSync(dir, { recursive: true });
+	const file = path.join(dir, `2026-01-01T00-00-00-000Z_${id}.jsonl`);
+
+	const filler = (tag: string) =>
+		JSON.stringify({
+			type: "message",
+			id: tag,
+			parentId: null,
+			timestamp: "2026-01-01T00:00:00.000Z",
+			message: { role: "user", content: [{ type: "text", text: "x".repeat(600) }] },
+		});
+	const lines = [
+		JSON.stringify({
+			type: "session",
+			version: 3,
+			id,
+			timestamp: "2026-01-01T00:00:00.000Z",
+			cwd: "/scratch",
+		}),
+	];
+	// ~1.8MB of history, then the rename, then more history so it is not at the end.
+	for (let i = 0; i < 1500; i++) lines.push(filler(`a${i}`));
+	lines.push(
+		JSON.stringify({
+			type: "session_info",
+			id: "renamed",
+			parentId: null,
+			timestamp: "2026-01-01T00:00:00.000Z",
+			name: "Middle of the file",
+		}),
+	);
+	for (let i = 0; i < 1500; i++) lines.push(filler(`b${i}`));
+	fs.writeFileSync(file, `${lines.join("\n")}\n`);
+
+	assert.ok(fs.statSync(file).size > 1_500_000, "fixture should be large");
+	assert.equal(readName(file), "Middle of the file");
+
+	// The row must use it, not the first prompt.
+	const row = buildRows().rows.find((r) => r.id === id);
+	assert.equal(row?.title, "Middle of the file");
+});
+
+test("a later rename beats an earlier one", () => {
+	const id = "a0000011-0000-0000-0000-000000000011";
+	const dir = path.join(agentDir, "sessions", "--scratch--");
+	fs.mkdirSync(dir, { recursive: true });
+	const file = path.join(dir, `2026-01-01T00-00-00-000Z_${id}.jsonl`);
+	const info = (name: string) =>
+		JSON.stringify({
+			type: "session_info",
+			id: name,
+			parentId: null,
+			timestamp: "2026-01-01T00:00:00.000Z",
+			name,
+		});
+	const msg = JSON.stringify({
+		type: "message",
+		id: "m",
+		parentId: null,
+		timestamp: "2026-01-01T00:00:00.000Z",
+		message: { role: "user", content: [{ type: "text", text: "hi" }] },
+	});
+	fs.writeFileSync(
+		file,
+		[
+			JSON.stringify({
+				type: "session",
+				version: 3,
+				id,
+				timestamp: "2026-01-01T00:00:00.000Z",
+				cwd: "/scratch",
+			}),
+			info("First name"),
+			msg,
+			info("Second name"),
+			msg,
+		].join("\n") + "\n",
+	);
+	assert.equal(readName(file), "Second name");
+});
+
+test("a session with no name still falls back to the first prompt", () => {
+	const file = writeSession({
+		id: "a0000012-0000-0000-0000-000000000012",
+		messages: [user("the first prompt"), assistant("ok")],
+	});
+	assert.equal(readName(file), undefined);
+	const row = buildRows().rows.find(
+		(r) => r.id === "a0000012-0000-0000-0000-000000000012",
+	);
+	assert.equal(row?.title, "the first prompt");
 });
 
 test("lanAddress returns a usable IPv4 literal", () => {
