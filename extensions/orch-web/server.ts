@@ -1221,7 +1221,18 @@ function say(event: string, detail: Record<string, unknown> = {}) {
 		pid: process.pid,
 		...detail,
 	});
-	process.stderr.write(`[orch-web] ${line}\n`);
+	// The log is a terminal artifact: it is read with `tail -f`. Control
+	// characters in a value (a crafted RemoteAddr is the realistic one) would
+	// otherwise be interpreted by whatever terminal reads the file.
+	process.stderr.write(`[orch-web] ${sanitizeForLog(line)}\n`);
+}
+
+/** Keep a log line printable: escape C0/C1 controls, DEL and the separators. */
+export function sanitizeForLog(s: string): string {
+	return s.replace(
+		/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g,
+		(c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
+	);
 }
 
 // ───────────────────────────── pairing ─────────────────────────────
@@ -1419,7 +1430,11 @@ async function handle(
 		const id = decodeURIComponent(rest.slice(0, slash));
 		const verb = rest.slice(slash + 1);
 		if (verb !== "stream") return sendJson(res, 404, { error: "no such route" });
-		const since = Number(url.searchParams.get("since") ?? 0) || 0;
+		// Clamp here as well as in Ring.since(): the route is the boundary, and a
+		// non-finite or negative value must never reach the buffer as anything
+		// but "everything you have".
+		const rawSince = Number(url.searchParams.get("since") ?? 0);
+		const since = Number.isFinite(rawSince) && rawSince > 0 ? rawSince : 0;
 		if (!terminalHost().attach(res, id, since, req.socket.remoteAddress)) {
 			sendJson(res, 404, { error: "no such terminal" });
 		}
@@ -1830,6 +1845,23 @@ function serveStatic(res: http.ServerResponse, file: string) {
 		"content-type": type,
 		"cache-control": "no-store",
 		"x-content-type-options": "nosniff",
+		// Nothing here is meant to be embedded, and the terminal page is a
+		// shell: refusing frames removes a clickjacking surface outright.
+		"x-frame-options": "DENY",
+		// Both pages are single files with their script and style inline and no
+		// remote origin, so 'unsafe-inline' is not a weakening here — it is what
+		// the zero-build design requires. Everything else is locked down.
+		"content-security-policy": [
+			"default-src 'self'",
+			"script-src 'self' 'unsafe-inline'",
+			"style-src 'self' 'unsafe-inline'",
+			"img-src 'self' data:",
+			"connect-src 'self'",
+			"frame-ancestors 'none'",
+			"base-uri 'none'",
+			"form-action 'self'",
+			"object-src 'none'",
+		].join("; "),
 	});
 	res.end(data);
 }

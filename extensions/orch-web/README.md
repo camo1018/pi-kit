@@ -140,6 +140,8 @@ you ask for it**. What is enforced either way:
 | Scrollback | 512 KB ring, bounded, replayed by sequence number |
 | Audit | every open/attach/close is a `[orch-web]` log line with the remote address |
 | Shutdown | a restart kills the shell and ends the stream, so nothing is orphaned |
+| No token in the shell | `ORCH_WEB_TOKEN` is stripped from the child environment, so `echo $ORCH_WEB_TOKEN` stays empty and rotating the token file still revokes |
+| No framing | `X-Frame-Options: DENY` plus a self-only CSP on the served pages |
 | Gate | same bearer token and `Host` check as every other route; `/vendor/` is a fixed file list |
 
 `ORCH_WEB_TERM_CMD` pins the shell to one command (default: `$SHELL -l`) — useful
@@ -243,6 +245,8 @@ Runtime state, all under `~/.pi/agent/`:
    with bounded caches keyed on mtime+size.
 4. **The token is a shell on the Mac.** Bind to the LAN address only, reject
    unknown `Host` headers, and require the bearer token on every `/api/` route.
+   Never hand that token to a child: a shell that can `echo` it outlives the
+   rotation you did to revoke it.
 5. **A PTY has to be asked for.** `ORCH_WEB_ALLOW_TERM=1` or no terminal; it is
    never a default, and it never weakens 1–4. One shell at a time, reaped when
    detached, everything audited.
