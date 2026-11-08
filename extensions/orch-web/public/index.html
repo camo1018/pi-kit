@@ -30,6 +30,10 @@
     padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
     overscroll-behavior-y: contain;
   }
+  /* While a session is open the overlay owns the viewport; the document behind
+     it must not scroll, or a gesture that escapes the transcript drags the
+     page (and the composer with it) instead of the transcript. */
+  body.detail-open { overflow: hidden; }
   header {
     position: sticky; top: 0; z-index: 10;
     display: flex; align-items: center; gap: 8px;
@@ -98,15 +102,28 @@
   .empty { padding: 40px 20px; text-align: center; color: var(--dim); }
 
   /* ── detail ── */
-  #detail { position: fixed; inset: 0; background: var(--bg); z-index: 20;
+  /* Sized from the *visual* viewport, not the layout one.
+    
+     iOS keeps the layout viewport at full height when the keyboard opens, so an
+     `inset: 0` overlay keeps the height it had before the keyboard: #log stays
+     tall, its content no longer overflows it, and there is genuinely nothing to
+     scroll. The drag then falls through to the document, which is what made the
+     transcript feel unscrollable while the page shifted around the composer.
+     --vv-height / --vv-top are kept current from visualViewport in the script. */
+  #detail { position: fixed; left: 0; right: 0; top: var(--vv-top, 0);
+    height: var(--vv-height, 100%); background: var(--bg); z-index: 20;
     display: flex; flex-direction: column;
     padding-top: env(safe-area-inset-top); }
   /* The overlay covers the page header, so it needs its own. */
   #detailHead { flex: 0 0 auto; position: static; }
   #back { font-size: 26px; line-height: 1; padding: 2px 12px 6px 8px;
     color: var(--accent); min-height: 0; }
-  #log { flex: 1; overflow-y: auto; padding: 12px 12px 8px;
-    -webkit-overflow-scrolling: touch; }
+  /* min-height:0 so the scroller can shrink below its content height; without
+     it a column flex child refuses to shrink and the overflow escapes to the
+     page. overscroll-behavior keeps a flick at either end from scrolling the
+     document behind the overlay. */
+  #log { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 12px 8px;
+    overscroll-behavior: contain; }
   .msg { margin: 0 0 12px; }
   .msg .who { font-size: 11.5px; color: var(--dim); margin-bottom: 3px;
     text-transform: uppercase; letter-spacing: .05em; }
@@ -267,6 +284,8 @@
     row: null,
     es: null,
     poll: null,
+    /** Whether the transcript is pinned to the newest message (null = not yet known). */
+    stickToBottom: null,
   };
 
   const $ = (s) => document.querySelector(s);
@@ -560,8 +579,49 @@
   }
 
   // ── detail ────────────────────────────────────────────────────────
+
+  /**
+   * Keep the overlay the size of the *visible* area.
+   *
+   * On iOS the layout viewport keeps its full height when the keyboard opens,
+   * and a `position: fixed; inset: 0` box keeps that height: the transcript
+   * stays as tall as before the keyboard, so its content no longer overflows
+   * and it cannot scroll, while the visible sliver scrolls the document
+   * instead. visualViewport reports what is actually on screen, so mirror it
+   * onto the overlay. `offsetTop` covers the page-shifted-up case (older iOS
+   * pushes the whole viewport rather than resizing it).
+   */
+  function syncViewport() {
+    const vv = window.visualViewport;
+    const root = document.documentElement;
+    if (!vv) {
+      root.style.removeProperty("--vv-height");
+      root.style.removeProperty("--vv-top");
+      return;
+    }
+    root.style.setProperty("--vv-height", `${Math.round(vv.height)}px`);
+    root.style.setProperty("--vv-top", `${Math.round(vv.offsetTop)}px`);
+    // The transcript just got taller or shorter under the same scrollTop. Stay
+    // pinned to the newest message if that is where the reader already was;
+    // leave a scrolled-back reader alone.
+    const log = document.getElementById("log");
+    if (log && !document.getElementById("detail").classList.contains("hidden")) {
+      if (store.stickToBottom !== false) log.scrollTop = log.scrollHeight;
+    }
+  }
+
+  if (window.visualViewport) {
+    // resize covers the keyboard opening and closing; scroll covers iOS
+    // shifting the page instead of resizing it. Both are cheap and idempotent.
+    window.visualViewport.addEventListener("resize", syncViewport);
+    window.visualViewport.addEventListener("scroll", syncViewport);
+    window.addEventListener("orientationchange", syncViewport);
+  }
+
   async function open(id) {
     store.id = id;
+    document.body.classList.add("detail-open");
+    syncViewport();
     $("#detail").classList.remove("hidden");
     $("#list").classList.add("hidden");
     $("#log").textContent = "";
@@ -582,6 +642,7 @@
     stopWatch();
     store.id = null;
     store.row = null;
+    document.body.classList.remove("detail-open");
     $("#detail").classList.add("hidden");
     $("#list").classList.remove("hidden");
     document.title = "orch";
@@ -819,6 +880,7 @@
     const log = $("#log");
     const atBottom =
       log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+    store.stickToBottom = atBottom;
     log.textContent = "";
 
     reconcileInFlight(messages);
@@ -1501,6 +1563,13 @@
     const focused = document.activeElement;
     if (focused && focused.id === "input") focused.blur();
   });
+  // A reader scrolled back must not be dragged to the bottom by a stream tick
+  // or by the keyboard resizing the viewport.
+  $("#log").addEventListener("scroll", () => {
+    const log = $("#log");
+    store.stickToBottom =
+      log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+  }, { passive: true });
   $("#input").addEventListener("input", (e) => {
     const n = e.target;
     n.style.height = "auto";
