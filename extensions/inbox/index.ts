@@ -560,6 +560,30 @@ function matchRule(info: SessionInfo, set: FilterSet): string | undefined {
 	return undefined;
 }
 
+/**
+ * A prompt in a session lifts the manual filing that would otherwise keep it
+ * out of the inbox: both an archive and a manual `x` hide.
+ *
+ * Extracted and exported so the rule has one definition and can be tested
+ * without instantiating the whole Inbox extension. The `agent_start` handler
+ * calls this; a wake reaches that handler like any other prompt, which is how
+ * a premature archive is corrected.
+ *
+ * Returns true when the meta changed.
+ */
+export function liftManualFiling(meta: SessionMeta): boolean {
+	let changed = false;
+	if (meta.archivedAt) {
+		meta.archivedAt = undefined;
+		changed = true;
+	}
+	if (meta.filter === "hide") {
+		meta.filter = undefined;
+		changed = true;
+	}
+	return changed;
+}
+
 function isFiltered(meta: SessionMeta, rule: string | undefined): boolean {
 	return meta.filter === "hide" || (!!rule && meta.filter !== "show");
 }
@@ -3570,6 +3594,20 @@ function editorFocused(): boolean {
 // background agent. ctrl+q jumps to the agent that finished last, `h` returns home. State lives on
 // globalThis because the extension is re-instantiated on every session switch.
 
+/**
+ * What a foreign-run observation means. Split out from the watcher so the
+ * transition logic can be tested without a TUI: only the two edges matter —
+ * a run starting (show a badge) and a run ending (reload the transcript).
+ * Steady state must be silent, or the 5s tick would reload on every pass.
+ */
+export function foreignRunMove(
+	wasActive: boolean,
+	isActive: boolean,
+): "none" | "started" | "finished" {
+	if (isActive) return wasActive ? "none" : "started";
+	return wasActive ? "finished" : "none";
+}
+
 interface ModeState {
 	on: boolean;
 	flagApplied: boolean;
@@ -3594,6 +3632,14 @@ interface ModeState {
 	lastFinished?: string;
 	/** Id the next inbox open should land on instead of painting the list (ctrl+q). */
 	jumpTo?: string;
+	/**
+	 * Last foreign-run state seen per session id: true while another pi process
+	 * is driving that session. Used to notice the transition to "done" so the
+	 * on-screen transcript can be reloaded from disk.
+	 */
+	foreignRun?: Map<string, boolean>;
+	/** Sessions already reloaded for the current foreign run, so one run reloads once. */
+	foreignReloaded?: Set<string>;
 }
 const MODE_KEY = Symbol.for("pi.inbox.mode");
 /** Agent id whose queue manager currently owns an overlay. */
@@ -3609,6 +3655,8 @@ const modeState = (): ModeState => {
 	s.stale ??= new Set();
 	s.wasRunning ??= new Set();
 	s.betweenRuns ??= new Set();
+	s.foreignRun ??= new Map();
+	s.foreignReloaded ??= new Set();
 	return s;
 };
 
@@ -4575,7 +4623,12 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		// Interactive windows heartbeat their agents and adopt orphans left by closed/quit windows.
-		if (ctx.mode === "tui" && !isAgentChild()) startAgentSupervisor();
+		// The tick doubles as the foreign-run watcher: a run driven by another pi writing this
+		// session (the phone front end) is only visible as file state, so it needs a periodic look.
+		if (ctx.mode === "tui" && !isAgentChild()) {
+			installForeignRunWatch();
+			startAgentSupervisor({ onTick: () => watchForeignRun() });
+		}
 		if (ctx.mode === "tui") {
 			viewing = ctx.sessionManager.getSessionId();
 			markRead(viewing); // opening a session counts as looking at it
@@ -4642,19 +4695,21 @@ export default function (pi: ExtensionAPI) {
 		writeLive(ctx, "working");
 		// Sending a new prompt in an archived session brings it back to the inbox.
 		const id = ctx.sessionManager.getSessionId();
-		if (loadStore().sessions[id]?.archivedAt) {
+		const before = loadStore().sessions[id] ?? {};
+		const wasArchived = !!before.archivedAt;
+		const wasHidden = before.filter === "hide";
+		if (wasArchived || wasHidden) {
 			updateMeta(id, (m) => {
-				m.archivedAt = undefined;
+				liftManualFiling(m);
 			});
-			if (ctx.hasUI) ctx.ui.notify("📥 Session moved back to inbox (was archived)", "info");
-			refreshFooter(ctx);
-		}
-		// Same for a session hidden manually with `x` (rule-matched sessions stay filtered).
-		if (loadStore().sessions[id]?.filter === "hide") {
-			updateMeta(id, (m) => {
-				m.filter = undefined;
-			});
-			if (ctx.hasUI) ctx.ui.notify("📥 Session moved back to inbox (was filtered out)", "info");
+			if (ctx.hasUI) {
+				ctx.ui.notify(
+					wasArchived
+						? "📥 Session moved back to inbox (was archived)"
+						: "📥 Session moved back to inbox (was filtered out)",
+					"info",
+				);
+			}
 			refreshFooter(ctx);
 		}
 	});
@@ -5138,6 +5193,95 @@ export default function (pi: ExtensionAPI) {
 				// stale context
 			}
 		};
+	}
+
+	/**
+	 * True when some other live pi process is currently running this session —
+	 * the phone front end, a background agent, or another window. Asked of the
+	 * same live records the rest of the inbox trusts, not of a second liveness
+	 * check: stale "working" records are already aged out on read.
+	 */
+	function foreignRunActive(id: string): boolean {
+		const rec = readLive().get(id);
+		if (!rec || rec.state !== "working") return false;
+		if (rec.pid === process.pid || rec.bgParent === process.pid) return false;
+		return !getAgent(id)?.proc;
+	}
+
+	/**
+	 * Reload the on-screen transcript when a run driven by another process just
+	 * ended, so a session you were reading on the phone is current when you come
+	 * back to this window. Calls the same reload the attached-session path uses;
+	 * it switches the session out from under the view, which is the cost of
+	 * seeing someone else's turns without pressing anything.
+	 */
+	function reloadAfterForeignRun(id: string): void {
+		const ms = modeState();
+		if (ms.foreignReloaded?.has(id)) return;
+		// Nothing to reload until the session has a file on disk.
+		if (!findSessionFile(id)) return;
+		ms.foreignReloaded?.add(id);
+		scheduleRefresh(id);
+	}
+
+	/**
+	 * Notice a run that another pi process drove to completion on the session this
+	 * window is showing, and reload the transcript so those turns appear.
+	 *
+	 * Cheap by construction: the supervisor tick runs every 5s, readLive() is
+	 * already called on that path, and a session with no foreign record costs one
+	 * map lookup. Only the working → not-working transition reloads, and only for
+	 * the session on screen — every other session's staleness is already covered
+	 * by the inbox rows.
+	 */
+	function watchForeignRun(): void {
+		// The tick runs every 5s, including in the middle of a session switch or
+		// /reload. A captured ctx throws on any property access once its runtime
+		// has been replaced ("ctx is stale after session replacement"), so read
+		// everything behind a guard and bail cleanly: the next tick gets the new
+		// context, which the session_start handler has already installed.
+		let ui: ExtensionContext;
+		let id: string;
+		try {
+			const maybe = (globalThis as any).__piInboxAgentsCtx as
+				| ExtensionContext
+				| undefined;
+			if (!maybe?.hasUI) return;
+			ui = maybe;
+			id = ui.sessionManager.getSessionId();
+		} catch {
+			return; // stale context mid-switch: nothing to do this tick
+		}
+		const ms = modeState();
+		const active = foreignRunActive(id);
+		const was = ms.foreignRun?.get(id) === true;
+		const move = foreignRunMove(was, active);
+		ms.foreignRun?.set(id, active);
+		try {
+			if (move === "started") {
+				// A new foreign run started: allow this run one reload when it ends.
+				ms.foreignReloaded?.delete(id);
+				ui.ui.setStatus(
+					"inbox-foreign",
+					ui.ui.theme.fg("warning", "● running in another pi (phone)"),
+				);
+			} else if (move === "finished") {
+				ui.ui.setStatus("inbox-foreign", undefined);
+				if (orchestrating() && !isHome(ui)) reloadAfterForeignRun(id);
+			}
+		} catch {
+			// The context went stale between the read and the write. The badge and
+			// the reload are both cosmetic; drop them rather than log every switch.
+			return;
+		}
+	}
+
+	/** Seed the watcher's baseline so an already-running foreign run isn't seen as newly started. */
+	function installForeignRunWatch(): void {
+		const ms = modeState();
+		if (ms.foreignRun && ms.foreignRun.size > 0) return;
+		ms.foreignRun ??= new Map();
+		ms.foreignReloaded ??= new Set();
 	}
 
 	/**
