@@ -6,6 +6,9 @@
  *   ORCH_WEB_TOKEN=…               set the token instead of using the token file
  *   ORCH_WEB_HOST / _PORT          override the bind address / port
  *   ORCH_WEB_HOSTS                 extra accepted Host headers (comma separated)
+ *   ORCH_WEB_ALLOW_TERM=1          offer a PTY on /terminal (see terminal.ts)
+ *   ORCH_WEB_TERM_CMD              pin that PTY to one command instead of $SHELL -l
+ *   ORCH_WEB_DEPS                  where the out-of-tree node-pty lives
  *
  * The token is a bearer credential for a shell on this machine: anyone on the
  * same wifi who has it can run commands through pi. It lives in

@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0b0d10">
+<title>term · orch</title>
+<link rel="stylesheet" href="/vendor/xterm.css">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0d10;
+    --panel: #14181d;
+    --panel-2: #1b2027;
+    --line: #262c34;
+    --text: #e6e9ee;
+    --dim: #8b95a3;
+    --accent: #6ea8fe;
+    --err: #f87171;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    overscroll-behavior: none; }
+  body {
+    font: 15px/1.45 -apple-system, system-ui, sans-serif;
+    display: flex; flex-direction: column;
+    padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
+  }
+  header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 10px; border-bottom: 1px solid var(--line);
+    background: var(--panel);
+  }
+  header h1 { font-size: 14px; margin: 0; font-weight: 600; flex: 1;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-family: var(--mono); color: var(--dim); }
+  button {
+    font: inherit; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 9px;
+    padding: 6px 10px; min-height: 34px;
+  }
+  button:active { background: var(--line); }
+  .ghost { background: transparent; border-color: transparent; color: var(--dim); }
+  button.on { color: var(--accent); border-color: #23314a; background: #23314a40; }
+  #term { flex: 1; min-height: 0; padding: 4px 0 0 8px; }
+  #term .xterm { height: 100%; }
+  #keys {
+    display: flex; gap: 6px; padding: 6px 8px; overflow-x: auto;
+    -webkit-overflow-scrolling: touch; border-top: 1px solid var(--line);
+    background: var(--panel); flex: 0 0 auto;
+  }
+  #keys button { font-family: var(--mono); font-size: 13px; min-height: 32px;
+    padding: 4px 10px; white-space: nowrap; }
+  #note {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 12px;
+    padding: 24px; text-align: center; background: var(--bg); z-index: 40;
+  }
+  #note h2 { font-size: 17px; margin: 0; }
+  #note p { color: var(--dim); font-size: 14px; margin: 0; max-width: 34em; }
+  #note code { font-family: var(--mono); font-size: 13px;
+    background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 7px; padding: 3px 7px; }
+  #note.err h2 { color: var(--err); }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<header>
+  <button class="ghost" id="back" aria-label="Back to the list">‹</button>
+  <h1 id="h1">term</h1>
+  <button class="ghost" id="paste" title="Paste">⌘V</button>
+  <button class="ghost" id="restart" title="Restart the shell">⟳</button>
+  <button class="ghost" id="kill" title="End the shell">✕</button>
+</header>
+
+<div id="term"></div>
+
+<div id="keys">
+  <button data-k="esc">esc</button>
+  <button data-k="tab">tab</button>
+  <button id="ctrl" data-k="ctrl">ctrl</button>
+  <button data-k="^C">^C</button>
+  <button data-k="^D">^D</button>
+  <button data-k="^Z">^Z</button>
+  <button data-k="up">↑</button>
+  <button data-k="down">↓</button>
+  <button data-k="left">←</button>
+  <button data-k="right">→</button>
+  <button data-k="~">~</button>
+  <button data-k="|">|</button>
+  <button data-k="-">-</button>
+</div>
+
+<section id="note" class="hidden">
+  <h2 id="noteTitle">…</h2>
+  <p id="noteText"></p>
+  <div id="noteActions"></div>
+</section>
+
+<script src="/vendor/xterm.js"></script>
+<script src="/vendor/addon-fit.js"></script>
+<script>
+(() => {
+  "use strict";
+
+  const token = (() => {
+    const url = new URL(location.href);
+    const t = url.searchParams.get("token");
+    if (t) {
+      localStorage.setItem("orch.token", t);
+      url.searchParams.delete("token");
+      history.replaceState(null, "", url.pathname + url.search);
+      return t;
+    }
+    return localStorage.getItem("orch.token") || "";
+  })();
+
+  const $ = (s) => document.querySelector(s);
+
+  // ── status / notes ───────────────────────────────────────────────
+  function note(title, text, actions, isError) {
+    const box = $("#note");
+    box.classList.remove("hidden");
+    box.classList.toggle("err", !!isError);
+    $("#noteTitle").textContent = title;
+    const p = $("#noteText");
+    p.textContent = "";
+    if (Array.isArray(text)) {
+      for (const part of text) {
+        if (typeof part === "string") p.append(document.createTextNode(part));
+        else { const c = document.createElement("code"); c.textContent = part.code;
+               p.append(c); }
+      }
+    } else if (text) {
+      p.textContent = text;
+    }
+    const acts = $("#noteActions");
+    acts.textContent = "";
+    for (const a of actions || []) {
+      const b = document.createElement("button");
+      b.textContent = a.label;
+      if (a.primary) b.style.cssText =
+        "background:var(--accent);border-color:var(--accent);color:#06101f;font-weight:600";
+      b.onclick = a.run;
+      acts.append(b);
+    }
+    $("#h1").textContent = "term";
+  }
+
+  function hideNote() { $("#note").classList.add("hidden"); }
+
+  if (!token) {
+    location.replace("/");
+    return;
+  }
+
+  async function api(path, body) {
+    const res = await fetch(path, {
+      method: body ? "POST" : "GET",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const e = new Error(data.error || `HTTP ${res.status}`);
+      e.status = res.status;
+      throw e;
+    }
+    return data;
+  }
+
+  // ── terminal ─────────────────────────────────────────────────────
+  const term = new Terminal({
+    cursorBlink: true,
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+    fontSize: 12,
+    // xterm's own scrollback is memory on a phone: keep it modest.
+    scrollback: 4000,
+    allowProposedApi: true,
+    theme: {
+      background: "#0b0d10",
+      foreground: "#e6e9ee",
+      cursor: "#6ea8fe",
+      selectionBackground: "#23314a",
+    },
+  });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open($("#term"));
+
+  let info = null;      // TermInfo from /api/term/open
+  let size = { cols: 0, rows: 0 };
+  let source = null;    // EventSource
+  let lastSeq = 0;
+  let closing = false;
+
+  function measure() {
+    try { fit.fit(); } catch { /* element not laid out yet */ }
+  }
+
+  function syncSize() {
+    const cols = term.cols;
+    const rows = term.rows;
+    if (!info || (cols === size.cols && rows === size.rows)) return;
+    size = { cols, rows };
+    api(`/api/term/${encodeURIComponent(info.id)}/resize`, { cols, rows })
+      .catch(() => { /* the terminal is gone; the stream will say so */ });
+  }
+
+  // iOS shows/hides a keyboard without a matching window resize, so track the
+  // visual viewport explicitly: without this the last line sits under the keys.
+  function fitToViewport() {
+    const vv = window.visualViewport;
+    document.body.style.height = vv ? `${vv.height}px` : "100%";
+    measure();
+    syncSize();
+  }
+  window.visualViewport?.addEventListener("resize", fitToViewport);
+  window.addEventListener("orientationchange", () =>
+    setTimeout(fitToViewport, 250));
+
+  // ── input: batched keystrokes ────────────────────────────────────
+  // One request per keystroke is a lot of round trips over wifi; a short buffer
+  // keeps typing responsive without sending a request per character.
+  let pending = "";
+  let flushTimer = null;
+  function flush() {
+    if (!pending) return;
+    const data = pending;
+    pending = "";
+    if (!info) return;
+    api(`/api/term/${encodeURIComponent(info.id)}/input`, { data })
+      .catch((e) => { if (e.status === 404) reconnect(); });
+  }
+  function queue(data) {
+    pending += data;
+    if (!flushTimer) flushTimer = setTimeout(() => { flushTimer = null; flush(); }, 30);
+  }
+  term.onData((d) => {
+    if (ctrlArmed && d.length === 1) {
+      const code = d.toUpperCase().charCodeAt(0);
+      if (code >= 64 && code <= 95) { queue(String.fromCharCode(code - 64)); disarm(); return; }
+      disarm();
+    }
+    queue(d);
+  });
+
+  // ── stream ───────────────────────────────────────────────────────
+  function decode(b64) {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  function connect() {
+    if (!info || closing) return;
+    source?.close();
+    const url = `/api/term/${encodeURIComponent(info.id)}/stream` +
+      `?since=${lastSeq}&token=${encodeURIComponent(token)}`;
+    const es = new EventSource(url);
+    source = es;
+    es.onmessage = (ev) => {
+      let m;
+      try { m = JSON.parse(ev.data); } catch { return; }
+      if (typeof m.seq === "number") lastSeq = Math.max(lastSeq, m.seq);
+      if (m.data) term.write(decode(m.data));
+    };
+    es.addEventListener("reset", () => {
+      // The daemon dropped the front of its buffer; replay from the beginning of
+      // what it still has rather than gluing two disjoint pieces together.
+      term.reset();
+      lastSeq = 0;
+      es.close();
+      source = null;
+      connect();
+    });
+    es.addEventListener("exit", (ev) => {
+      let code = 0;
+      try { code = JSON.parse(ev.data).code; } catch { /* unknown */ }
+      source?.close();
+      source = null;
+      showExited(code);
+    });
+    es.addEventListener("close", () => {
+      source?.close();
+      source = null;
+    });
+    es.onerror = () => {
+      // EventSource retries on its own with the stale `since`; do it here so a
+      // resume asks for what this client actually has.
+      es.close();
+      if (source === es) source = null;
+      if (closing) return;
+      setTimeout(() => { if (!source) connect(); }, 1200);
+    };
+  }
+
+  function showExited(code) {
+    note(`shell exited${code ? ` (${code})` : ""}`,
+      "The process ended. Start a new one to keep going.",
+      [{ label: "New shell", primary: true, run: start }]);
+  }
+
+  async function start(fresh) {
+    hideNote();
+    const cols = Math.max(20, term.cols || 80);
+    const rows = Math.max(5, term.rows || 24);
+    let opened;
+    try {
+      opened = await api("/api/term/open", { cols, rows, fresh: !!fresh });
+    } catch (e) {
+      if (e.status === 403) {
+        note("Terminals are off", [
+          "Start the daemon with ",
+          { code: "ORCH_WEB_ALLOW_TERM=1" },
+          " (add it to ~/.pi/agent/orch-web.env, then restart).",
+        ], [{ label: "Back", run: () => location.assign("/") }], true);
+        return;
+      }
+      if (e.status === 503) {
+        note("Terminal unavailable", e.message,
+          [{ label: "Back", run: () => location.assign("/") }], true);
+        return;
+      }
+      note("Could not open a shell", e.message,
+        [{ label: "Retry", primary: true, run: () => start(fresh) }], true);
+      return;
+    }
+    info = opened;
+    lastSeq = 0;
+    size = { cols: 0, rows: 0 };
+    $("#h1").textContent = `${opened.command} · ${opened.pid}`;
+    measure();
+    syncSize();
+    connect();
+    term.focus();
+  }
+
+  function reconnect() {
+    // The daemon restarted, or reaped the shell: reopen and replay.
+    source?.close();
+    source = null;
+    info = null;
+    lastSeq = 0;
+    setTimeout(() => start(false), 300);
+  }
+
+  // ── key bar ──────────────────────────────────────────────────────
+  const SEQ = {
+    esc: "\x1b", tab: "\t", up: "\x1b[A", down: "\x1b[B",
+    right: "\x1b[C", left: "\x1b[D",
+  };
+  let ctrlArmed = false;
+  function disarm() {
+    ctrlArmed = false;
+    $("#ctrl").classList.remove("on");
+  }
+  for (const b of document.querySelectorAll("#keys button")) {
+    if (b.id === "ctrl") continue;
+    b.onclick = () => {
+      if (!info) return;
+      const k = b.dataset.k;
+      queue(SEQ[k] ?? (k.startsWith("^") ? String.fromCharCode(k.charCodeAt(1) - 64) : k));
+      term.focus();
+    };
+  }
+  $("#ctrl").onclick = () => {
+    ctrlArmed = !ctrlArmed;
+    $("#ctrl").classList.toggle("on", ctrlArmed);
+    term.focus();
+  };
+
+  // ── header ───────────────────────────────────────────────────────
+  $("#back").onclick = () => location.assign("/");
+  $("#kill").onclick = async () => {
+    closing = true;
+    source?.close();
+    source = null;
+    if (info) {
+      await api(`/api/term/${encodeURIComponent(info.id)}/close`, {})
+        .catch(() => {});
+    }
+    info = null;
+    location.assign("/");
+  };
+  $("#restart").onclick = () => { closing = false; start(true); };
+  $("#paste").onclick = async () => {
+    // The clipboard API needs a live gesture and https; fall back to a prompt,
+    // which is what a phone can always do.
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) queue(text);
+      term.focus();
+      return;
+    } catch { /* fall through */ }
+    const text = window.prompt("Paste:");
+    if (text) queue(text);
+    term.focus();
+  };
+
+  // ── boot ─────────────────────────────────────────────────────────
+  (async () => {
+    measure();
+    let status;
+    try {
+      status = await api("/api/term/status");
+    } catch (e) {
+      note("Cannot reach the daemon", e.message,
+        [{ label: "Back", run: () => location.assign("/") }], true);
+      return;
+    }
+    if (!status.allowed) {
+      note("Terminals are off", [
+        "This daemon was started without terminal support. Add ",
+        { code: "ORCH_WEB_ALLOW_TERM=1" },
+        " to ~/.pi/agent/orch-web.env and restart it.",
+      ], [{ label: "Back", run: () => location.assign("/") }], true);
+      return;
+    }
+    if (!status.ready) {
+      note("node-pty is not installed",
+        status.error || "Run npm install in the pi-kit checkout.",
+        [{ label: "Back", run: () => location.assign("/") }], true);
+      return;
+    }
+    // A shell is already running (a reload, or another window): attach to it
+    // rather than leaving an orphan behind.
+    if (status.current) {
+      info = status.current;
+      $("#h1").textContent = `${info.command} · ${info.pid}`;
+      measure();
+      connect();
+      term.focus();
+      return;
+    }
+    fitToViewport();
+    await start(false);
+  })();
+})();
+</script>
+</body>
+</html>

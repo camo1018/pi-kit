@@ -37,6 +37,11 @@ fi
 # Background agents must spawn pi, not this daemon.
 export PI_INBOX_AGENT_CMD="${PI_INBOX_AGENT_CMD:-$HOME/.pi/agent/bin/pi}"
 
+# Terminals (opt-in). The native node-pty module lives outside this checkout:
+# node_modules here is a set of symlinks into the pi install, and running a
+# normal `npm install` would replace them. See extensions/orch-web/README.md.
+export ORCH_WEB_DEPS="${ORCH_WEB_DEPS:-$HOME/.pi/agent/orch-web-deps}"
+
 # Provider credentials. launchd gives us almost no environment, so a child pi
 # spawned from here cannot authenticate without these: it exits with "No API key
 # found for the selected model" and the message silently never runs. The file is
