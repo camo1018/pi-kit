@@ -139,6 +139,7 @@ you ask for it**. What is enforced either way:
 | Idle reap | killed 10 min after the last viewer detaches; 8 h hard cap |
 | Scrollback | 512 KB ring, bounded, replayed by sequence number |
 | Audit | every open/attach/close is a `[orch-web]` log line with the remote address |
+| Shutdown | a restart kills the shell and ends the stream, so nothing is orphaned |
 | Gate | same bearer token and `Host` check as every other route; `/vendor/` is a fixed file list |
 
 `ORCH_WEB_TERM_CMD` pins the shell to one command (default: `$SHELL -l`) — useful

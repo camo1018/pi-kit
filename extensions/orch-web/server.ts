@@ -1132,6 +1132,34 @@ export function terminalHost(): TerminalHost {
 	return terminals;
 }
 
+/**
+ * Stop the daemon for real.
+ *
+ * `server.close()` waits for every connection to end, and a phone sitting on a
+ * terminal page holds an SSE stream open forever — so a restart that only
+ * called close() would hang until launchd gave up and SIGKILLed us, leaving the
+ * login shells re-parented to init. Order matters: kill the shells and end
+ * their streams first, then close the listener (which drops keep-alive
+ * connections), then stop accepting new work.
+ */
+export async function stopOrchWeb(server: http.Server): Promise<void> {
+	// The supervisor's own tick is unref'd, so it cannot hold the process open.
+	terminalHost().dispose();
+	// closeIdleConnections() drops keep-alive sockets that are between requests
+	// without waiting for them; without this a poller stalls the shutdown.
+	server.closeIdleConnections?.();
+	await new Promise<void>((resolve) => {
+		const done = () => resolve();
+		server.close(done);
+		// Belt and braces: a socket that will not drain must not wedge a restart.
+		const force = setTimeout(() => {
+			server.closeAllConnections?.();
+			resolve();
+		}, 3000);
+		force.unref?.();
+	});
+}
+
 export function startOrchWeb(cfg: Config) {
 	running = cfg;
 	// Resolve node-pty once, in the background: a missing native build must not

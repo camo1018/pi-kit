@@ -331,6 +331,47 @@ test("deps live outside the checkout by default, and honour ORCH_WEB_DEPS", () =
 	}
 });
 
+test("dispose kills every shell and ends every viewer stream", async () => {
+	// The bug this guards: dispose() used to kill nothing, so a daemon restart
+	// left login shells running, and an open SSE stream kept server.close()
+	// from ever completing.
+	const ptys: any[] = [];
+	const host = new TerminalHost({
+		audit: () => {},
+		spawn: () => {
+			const p = fakePty(2000 + ptys.length);
+			ptys.push(p);
+			return p;
+		},
+		enabled: true,
+	});
+	const term = await host.open({});
+	const viewer = fakeRes();
+	host.attach(viewer, term.id, 0);
+	assert.equal(viewer.writableEnded, false);
+
+	host.dispose();
+
+	for (const pty of ptys) assert.equal(pty.killed, true, "shell must be killed");
+	assert.equal(viewer.writableEnded, true, "stream must be ended, not orphaned");
+	assert.equal(host.current(), undefined);
+});
+
+test("closing a terminal ends its stream and stops its heartbeat", async () => {
+	const host = new TerminalHost({
+		audit: () => {},
+		spawn: () => fakePty(),
+		enabled: true,
+	});
+	const term = await host.open({});
+	const viewer = fakeRes();
+	host.attach(viewer, term.id, 0);
+	host.close(term.id, "requested");
+	assert.equal(viewer.writableEnded, true);
+	assert.ok(viewer.body().includes("event: close"), "client is told why");
+	assert.equal(host.attach(fakeRes(), term.id, 0), false, "gone");
+});
+
 test("a terminal records the remote it was opened from", async () => {
 	const seen: any[] = [];
 	const host = new TerminalHost({
