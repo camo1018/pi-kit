@@ -21,7 +21,7 @@ const agentDir = path.join(home, ".pi", "agent");
 fs.mkdirSync(path.join(agentDir, "sessions"), { recursive: true });
 
 const { buildRows, eventBytes, firstUserText, lanAddress, liveItems,
-	readLinesAt, readName, readTail } = await import("./server.ts");
+	modelChoices, readLinesAt, readName, readTail } = await import("./server.ts");
 
 function writeSession(opts: {
 	id: string;
@@ -409,6 +409,55 @@ test("delegated workers collapse under the session that spawned them", () => {
 test("lanAddress returns a usable IPv4 literal", () => {
 	const addr = lanAddress();
 	assert.match(addr, /^\d+\.\d+\.\d+\.\d+$/);
+});
+
+test("a manual hide is honoured, like the TUI's x", () => {
+	// `x` on a session no rule matched writes `filter: "hide"`. The phone used
+	// to show it anyway, so the two lists disagreed about what you had filed.
+	const id = "a0000013-0000-0000-0000-000000000013";
+	writeSession({ id, messages: [user("hide me"), assistant("ok")] });
+	fs.writeFileSync(
+		path.join(agentDir, "inbox.json"),
+		JSON.stringify({
+			version: 1,
+			sessions: { [id]: { filter: "hide" } },
+		}),
+	);
+	assert.equal(buildRows().rows.some((r) => r.id === id), false);
+	const withHidden = buildRows({ withHidden: true }).rows.find((r) => r.id === id);
+	assert.equal(withHidden?.hidden, true, "the Filtered view needs the flag");
+});
+
+test("model choices come from enabledModels, with per-model levels", () => {
+	// The phone's picker must match the TUI's N, which pi derives from the same
+	// settings list; the daemon has no session, so it reads the file directly.
+	fs.writeFileSync(
+		path.join(agentDir, "settings.json"),
+		JSON.stringify({
+			enabledModels: ["prov/a-model", "prov/b-model", "no-slash"],
+			defaultThinkingLevel: "high",
+			modelThinkingLevels: { "prov/b-model": "low" },
+		}),
+	);
+	const data = modelChoices();
+	assert.deepEqual(
+		data.models.map((m) => m.reference),
+		["prov/a-model", "prov/b-model"],
+		"a malformed reference is skipped, not crashed on",
+	);
+	assert.equal(data.models[0]?.defaultLevel, "high");
+	assert.equal(data.models[1]?.defaultLevel, "low", "per-model wins");
+	assert.equal(data.defaultLevel, "high");
+	assert.ok(data.models[0]?.levels.includes("off"));
+});
+
+test("no enabledModels means an empty picker, not a crash", () => {
+	fs.writeFileSync(
+		path.join(agentDir, "settings.json"),
+		JSON.stringify({ defaultThinkingLevel: "low" }),
+	);
+	assert.deepEqual(modelChoices().models, []);
+	assert.equal(modelChoices().source, "none");
 });
 
 test.after(() => fs.rmSync(home, { recursive: true, force: true }));

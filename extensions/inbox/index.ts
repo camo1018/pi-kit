@@ -87,6 +87,7 @@ import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 import {
 	beforeRun, branchName, selectedHistory, sourceName,
 } from "../../lib/session-branch.ts";
+import { writeClone as writeCloneFile } from "../../lib/session-clone.ts";
 import { handleVisitModelInput } from "./visit-models.ts";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -6523,7 +6524,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	/**
-	 * Write a clone of a session file at `leaf` (`null` = empty history). The caller resolves the
+	 * Clone a session file at `leaf` (`null` = empty history). The caller resolves the
 	 * leaf, so a working background agent can be cut before its active prompt. `/clone` switches
 	 * to the result; the list's `c` only selects it, so this returns instead of switching.
 	 */
@@ -6533,49 +6534,29 @@ export default function (pi: ExtensionAPI) {
 		leaf: string | null;
 		groupId?: string;
 	}): Promise<{ file: string; id: string; name: string }> {
-		const sm = SessionManager.open(opts.file, opts.sessionDir);
-		const name = branchName(sourceName(sm), "Clone");
-		// A first-ever prompt has no parent: produce an empty, named clone.
-		const cloned =
-			opts.leaf === null
-				? (() => {
-						const empty = SessionManager.create(
-							sm.getCwd(),
-							opts.sessionDir,
-						);
-						empty.newSession({ parentSession: opts.file });
-						empty.appendSessionInfo(name);
-						const destination = empty.getSessionFile()!;
-						// Pi defers saving setup-only sessions until a user prompt.
-						// This explicit empty clone must be reopenable right away.
-						fs.writeFileSync(
-							destination,
-							[empty.getHeader(), ...empty.getEntries()]
-								.map((entry) => JSON.stringify(entry))
-								.join("\n") + "\n",
-							{ flag: "wx" },
-						);
-						return destination;
-					})()
-				: sm.createBranchedSession(opts.leaf);
-		if (!cloned || !fs.existsSync(cloned))
-			throw new Error("couldn't write the new session");
-		SessionManager.open(cloned).appendSessionInfo(name);
-		const id = SessionManager.open(cloned, opts.sessionDir).getSessionId();
-		try {
+		const clone = writeCloneFile({
+			file: opts.file,
+			sessionDir: opts.sessionDir,
+			leaf: opts.leaf,
 			// Mark the clone: its tail ends at a tool result, which the inbox would otherwise
 			// call stalled/working until it has activity of its own.
-			updateMeta(id, (m) => {
-				m.clonedAt = Date.now();
-			});
-			// The clone inherits the original's group. `/clone` switches here, which fires
-			// session_start with reason "resume" (not "fork"), where native fork inheritance
-			// can't see it.
-			if (opts.groupId) await inboxGroups.assign(id, opts.groupId);
-		} catch {
-			// best effort — only the status badge and the clone's group are affected
+			onCloned: (id) => {
+				updateMeta(id, (m) => {
+					m.clonedAt = Date.now();
+				});
+			},
+		});
+		// The clone inherits the original's group. `/clone` switches here, which fires
+		// session_start with reason "resume" (not "fork"), where native fork inheritance
+		// can't see it.
+		if (opts.groupId) {
+			try {
+				await inboxGroups.assign(clone.id, opts.groupId);
+			} catch {
+				// best effort — only the clone's group is affected
+			}
 		}
-		return { file: cloned, id, name };
+		return clone;
 	}
 
 	/** Clone without including any work from the active background prompt. */

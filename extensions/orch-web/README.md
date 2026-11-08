@@ -55,16 +55,40 @@ First connection triggers a macOS firewall prompt for `node` — **Allow**.
 |---|---|
 | Open a session | tap a row |
 | Back to the list | `‹` top-left, or the phone's back gesture |
-| Send | type, press Enter; becomes **Queue** while that session is running |
+| Session actions | `⋯` on a row, or `⋯` in the session header |
+| View tabs | Inbox · Archived · All · Hidden |
+| Send | type, then tap **Send** (or Cmd/Ctrl+Enter); becomes **Queue** while that session is running |
+| Newline | **Enter** in the composer |
+| Dismiss the keyboard | tap anywhere in the transcript |
 | See what's queued | the queue strip above the composer: **now** / **✕** per item |
-| Start an agent | **＋** in the header |
+| Start an agent | **＋** in the header (prompt, directory, group, model) |
+| Groups | **☰** → Groups |
 | Refresh | automatic; **⟳** forces it |
 
 Status dots: `●` working · `◆` your turn · `✗` error · `⚠` stalled (run was cut
 off) · `⏸` aborted.
 
-Desktop-only for now: takeover, moving a session's directory, cloning, filter
-rules.
+### Session actions
+
+Every row's `⋯` opens the same set the inbox list has on its keys:
+
+| Action | Notes |
+|---|---|
+| Open | |
+| Rename | A running agent applies it on its next turn |
+| Change model | `enabledModels` from `settings.json`, then a thinking level |
+| Clone | A working agent is cut *before* its active prompt |
+| Move to group | includes "New group…" |
+| Pin / unpin | |
+| Mark read / unread | |
+| Archive / unarchive | |
+| Hide / unhide | manual filing; shows under **Hidden** |
+| Cancel run | |
+
+Desktop-only: **takeover**, **peek**, and **moving a session's directory**.
+Takeover hands a live session to a terminal window, which a phone has no
+equivalent of; the other two are file-relocation actions that want a
+filesystem picker.
 
 ## Managing the daemon
 
@@ -123,9 +147,10 @@ its event file. If you see it, the daemon is running old code: restart it.
 ```
 extensions/orch-web/
   cli.ts                        entry: token, --pair, bind address
-  server.ts                     HTTP + SSE, row/transcript model
+  server.ts                     HTTP + SSE, row/transcript model, actions
   public/index.html             the whole client (no build, no framework)
-  server.test.ts                tests: tail parsing, live items, change keys
+  server.test.ts                tests: tail parsing, live items, hide, models
+lib/session-clone.ts            clone a session file (shared with the inbox)
 scripts/orch-web.sh             launcher (resolves pi's node_modules)
 scripts/orch-web-install.sh     launchd install / --capture-env / --remove
 ```
