@@ -322,7 +322,7 @@ function emit(e: AgentEvent) {
 }
 
 /** Max agents running at once; extra ones wait as "queued". */
-export const MAX_CONCURRENT = Math.max(1, Number(process.env.PI_INBOX_MAX_AGENTS) || 6);
+export const MAX_CONCURRENT = Math.max(1, Number(process.env.PI_INBOX_MAX_AGENTS) || 20);
 
 // ───────────────────────────── child process ─────────────────────────────
 
