@@ -988,7 +988,6 @@ test("a wake left on disk by a crashed run is delivered next", async (t) => {
 	});
 	writeWakeRequest(first.team.stateDir, {
 		parentId: "parent",
-		signature: "crashed",
 		content: "All 1 delegated worker has settled.",
 		workers: [],
 	});
@@ -1791,7 +1790,6 @@ test("a queued wake for an opted-out team is not delivered", async (t) => {
 	await s.spawn("parent", false);
 	writeWakeRequest(s.team.stateDir, {
 		parentId: "parent",
-		signature: "1",
 		content: "[pi-kit wake] stale",
 		workers: [],
 	});
@@ -1900,7 +1898,6 @@ test("a wake request can be consumed by exactly one process", async (t) => {
 	const dir = join(h.team.agentDir, "inbox-agents");
 	writeWakeRequest(dir, {
 		parentId: "parent",
-		signature: "1",
 		content: "[pi-kit wake] once",
 		workers: [],
 	});
@@ -2088,6 +2085,36 @@ test("arming state for a finished team is pruned", async (t) => {
 	);
 });
 
+test("pruning the arm clears the episode claims named after it", async (t) => {
+	// A claim is named `<parent>.wake-claim-<episode>`, and the arm is what
+	// carries the episode number. Once the arm is pruned the numbering restarts
+	// at 1, so a claim left behind for a reused number would silently suppress a
+	// real wake. A crash between claim and release can strand one with no arm
+	// left to ever clear it, because release is only reached from the emit path.
+	const s = harness(t, { mode: "tui" });
+	s.start();
+	const parent = "ghost-parent";
+	writeWakeArm(s.team.stateDir, parent, {
+		armed: false, episode: 3, signature: "3", wakes: 1,
+	});
+	assert.equal(claimEpisodeWake(s.team.stateDir, parent, 1), true);
+	assert.equal(claimEpisodeWake(s.team.stateDir, parent, 3), true);
+	// Belongs to another parent: must survive.
+	assert.equal(claimEpisodeWake(s.team.stateDir, "other-parent", 2), true);
+
+	s.pump();
+
+	assert.equal(readWakeArm(s.team.stateDir, parent), undefined, "arm pruned");
+	const claims = readdirSync(s.team.stateDir).filter((n) =>
+		n.startsWith(`${parent}.wake-claim-`),
+	);
+	assert.deepEqual(claims, [], "no claim outlives the arm naming its episode");
+	assert.ok(
+		readdirSync(s.team.stateDir).includes("other-parent.wake-claim-2"),
+		"another team's claim is untouched",
+	);
+});
+
 test("pruning never removes a team that could still wake", async (t) => {
 	const s = harness(t, { mode: "tui" });
 	s.start();
@@ -2105,7 +2132,7 @@ test("pruning never removes a team that could still wake", async (t) => {
 		armed: false, episode: 2, signature: "2",
 	});
 	writeWakeRequest(s.team.stateDir, {
-		parentId: "owing-parent", signature: "2",
+		parentId: "owing-parent",
 		content: "[pi-kit wake] owed", workers: [],
 	});
 	// 4. A team with live worker records must survive.
@@ -2249,7 +2276,6 @@ test("a non-owner does not deliver another live session's pending wake", async (
 	});
 	writeWakeRequest(s.team.stateDir, {
 		parentId: "parent",
-		signature: "1",
 		content: "[pi-kit wake] pending",
 		workers: [],
 	});
@@ -2287,7 +2313,6 @@ test("a dead owner's pending wake is still delivered", async (t) => {
 	s.files.set("parent", join(s.team.agentDir, "parent.jsonl"));
 	writeWakeRequest(s.team.stateDir, {
 		parentId: "parent",
-		signature: "1",
 		content: "[pi-kit wake] pending",
 		workers: [],
 	});
@@ -2315,7 +2340,6 @@ test("a legacy arm with no ownerPid still delivers its pending wake", async (t) 
 	s.files.set("parent", join(s.team.agentDir, "parent.jsonl"));
 	writeWakeRequest(s.team.stateDir, {
 		parentId: "parent",
-		signature: "1",
 		content: "[pi-kit wake] pending",
 		workers: [],
 	});
@@ -2463,7 +2487,6 @@ test("a malformed worker record does not throw out of the sweep", async (t) => {
 	});
 	writeWakeRequest(s.team.stateDir, {
 		parentId: "parent",
-		signature: "1",
 		content: "[pi-kit wake] pending",
 		workers: [],
 	});
