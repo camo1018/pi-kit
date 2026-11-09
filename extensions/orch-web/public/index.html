@@ -127,6 +127,29 @@
   .msg { margin: 0 0 12px; }
   .msg .who { font-size: 11.5px; color: var(--dim); margin-bottom: 3px;
     text-transform: uppercase; letter-spacing: .05em; }
+
+  /* ── final answer ── */
+  /* The TUI draws a `▼ FINAL ANSWER` divider before the concluding message so
+     the end of a run is obvious at a glance. On a phone a full-width divider
+     is easy to miss while scrolling, so the answer is a raised card with an
+     accent edge: the boundary is where the box starts, not where a line is. */
+  .msg.final {
+    margin: 16px -4px 14px; padding: 11px 12px 12px;
+    background: var(--panel);
+    border: 1px solid #23314a;
+    border-left: 3px solid var(--accent);
+    border-radius: 12px;
+  }
+  .msg.final .who {
+    color: var(--accent); font-weight: 650; letter-spacing: .07em;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .msg.final .who::before { content: "▼"; font-size: 10px; }
+  .msg.final > :last-child { margin-bottom: 0; }
+  /* The divider rule above the card is the TUI's `---`.
+     Drawn on the card itself so a collapsed/streamed re-render cannot leave a
+     stray <hr> behind. */
+  .msg.final + .msg.final { margin-top: 16px; }
   .msg .text { white-space: pre-wrap; word-break: break-word; }
   .msg.user .text { background: var(--panel-2); border-radius: 12px;
     padding: 9px 11px; }
@@ -964,8 +987,10 @@
         box.append(mdNode(m.text));
         log.append(box);
       } else if (m.role === "assistant") {
-        const box = el("div", "msg");
-        box.append(el("div", "who", "agent"));
+        // The run's conclusion is marked by the server from the message's own
+        // stop reason, so a reload or another front end agrees with the TUI.
+        const box = el("div", m.final ? "msg final" : "msg");
+        box.append(el("div", "who", m.final ? "final answer" : "agent"));
         if (m.text) box.append(mdNode(m.text));
         for (const tool of m.tools || []) {
           box.append(el("div", "tool",

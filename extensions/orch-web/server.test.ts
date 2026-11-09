@@ -23,7 +23,7 @@ fs.mkdirSync(path.join(agentDir, "sessions"), { recursive: true });
 
 const { buildRows, eventBytes, firstUserText, lanAddress, liveItems,
 	mentionChoices, modelChoices, readLinesAt, readName, readTail,
-	sanitizeForLog } = await import("./server.ts");
+	sanitizeForLog, transcript } = await import("./server.ts");
 
 function writeSession(opts: {
 	id: string;
@@ -670,9 +670,10 @@ test("a queued message behind a live foreign run reads as writer, not slot", () 
 	// which sent the reader looking for a capacity problem that did not exist.
 	const id = "llll-5555";
 	writeSession({ id, messages: [user("mirror the change"), assistant("done")] });
-	// An alive pid that is not a tracked agent of this process: a foreign holder.
+	// A genuinely foreign live pid: the test runner's parent is alive for the
+	// duration of the run, and is not this process's own record.
 	writeLiveRecord({
-		pid: process.pid,
+		pid: process.ppid,
 		sessionId: id,
 		sessionFile: path.join(agentDir, "sessions", "--scratch--", `x_${id}.jsonl`),
 		state: "working",
@@ -682,6 +683,99 @@ test("a queued message behind a live foreign run reads as writer, not slot", () 
 	const row = buildRows().rows.find((r) => r.id === id);
 	assert.ok(row);
 	assert.equal(row.state, "working", "a foreign run is still a run");
+	fs.rmSync(path.join(agentDir, "inbox-live", `${process.ppid}.json`), { force: true });
+});
+
+
+test("the concluding assistant message is flagged final, tool steps are not", () => {
+	const file = writeSession({
+		id: "jjjj-0001",
+		messages: [
+			user("do the thing"),
+			// A step: the model wanted another tool, so this is not the answer.
+			{ role: "assistant", stopReason: "toolUse", content: [
+				{ type: "text", text: "Let me look." },
+				{ type: "toolCall", name: "read", arguments: { path: "/x" } },
+			] },
+			{ role: "toolResult", isError: false, content: [{ type: "text", text: "ok" }] },
+			assistant("Done — it worked."),
+		],
+	});
+	const msgs = transcript(file);
+	const finals = msgs.filter((m) => m.final);
+	assert.equal(finals.length, 1, "exactly one final answer");
+	assert.equal(finals[0]?.text, "Done — it worked.");
+	// The step is still visible; only the flag is withheld.
+	assert.ok(msgs.some((m) => m.role === "assistant" && !m.final && m.tools?.length));
+});
+
+test("a run that errored or aborted has no final answer", () => {
+	const file = writeSession({
+		id: "kkkk-0002",
+		messages: [
+			user("go"),
+			assistant("boom", { stopReason: "error", errorMessage: "rate limited" }),
+			assistant("cut off", { stopReason: "aborted" }),
+		],
+	});
+	const msgs = transcript(file);
+	assert.equal(msgs.filter((m) => m.final).length, 0);
+	assert.equal(msgs.find((m) => m.stopped === "error")?.error, "rate limited");
+	assert.ok(msgs.some((m) => m.stopped === "aborted"));
+});
+
+test("an empty-text stop is not a final answer", () => {
+	const file = writeSession({
+		id: "llll-0003",
+		messages: [
+			user("go"),
+			{ role: "assistant", stopReason: "stop", content: [] },
+		],
+	});
+	// A stop with nothing said has nothing to mark: it is skipped entirely.
+	assert.equal(transcript(file).filter((m) => m.final).length, 0);
+});
+
+test("our own live record is running, not another pi", async () => {
+	// The label regression: a session this daemon is itself running has a live
+	// record naming OUR pid. `writerElsewhere` counts that as a writer on
+	// purpose (don't spawn beside yourself), but the label must not then tell
+	// the user "another pi is running it" about the window they are typing in.
+	const id = "llll-6666";
+	writeSession({ id, messages: [user("this very session"), assistant("hi")] });
+	writeLiveRecord({
+		pid: process.pid,
+		sessionId: id,
+		sessionFile: path.join(agentDir, "sessions", "--scratch--", `x_${id}.jsonl`),
+		state: "working",
+		updated: Date.now(),
+	});
+	// A pending message is what makes the reason meaningful: without one the row
+	// carries no queueReason at all and the assertion below would be vacuous.
+	const { registry } = await import("../../lib/inbox-agents.ts");
+	registry().agents.set(id, {
+		id,
+		cwd: "/scratch",
+		title: "this very session",
+		state: "queued",
+		pending: ["and again"],
+		createdAt: Date.now(),
+		updatedAt: Date.now(),
+		needsYou: false,
+		runs: 1,
+		log: [],
+		liveText: "",
+	} as any);
+
+	const row = buildRows().rows.find((r) => r.id === id);
+	assert.ok(row);
+	// A message is waiting behind a live run...
+
+	assert.equal(typeof row.queueReason, "string", "a waiting message has a reason");
+	// ...but not because a stranger holds it.
+	assert.notEqual(row.queueReason, "writer", "our own run is not 'another pi'");
+	assert.equal(row.queueReason, "running", "our own run is just this run");
+	registry().agents.delete(id);
 	fs.rmSync(path.join(agentDir, "inbox-live", `${process.pid}.json`), { force: true });
 });
 
