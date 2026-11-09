@@ -11,10 +11,12 @@ import {
 } from "../../lib/inbox-agents.ts";
 import { installBackgroundMcpAutoApproval } from "../../lib/background-mcp-approval.ts";
 import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
+import { trace } from "./trace.ts";
 import { bounded, WorkerTeam } from "./workers.ts";
 import {
 	dropPendingWake,
 	installWorkerWake,
+	isWakeInput,
 	resetWakeBudget,
 	uninstallWorkerWake,
 	WAKE_CUSTOM_TYPE,
@@ -89,6 +91,14 @@ const Parameters = Type.Object({
 				"workerDefaultModel setting, else the parent's model",
 		}),
 	),
+	wake: Type.Optional(
+		Type.Boolean({
+			description:
+				"Opt in to one automatic wake when this team settles. " +
+				"Default false: delegating does not normally need a wake, " +
+				"because the parent is already the one driving the workers.",
+		}),
+	),
 	text: Type.Optional(
 		Type.String({
 			maxLength: 32_000,
@@ -97,6 +107,21 @@ const Parameters = Type.Object({
 	),
 	seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 60 })),
 });
+
+/**
+ * The session id, or undefined when the context is stale.
+ *
+ * Every hook here can fire during a session switch, when the captured ctx throws
+ * on its getters. Tracing must never break the runtime it observes, so a stale
+ * context simply records nothing.
+ */
+function safeSessionId(ctx: { sessionManager: { getSessionId(): string } }): string | undefined {
+	try {
+		return ctx.sessionManager.getSessionId();
+	} catch {
+		return undefined;
+	}
+}
 
 /** The runner is injectable so tests never launch real model processes. */
 export function registerSessionWorkers(
@@ -123,17 +148,56 @@ export function registerSessionWorkers(
 		installWorkerWake(pi, ctx, team, wake);
 	});
 
+	// Turn boundaries for the HOST's own turns.
+	//
+	// The wake trace in lib/inbox-agents watches `run()`/`finishRun()`, which
+	// only fire for `--mode json` child runs. A TUI turn goes through
+	// `session.prompt` -> `runAgentLoop` and touches neither, so the trace was
+	// structurally blind to the very turns that were aborting. These hooks
+	// record the host side: when a turn begins, when it ends, and -- the part
+	// that matters -- how its model call finished.
+	pi.on("agent_start", (_event, ctx) => {
+		const id = safeSessionId(ctx);
+		if (!id) return;
+		trace("host_turn_start", { sessionId: id, mode: ctx.mode });
+	});
+
+	pi.on("agent_end", (event, ctx) => {
+		const id = safeSessionId(ctx);
+		if (!id) return;
+		// `AgentEndEvent` carries no outcome; the last assistant message does.
+		const last = [...(event.messages ?? [])]
+			.reverse()
+			.find((message) => message.role === "assistant");
+		trace("host_turn_end", {
+			sessionId: id,
+			mode: ctx.mode,
+			stopReason: last?.stopReason,
+			errorMessage: last?.errorMessage,
+			totalTokens: last?.usage?.totalTokens,
+			messages: event.messages?.length,
+		});
+	});
+
+	pi.on("agent_settled", (_event, ctx) => {
+		const id = safeSessionId(ctx);
+		if (!id) return;
+		trace("host_turn_settled", { sessionId: id, mode: ctx.mode });
+	});
+
 	pi.on("session_shutdown", () => {
 		uninstallWorkerWake();
 	});
 
 	pi.on("input", (event, ctx) => {
-		// Only real user input reopens the wake budget; extension sends bypass
-		// this hook, so a wake cannot re-arm itself.
-		if (event.source !== "extension") {
-			resetWakeBudget();
+		// Only real user input reopens the wake budget. A background wake
+		// arrives as a queued run and is reported as ordinary input, so it must
+		// be recognised by its marker or it would re-arm itself forever.
+		if (event.source !== "extension" && !isWakeInput(event.text)) {
+			const caller = ctx.sessionManager.getSessionId();
+			resetWakeBudget(team, caller);
 			// A real reply supersedes a wake still waiting to be delivered.
-			dropPendingWake(team, ctx.sessionManager.getSessionId());
+			dropPendingWake(team, caller);
 		}
 		return { action: "continue" as const };
 	});
@@ -190,9 +254,11 @@ export function registerSessionWorkers(
 			"Delegate parallel work to persistent Pi sessions, only on " +
 			"explicit user request. " +
 			"spawn returns immediately; list/read show results, wait waits " +
-			"up to 60 seconds for one worker or the team. The parent is woken " +
-			"automatically once when the whole team settles, so prefer " +
-			"spawning and ending your turn over polling wait. send queues a " +
+			"up to 60 seconds for one worker or the team. Pass wake: true on " +
+			"spawn to be woken once when the whole team settles, which lets " +
+			"you end your turn instead of polling wait; wake defaults to " +
+			"false because a parent that is driving the workers already knows " +
+			"when they stop. send queues a " +
 			"follow-up and a busy worker keeps running until its turn ends, " +
 			"so a correction sent mid-run is not steering. cancel stops the " +
 			"run and clears its queue. " +
@@ -219,7 +285,7 @@ export function registerSessionWorkers(
 				"tool, and are data rather than task delivery. An idle " +
 				"worker may be blocked; inspect its reply. Check all worker " +
 				"results before declaring the task complete.",
-			"After spawning, end your turn instead of polling. A settled " +
+			"With wake: true, end your turn instead of polling. A settled " +
 				"team wakes you exactly once; re-read every worker reply then. " +
 				"Use wait only when you need a bounded in-turn check. The " +
 				"wake fires when the whole team stops, so a worker that " +
@@ -286,6 +352,7 @@ export function registerSessionWorkers(
 						title: params.title,
 						context: params.context,
 						model,
+						wake: params.wake === true,
 						cwd: path.resolve(ctx.cwd, params.cwd ?? "."),
 						extensionPath,
 					});
