@@ -64,14 +64,53 @@ First connection triggers a macOS firewall prompt for `node` — **Allow**.
 | Send | type, then tap **Send** (or Cmd/Ctrl+Enter); becomes **Queue** while that session is running |
 | Newline | **Enter** in the composer |
 | Dismiss the keyboard | tap anywhere in the transcript |
-| See what's queued | the queue strip above the composer: **now** / **✕** per item |
+| See what's queued | the queue strip above the composer: **now** / **✕** per item, plus why it is waiting (see below) |
 | Start an agent | **＋** in the header (prompt, directory, group, model) |
 | Groups | **☰** → Groups |
+| Insert a skill | `$` — the popup opens as you type (`$graf` → `$grafana`) |
+| Insert a command | `/` at the start of the message |
+| Reference another session | `@[` (all), `@g[` (this group), `@ga[` (this group + archived) |
+| Trigger a popup without a keyboard | `$` `/` `@` buttons left of the composer |
 | Terminal | **☰** → Terminal (needs `--term`) |
 | Refresh | automatic; **⟳** forces it |
 
 Status dots: `●` working · `◆` your turn · `✗` error · `⚠` stalled (run was cut
 off) · `⏸` aborted.
+
+### Why a message queues
+
+The composer says **Queue** instead of **Send** for three different reasons, and
+the queue strip names which one. Only the first is about capacity:
+
+| Queue strip says | Meaning |
+|---|---|
+| `queued (1) — after this run` | This session's own run is still in flight. Normal. |
+| `queued (1) — waiting for a free slot` | All `PI_INBOX_MAX_AGENTS` slots are busy. Rarely what you hit. |
+| `queued (1) — another pi is running it` | A different live pi process holds this session. It runs when that process finishes. |
+
+Rows carry this as `queueReason` (`running` / `slot` / `writer`), so the phone
+never claims "no free agent slot" for something capacity cannot fix. A live
+record whose pid is gone is treated as finished and deleted, not trusted
+because this daemon happened to spawn it — that stale record used to make an
+idle session read as busy for up to five minutes.
+
+### Composer completions
+
+The phone offers the same three insertions the TUI does, and they mean the same
+thing because the same extensions expand them on the request side:
+
+| Token | What it does | Expanded by |
+|---|---|---|
+| `$skill-name` | inline skill invocation, anywhere in the sentence | `inline-skills` |
+| `@[<session-id>]` | quotes that session's transcript into the request | `session-mention` |
+| `/skill:name args` | the portable skill form; works in any mode | pi itself |
+| `/command` | listed for parity, but pi-kit's handlers need a TUI, so they are inert in a background run | — |
+
+`@[` lists every session, `@g[` only this session's group (and says so when the
+session is ungrouped), `@ga[` adds archived ones. The dropdown in the popup
+header switches the filter for that token without retyping it. Up/Down/Tab/Enter
+move and accept, Escape dismisses, and the group picker is the only control that
+steals focus.
 
 ### Session actions
 
