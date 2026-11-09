@@ -67,11 +67,33 @@ First connection triggers a macOS firewall prompt for `node` — **Allow**.
 | See what's queued | the queue strip above the composer: **now** / **✕** per item |
 | Start an agent | **＋** in the header (prompt, directory, group, model) |
 | Groups | **☰** → Groups |
+| Insert a skill | `$` — the popup opens as you type (`$graf` → `$grafana`) |
+| Insert a command | `/` at the start of the message |
+| Reference another session | `@[` (all), `@g[` (this group), `@ga[` (this group + archived) |
+| Trigger a popup without a keyboard | `$` `/` `@` buttons left of the composer |
 | Terminal | **☰** → Terminal (needs `--term`) |
 | Refresh | automatic; **⟳** forces it |
 
 Status dots: `●` working · `◆` your turn · `✗` error · `⚠` stalled (run was cut
 off) · `⏸` aborted.
+
+### Composer completions
+
+The phone offers the same three insertions the TUI does, and they mean the same
+thing because the same extensions expand them on the request side:
+
+| Token | What it does | Expanded by |
+|---|---|---|
+| `$skill-name` | inline skill invocation, anywhere in the sentence | `inline-skills` |
+| `@[<session-id>]` | quotes that session's transcript into the request | `session-mention` |
+| `/skill:name args` | the portable skill form; works in any mode | pi itself |
+| `/command` | listed for parity, but pi-kit's handlers need a TUI, so they are inert in a background run | — |
+
+`@[` lists every session, `@g[` only this session's group (and says so when the
+session is ungrouped), `@ga[` adds archived ones. The dropdown in the popup
+header switches the filter for that token without retyping it. Up/Down/Tab/Enter
+move and accept, Escape dismisses, and the group picker is the only control that
+steals focus.
 
 ### Session actions
 
