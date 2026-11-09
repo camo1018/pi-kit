@@ -203,7 +203,8 @@ test("external owners and taken-over workers refuse a second writer", async (t) 
 	assert.ok(agent);
 	s.agents.delete(worker.id);
 	const dir = join(s.dir, "inbox-agents");
-	fs.mkdirSync(dir);
+	// Spawning records wake bookkeeping here, so the directory may already exist.
+	fs.mkdirSync(dir, { recursive: true });
 	const file = join(dir, `${worker.id}.json`);
 	fs.writeFileSync(file, JSON.stringify({ state: "working", pid: 123 }));
 	assert.equal(s.team.status("parent", worker.id).busy, true);

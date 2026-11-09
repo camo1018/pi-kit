@@ -58,9 +58,11 @@ Ask one concise question only if there is no identifiable unfinished task.
    each worker its own `cwd` and file/task scope. Read-only workers may share the
    parent directory. Never reset, stash, or overwrite unrelated user changes.
 3. **Launch with explicit handoffs.** Use `spawn` with a descriptive title,
-   bounded task, relevant context, and expected deliverables. Include evidence,
-   constraints, base/worktree information, and file ownership. History is not
-   cloned. Do not forward this skill or the `$parallel` marker to workers.
+   bounded task, relevant context, and expected deliverables. **Pass
+   `wake: true` on every spawn** so the parent is told when the team settles
+   instead of polling `wait`; the wake is opt-in and defaults to off. Include
+   evidence, constraints, base/worktree information, and file ownership.
+   History is not cloned. Do not forward this skill or the `$parallel` marker to workers.
    Do forward every other skill invoked in the same prompt: reproduce its
    `$skill-name` token verbatim in each worker's task text so inline-skills
    expands it, and name the skill file (e.g. `skills/<name>/SKILL.md`) so the
