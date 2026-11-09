@@ -112,8 +112,15 @@ propagated.
    unrelated user changes, and never give two workers the same file in the same
    directory.
 3. **Launch with explicit handoffs.** Use `spawn` with a descriptive title, a
-   bounded task, relevant context, and expected deliverables. History is not
-   cloned, so the handoff must stand alone. Each handoff should specify:
+   bounded task, relevant context, and expected deliverables. **Pass
+   `wake: true` on every spawn.** The wake is opt-in and defaults to off: it is
+   right for orchestration, where the parent spawns, ends its turn, and must be
+   told the team settled, and wrong everywhere else, where the parent is driving
+   the workers and already knows when they stop. Without the opt-in a parent
+   that delegates also has to poll `wait`.
+
+   History is not cloned, so the handoff must stand alone. Each handoff should
+   specify:
    - the precise question and its boundaries (what is in and out of scope);
    - which sources, repos, paths, tables, or services to use, and which the
      user already ruled out;
@@ -133,7 +140,8 @@ propagated.
 
    Each worker should publish useful findings or blockers with `share` and read
    the shared notes board. Once every worker is started, **end your turn**
-   instead of polling: a settled team wakes you exactly once with one new turn,
+   instead of polling: a settled team wakes you once per fan-out (up to three
+   consecutive automatic wakes before real user input refills the budget),
    which costs less than any number of `wait` returns. Use bounded `wait` only
    when you need an in-turn check, and `send` for scope changes or follow-ups.
    Ending the turn is safe either way: the wake is recorded durably first, so

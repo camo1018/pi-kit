@@ -59,7 +59,7 @@ contribute hands-on work itself.
 
 | Action | Inputs | Behavior |
 |---|---|---|
-| `spawn` | `title`, `task`; optional `context`, `cwd`, `model` (defaults to the `workerDefaultModel` setting, else the parent's model) | Start a worker and return its session id immediately |
+| `spawn` | `title`, `task`; optional `context`, `cwd`, `model` (defaults to the `workerDefaultModel` setting, else the parent's model), `wake` (default `false`) | Start a worker and return its session id immediately |
 | `list` | Optional `id` | Status and latest reply for this team's workers |
 | `read` | `id` | Status, latest reply, and transcript path |
 | `wait` | Optional `id`, `seconds` (1–60, default 30) | Wait for one worker, or all workers, to stop running; timeout returns current status |
@@ -176,10 +176,14 @@ already have the same filesystem permissions. Do not put credentials in notes.
   background parent also starts its team supervisor; ownership still follows
   the existing heartbeat grace period. Queues wait while no eligible
   supervisor is running.
-- **A settled team wakes the parent.** When the last worker of a team stops
-  running, an idle parent gets exactly one wake and runs exactly one new turn.
-  That is the cheap pattern: spawn, end the turn, and spend nothing until the
-  wake. `wait` is still there for a bounded check inside a turn.
+- **A settled team wakes the parent, if it asked to be.** Pass `wake: true` on
+  `spawn` to opt in; the default is off, because delegation usually happens
+  while the parent is the one driving the workers and already knows when they
+  stop. With the opt-in, the last worker of a team stopping gives an idle
+  parent one wake and one new turn, which is the cheap pattern: spawn, end the
+  turn, spend nothing until the wake. At most three consecutive automatic wakes
+  fire per session before a real user reply refills the budget. `wait` is still
+  there for a bounded check inside a turn.
 
   The wake is always first written as a durable `<id>.wake` request next to
   the parent's agent record — the same directory, atomic write, and "whoever
@@ -205,12 +209,33 @@ already have the same filesystem permissions. Do not put credentials in notes.
 
   Guards: the wake needs a worker that was observed running (so loading a
   session with already-finished workers does not fire), coalesces settles
-  inside a short debounce window, fires once per team state, stops after three
+  inside a short debounce window, fires once per fan-out episode, stops after three
   consecutive wakes until real user input arrives, never targets a session
   other than the workers' own parent, and never stacks a second request while
   one is still undelivered. Only the newest wake message is kept in context.
   Adopted workers count as settled normally, which is required for background
   parents.
+
+  Three invariants that are easy to break and silent when broken:
+
+  - **The wake sidecars are not the runner's to delete.** `<id>.wake` and
+    `<id>.wake-state` live in the inbox agent directory beside the runner's own
+    `<id>.json` / `<id>.out` / `<id>.beat`. The runner's metadata cleanup is
+    restricted to that known set: a blanket `${id}.*` glob deleted a pending
+    wake when a parent run finished. Adding a new sidecar under this directory
+    means teaching `removeAgentFiles` about it in `lib/inbox-agents.ts`.
+  - **A wake is queued by session file path, never by session id.** pi resolves
+    `--session-id` against the *spawning* process's project directory only. A
+    wake delivered from a different cwd than the session was created in does
+    not find it and pi silently starts a new blank session under the same id,
+    orphaning the real transcript. `run()` therefore passes `--session <path>`
+    when a session file exists, and spawns in the cwd recorded in that file's
+    header. This applies to every `sendToAgent` call, not just wakes.
+  - **`signature: null` clears, `undefined` leaves alone.** `writeWakeArm`
+    merges into the existing record, so `undefined` is a no-op sentinel. A
+    clear that passes `undefined` does not clear. Likewise arming with
+    `episode` still 0 is a dead end: the settle branch skips `episode === 0`,
+    so the team can never wake.
 
 ## Try a real-model smoke test
 
