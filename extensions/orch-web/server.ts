@@ -801,6 +801,8 @@ interface LiveRecord {
 	state: "idle" | "working";
 	updated: number;
 	bgParent?: number;
+	/** The run's start; the heartbeat only moves `updated`, so this survives. */
+	startedAt?: number;
 	stuckMin?: number;
 }
 

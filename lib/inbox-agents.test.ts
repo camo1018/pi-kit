@@ -661,3 +661,171 @@ test("the run lock is exclusive and a dead holder is reclaimed", async () => {
 	runner.releaseRunLock(id);
 	assert.equal(fs.existsSync(file), false);
 });
+
+// ── an orphaned background run must not own its session forever ────────────
+//
+// A background child is detached on purpose so a closed tab does not kill it,
+// and a live pi normally adopts it within ~20s. When nobody does, the run keeps
+// a live pid and a fresh heartbeat while sitting inside one tool call that never
+// returns -- so pidAlive, `updated`, and every cheap check say "busy" forever.
+// Observed in the wild: such a run outlived its parent by 3h40m and kept the
+// session it shared unwritable the whole time.
+
+/**
+ * Write a live record for `pid` whose RUN started `ageMs` ago.
+ *
+ * Deliberately backdates `startedAt`, not the file's timestamps: the rule reads
+ * the record's own clock, so the test exercises the same path production does
+ * instead of depending on how a given filesystem reports birthtime.
+ */
+function liveRecord(
+	pid: number,
+	fields: Record<string, unknown>,
+	ageMs: number,
+): string {
+	const live = join(dir, "inbox-live");
+	fs.mkdirSync(live, { recursive: true });
+	const file = join(live, `${pid}.json`);
+	fs.writeFileSync(
+		file,
+		JSON.stringify({
+			pid,
+			state: "working",
+			// A wedged run's heartbeat is FRESH -- that is the whole problem.
+			updated: Date.now(),
+			startedAt: Date.now() - ageMs,
+			...fields,
+		}),
+	);
+	return file;
+}
+
+const DEAD_PARENT = 2 ** 30 + 7; // far outside any real pid range
+
+test("a background run whose parent is gone stops being a writer after the grace", async () => {
+	const id = "orphaned-run";
+	const file = liveRecord(
+		process.ppid,
+		{ sessionId: id, bgParent: DEAD_PARENT },
+		runner.ORPHANED_RUN_GRACE_MS + 60_000,
+	);
+	try {
+		assert.equal(
+			runner.writerElsewhere(id),
+			false,
+			"a run nobody adopted in time is stuck, not working",
+		);
+	} finally {
+		fs.rmSync(file, { force: true });
+	}
+});
+
+test("an orphan is still a writer while adoption could still rescue it", async () => {
+	// The first 20s are exactly when a live pi is expected to adopt. Releasing
+	// the slot here would let a second writer start beside a healthy orphan --
+	// the two-writer bug that produced the zero-token aborts.
+	const id = "fresh-orphan";
+	const file = liveRecord(
+		process.ppid,
+		{ sessionId: id, bgParent: DEAD_PARENT },
+		5_000,
+	);
+	try {
+		assert.equal(
+			runner.writerElsewhere(id),
+			true,
+			"a just-orphaned run gets its adoption window",
+		);
+	} finally {
+		fs.rmSync(file, { force: true });
+	}
+});
+
+test("an old background run with a LIVE parent is still a writer", async () => {
+	// Age alone is not abandonment. A long, healthy background run whose parent
+	// is alive is doing real work and must keep its slot however long it takes.
+	const id = "long-healthy-run";
+	const file = liveRecord(
+		process.ppid,
+		{ sessionId: id, bgParent: process.ppid },
+		runner.ORPHANED_RUN_GRACE_MS * 10,
+	);
+	try {
+		assert.equal(
+			runner.writerElsewhere(id),
+			true,
+			"a long run is not a stuck run",
+		);
+	} finally {
+		fs.rmSync(file, { force: true });
+	}
+});
+
+test("an interactive turn is never treated as an abandoned background run", async () => {
+	// No bgParent means a person is sitting in front of that pi. Holding the
+	// session open for hours is legitimate, so this must not be aged out.
+	const id = "long-interactive-turn";
+	const file = liveRecord(
+		process.ppid,
+		{ sessionId: id },
+		runner.ORPHANED_RUN_GRACE_MS * 10,
+	);
+	try {
+		assert.equal(
+			runner.writerElsewhere(id),
+			true,
+			"an interactive writer is a writer for as long as it runs",
+		);
+	} finally {
+		fs.rmSync(file, { force: true });
+	}
+});
+
+test("an abandoned run releases the run lock it was holding", async () => {
+	// `isWriting` rejecting the claim is not enough: the runlock enforced the
+	// same stale claim separately, so the session stayed unwritable.
+	const id = "abandoned-lock";
+	const file = liveRecord(
+		process.ppid,
+		{ sessionId: id, bgParent: DEAD_PARENT },
+		runner.ORPHANED_RUN_GRACE_MS + 60_000,
+	);
+	const lock = join(dir, "inbox-agents", `${id}.runlock`);
+	fs.mkdirSync(join(dir, "inbox-agents"), { recursive: true });
+	fs.writeFileSync(lock, String(process.ppid));
+	try {
+		assert.equal(runner.abandonedWriter(process.ppid), true);
+		assert.equal(
+			runner.acquireRunLock(id),
+			true,
+			"a wedged run's lock is reclaimable",
+		);
+		assert.equal(fs.readFileSync(lock, "utf-8"), String(process.pid));
+	} finally {
+		fs.rmSync(file, { force: true });
+		fs.rmSync(lock, { force: true });
+	}
+});
+
+test("a live background run keeps its run lock", async () => {
+	const id = "healthy-lock";
+	const file = liveRecord(
+		process.ppid,
+		{ sessionId: id, bgParent: process.ppid },
+		runner.ORPHANED_RUN_GRACE_MS * 10,
+	);
+	const lock = join(dir, "inbox-agents", `${id}.runlock`);
+	fs.mkdirSync(join(dir, "inbox-agents"), { recursive: true });
+	fs.writeFileSync(lock, String(process.ppid));
+	try {
+		assert.equal(runner.abandonedWriter(process.ppid), false);
+		assert.equal(
+			runner.acquireRunLock(id),
+			false,
+			"a live holder is a competitor, not garbage",
+		);
+	} finally {
+		fs.rmSync(file, { force: true });
+		fs.rmSync(lock, { force: true });
+	}
+});
