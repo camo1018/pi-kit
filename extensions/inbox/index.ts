@@ -143,13 +143,13 @@ import {
 	getAgent,
 	isRunning,
 	listAgents,
-	MAX_CONCURRENT,
 	onAgentEvent,
 	holdAgent,
 	installAgentChildHooks,
 	isAgentChild,
 	markSeen,
 	parseAgentModel,
+	queueReason,
 	recordActualThinkingLevel,
 	setAgentDir,
 	startAgentSupervisor,
@@ -159,8 +159,11 @@ import {
 	renameAgent,
 	sendQueuedMessageNow,
 	sendToAgent,
+	isWriting,
+	LIVE_STALE_MS,
 	sessionModel,
 	spawnAgent,
+	type LiveRecord,
 } from "../../lib/inbox-agents.ts";
 import {
 	closeVisit,
@@ -592,23 +595,17 @@ function isFiltered(meta: SessionMeta, rule: string | undefined): boolean {
 
 // ───────────────────────────── live registry ─────────────────────────────
 
-interface LiveRecord {
-	pid: number;
-	sessionId: string;
-	sessionFile: string;
-	state: "working" | "idle";
-	updated: number;
-	/** Set when this process is a background agent: pid of the pi that runs it. */
-	bgParent?: number;
-	/** Computed on read: claimed "working" but the session file has been silent too long. */
-	stuckMin?: number;
-}
+// The record shape and its one reading rule live in lib/inbox-agents.ts, beside
+// the spawn gate that also consults them -- so the inbox and the gate cannot
+// disagree about who is writing a session.
 
 // While working, each pi re-touches its own heartbeat every minute (even mid long tool call).
 // A process frozen mid-turn (orphaned by a closed tab) can't, so its heartbeat goes stale.
 // (The session file's mtime is no good here: a reopened window writes the same file.)
-const PULSE_MS = 60_000;
-const STUCK_AFTER_MS = 5 * PULSE_MS;
+// Derived from the staleness rule rather than its own number: the pulse has to
+// be frequent enough that real work never looks stale, and when the two were
+// independent constants they could drift apart.
+const PULSE_MS = Math.max(1_000, Math.floor(LIVE_STALE_MS / 5));
 const PULSE_KEY = Symbol.for("pi.inbox.livePulse");
 
 function setPulse(on: boolean) {
@@ -745,13 +742,13 @@ function readLive(): Map<string, LiveRecord> {
 				fs.unlinkSync(full);
 				continue;
 			}
-			if (rec.state === "working") {
-				// e.g. an orphan frozen mid-turn after its tab closed: don't keep calling it working.
-				const silent = Date.now() - rec.updated;
-				if (silent > STUCK_AFTER_MS) {
-					rec.state = "idle";
-					rec.stuckMin = Math.round(silent / 60_000);
-				}
+			// Age a stale `working` claim down to how we DISPLAY it. The rule itself
+			// lives in `isWriting`, so this can no longer disagree with the gates.
+			if (!isWriting(rec) && rec.state === "working") {
+				// e.g. an orphan frozen mid-turn after its tab closed: don't keep
+				// calling it working.
+				rec.state = "idle";
+				rec.stuckMin = Math.round((Date.now() - rec.updated) / 60_000);
 			}
 			const prev = out.get(rec.sessionId);
 			// Several live processes on one session (e.g. an orphan left mid-turn by a closed tab, plus
@@ -4154,30 +4151,15 @@ function showStartingPrompt(
  *
  * "waiting for a free agent slot" used to be shown for every case, including a
  * run held by another live process -- which capacity cannot fix, and which made
- * the window look capacity-blocked when it was not.
+ * the window look capacity-blocked when it was not. See `queueReason` in
+ * lib/inbox-agents.ts for the three cases.
  */
 function queuedWhy(id: string): string {
-	const a = getAgent(id);
-	if (a?.proc || a?.hold) return "after this run";
-	// A live record for this session held by another process is not capacity.
-	const dir = path.join(AGENT_DIR, "inbox-live");
-	try {
-		for (const name of fs.readdirSync(dir)) {
-			const rec = JSON.parse(fs.readFileSync(path.join(dir, name), "utf-8"));
-			if (rec.sessionId !== id || !rec.pid) continue;
-			if (rec.pid === process.pid) continue;
-			try {
-				process.kill(rec.pid, 0);
-			} catch (e: any) {
-				if (e?.code !== "EPERM") continue;
-			}
-			if (rec.state === "working") return "another pi is running it";
-		}
-	} catch {
-		// no live records: fall through to the capacity answer
-	}
-	const running = listAgents().filter((x) => x.proc).length;
-	if (running >= MAX_CONCURRENT) return "waiting for a free agent slot";
+	const why = queueReason(id);
+	if (why === "slot") return "waiting for a free agent slot";
+	if (why === "writer") return "another pi is running it";
+	if (why === "running") return "after this run";
+	// Nothing is blocking it: the next pump will start it on its own.
 	return "starting…";
 }
 
@@ -4296,17 +4278,21 @@ function unmountLiveStream(ctx: ExtensionContext, G: any) {
 const LIVE_STREAM_KEY = Symbol.for("pi.inbox.liveStream");
 const LIVE_STREAM_LISTENER = Symbol.for("pi.inbox.liveStreamListener");
 
-/** Why a reply can't be sent to this session in the background (undefined = OK). */
+/**
+ * Why a reply can't be sent to this session in the background (undefined = OK).
+ *
+ * Only one case is genuinely impossible: the session this window is holding in
+ * its own chat view, where the editor already is the right place to type. A
+ * session some OTHER pi has open is not a block -- open is not writing. If that
+ * pi is actively working it, the message queues and the spawn chokepoint in
+ * `run()` enforces the single writer; if it is merely sitting open, the run
+ * just starts. Blocking on presence is what made an ordinary open session read
+ * as un-repliable.
+ */
 function sendBlockedReason(id: string, file: string | undefined, ctx: ExtensionContext): string | undefined {
 	const currentFile = ctx.sessionManager.getSessionFile();
 	if (id === ctx.sessionManager.getSessionId() || (file && file === currentFile))
 		return "That's your current session — just type in the editor.";
-	const live = readLive().get(id);
-	const mine = getAgent(id);
-	if (live && live.pid !== process.pid && live.pid !== mine?.pid)
-		return live.bgParent
-			? `It's a background agent of another pi (pid ${live.bgParent}) — reply from there.`
-			: `It's open in another pi window (pid ${live.pid}) — reply there, or close it first.`;
 	return undefined;
 }
 
@@ -5509,7 +5495,10 @@ export default function (pi: ExtensionAPI) {
 			return ctx.ui.notify("That agent is working: wait for it to finish or stop it (C) before moving it.", "warning");
 		const live = readLive().get(id);
 		const ours = live && (live.pid === process.pid || live.pid === getAgent(id)?.pid || live.bgParent === process.pid);
-		if (live && !ours) {
+		// Moving rewrites the session's cwd. That races a run, not an open window:
+		// another pi holding the file open but idle is harmless, and `isRunning`
+		// above already refuses a run this process knows about.
+		if (live?.state === "working" && !ours) {
 			return ctx.ui.notify(
 				live.bgParent
 					? `It's a background agent of another pi (pid ${live.bgParent}) — stop it there first.`
@@ -5641,10 +5630,12 @@ export default function (pi: ExtensionAPI) {
 				"That agent is working again — the inbox has its live view.",
 				"warning",
 			);
-		// The list asks before opening a session another pi holds; a shortcut must never pop that
-		// dialog, so refuse here and leave the list for the deliberate route.
+		// The list asks before opening a session another pi is WORKING; a shortcut
+		// must never pop that dialog, so refuse here and leave the list for the
+		// deliberate route. A session that is only held open elsewhere is not
+		// being written, so it is not worth refusing to jump to.
 		const live = readLive().get(id);
-		if (live && live.pid !== process.pid)
+		if (live?.state === "working" && live.pid !== process.pid)
 			return ctx.ui.notify(
 				`That session is open in another pi window (pid ${live.pid}). shift+tab opens the inbox.`,
 				"warning",
@@ -5975,7 +5966,10 @@ export default function (pi: ExtensionAPI) {
 					);
 					continue;
 				}
-				if (live && !ours) {
+				// Moving rewrites the session's cwd. That races a run, not an open
+				// window: another pi holding the file open but idle is harmless, and
+				// the check above already refuses a run this process knows about.
+				if (live?.state === "working" && !ours) {
 					ctx.ui.notify(
 						live.bgParent
 							? `It's a background agent of another pi (pid ${live.bgParent}) — stop it there first.`

@@ -332,11 +332,16 @@ test("writerElsewhere sees a live writer, and ignores a stale record", async () 
 	const write = (name: string, body: unknown) =>
 		fs.writeFileSync(join(live, name), JSON.stringify(body), "utf-8");
 
-	write("111.json", { sessionId: "busy-session", pid: process.ppid });
+	write("111.json", {
+		sessionId: "busy-session",
+		pid: process.ppid,
+		state: "working",
+		updated: Date.now(),
+	});
 	assert.equal(
 		runner.writerElsewhere("busy-session"),
 		true,
-		"a live foreign pid is a writer",
+		"a live foreign pid that is working is a writer",
 	);
 
 	write("222.json", { sessionId: "stale-session", pid: 2_147_483_646 });
@@ -346,16 +351,205 @@ test("writerElsewhere sees a live writer, and ignores a stale record", async () 
 		"a dead pid is not a writer",
 	);
 
-	// Our own pid is still a writer for a DIFFERENT session: this is the case
-	// `runningElsewhere` skipped and that produced a duplicate.
-	write("333.json", { sessionId: "own-session", pid: process.pid });
+	// Our own pid is still a writer for a DIFFERENT session, but only while it
+	// says it is working: this process really is running that session under
+	// another entry, and a second spawn would race it.
+	write("333.json", {
+		sessionId: "own-session",
+		pid: process.pid,
+		state: "working",
+		updated: Date.now(),
+	});
 	assert.equal(
 		runner.writerElsewhere("own-session"),
 		true,
-		"our own pid counts for another session",
+		"our own working record counts as a writer",
 	);
 
+	// An idle record for THIS process is not a writer at all: it is what an
+	// orchestrator window leaves on `session_start` for a session it only has
+	// open in its chat view. Counting it stopped `run()` from spawning the very
+	// background run that view exists to start, so a message sent there sat in
+	// `pending` forever behind "queued (after this run)" -- and stayed stuck
+	// across restarts, because the pending message is durable and the fresh
+	// window writes the same idle record.
+	write("444.json", {
+		sessionId: "own-idle",
+		pid: process.pid,
+		state: "idle",
+	});
+	assert.equal(
+		runner.writerElsewhere("own-idle"),
+		false,
+		"our own idle record is not writing anything",
+	);
+
+	// A FOREIGN idle record is not a writer either: having a session open is not
+	// writing it. Blocking on presence parked messages behind "queued (after this
+	// run)" when any window merely had the session in its chat view.
+	write("555.json", {
+		sessionId: "foreign-idle",
+		pid: process.ppid,
+		state: "idle",
+	});
+	assert.equal(
+		runner.writerElsewhere("foreign-idle"),
+		false,
+		"a foreign idle record is not writing anything",
+	);
+
+	// A foreign WORKING record is: that process is mid-run on this session, and a
+	// second writer would race it for the file.
+	write("666.json", {
+		sessionId: "foreign-working",
+		pid: process.ppid,
+		state: "working",
+		updated: Date.now(),
+	});
+	assert.equal(runner.writerElsewhere("foreign-working"), true);
+
 	assert.equal(runner.writerElsewhere("nobody"), false);
+});
+
+test("an attached session's queued message actually starts a run", async () => {
+	// The end-to-end shape of the same regression: with the window's own idle
+	// live record present, `sendToAgent` on that session must spawn, not leave
+	// the message parked in `pending` behind "queued (after this run)".
+	let spawned = 0;
+	mock.method(
+		childProcess,
+		"spawn",
+		(_command: string, _args: readonly string[]) => {
+			spawned++;
+			const child = new EventEmitter() as ChildProcess;
+			const stdin = new PassThrough();
+			stdin.on("data", () => {});
+			Object.assign(child, {
+				pid: 123450001,
+				stdin,
+				unref() {},
+				kill() {
+					return true;
+				},
+			});
+			return child;
+		},
+	);
+	syncBuiltinESMExports();
+	try {
+		const live = join(dir, "inbox-live");
+		fs.mkdirSync(live, { recursive: true });
+		fs.writeFileSync(
+			join(live, `${process.pid}.json`),
+			JSON.stringify({
+				sessionId: "open-in-this-window",
+				pid: process.pid,
+				state: "idle",
+			}),
+		);
+		const agent = runner.sendToAgent({
+			id: "open-in-this-window",
+			cwd: dir,
+			title: "open in this window",
+			text: "hello",
+		});
+		assert.equal(spawned, 1, "the attached session starts its run");
+		assert.deepEqual(agent.pending, [], "the message is not left queued");
+		assert.ok(agent.proc, "a run is in flight");
+	} finally {
+		mock.restoreAll();
+		syncBuiltinESMExports();
+		runner.registry().agents.clear();
+	}
+});
+
+test("a session open in several windows still accepts a send", async () => {
+	// Holding a session open is not writing it. Two other windows have this
+	// session in their chat views (idle records, live pids) and neither is
+	// running it, so a send must start a run rather than park the message.
+	// Only one writer at a time is still enforced -- that is `writerElsewhere`
+	// on a `working` record, and the run lock beneath it.
+	let spawned = 0;
+	mock.method(
+		childProcess,
+		"spawn",
+		(_command: string, _args: readonly string[]) => {
+			spawned++;
+			const child = new EventEmitter() as ChildProcess;
+			const stdin = new PassThrough();
+			stdin.on("data", () => {});
+			Object.assign(child, {
+				pid: 123450002,
+				stdin,
+				unref() {},
+				kill() {
+					return true;
+				},
+			});
+			return child;
+		},
+	);
+	syncBuiltinESMExports();
+	try {
+		const live = join(dir, "inbox-live");
+		fs.mkdirSync(live, { recursive: true });
+		const openIn = (pid: number) =>
+			fs.writeFileSync(
+				join(live, `${pid}.json`),
+				JSON.stringify({
+					sessionId: "held-open-everywhere",
+					pid,
+					state: "idle",
+				}),
+			);
+		// Our own window, plus a genuinely foreign one (the test runner's parent,
+		// which is alive and not us).
+		openIn(process.pid);
+		openIn(process.ppid);
+
+		const agent = runner.sendToAgent({
+			id: "held-open-everywhere",
+			cwd: dir,
+			title: "held open everywhere",
+			text: "hello",
+		});
+		assert.equal(spawned, 1, "an open session is not a blocked session");
+		assert.deepEqual(agent.pending, [], "the message is not left queued");
+		assert.ok(agent.proc, "a run is in flight");
+	} finally {
+		mock.restoreAll();
+		syncBuiltinESMExports();
+		runner.registry().agents.clear();
+	}
+});
+
+test("a frozen 'working' claim stops counting as a writer", async () => {
+	// An orphaned tab frozen mid-turn keeps a live record and a live pid but
+	// cannot refresh it. The inbox aged that to `idle` after 5 minutes while
+	// `writerElsewhere` read the raw file and never did, so the session was
+	// blocked from ever being written again. Both ask `isWriting` now.
+	const live = join(dir, "inbox-live");
+	fs.mkdirSync(live, { recursive: true });
+	const claim = (state: string, ageMs: number) =>
+		fs.writeFileSync(
+			join(live, `${process.ppid}.json`),
+			JSON.stringify({
+				sessionId: "frozen",
+				pid: process.ppid,
+				state,
+				updated: Date.now() - ageMs,
+			}),
+		);
+
+	claim("working", 60_000); // one pulse interval: real work
+	assert.equal(runner.writerElsewhere("frozen"), true);
+
+	claim("working", runner.LIVE_STALE_MS + 60_000);
+	assert.equal(
+		runner.writerElsewhere("frozen"),
+		false,
+		"a claim that stopped refreshing is not a writer",
+	);
 });
 
 test("silence means gone only when the recorded pid is also gone", async () => {
@@ -434,4 +628,36 @@ test("a stale heartbeat does not authorise adoption while the owner lives", asyn
 		runner.mayAdopt({ owner: process.ppid, ownerBeat: Date.now() }),
 		false,
 	);
+});
+
+test("the run lock is exclusive and a dead holder is reclaimed", async () => {
+	// `writerElsewhere` is a read: two processes calling run() in the same instant
+	// both see no writer and both spawn. The lock is what makes the guarantee
+	// mutual exclusion rather than a likely-correct glance.
+	const id = "lock-session";
+	assert.equal(runner.acquireRunLock(id), true, "first caller takes it");
+	assert.equal(runner.acquireRunLock(id), true, "we hold it: a missed release");
+	runner.releaseRunLock(id);
+
+	// A lock held by a live foreign process blocks.
+	const file = join(dir, "inbox-agents", `${id}.runlock`);
+	fs.mkdirSync(join(dir, "inbox-agents"), { recursive: true });
+	fs.writeFileSync(file, String(process.ppid), "utf-8");
+	assert.equal(runner.acquireRunLock(id), false, "a live holder keeps it");
+	assert.equal(fs.readFileSync(file, "utf-8"), String(process.ppid));
+
+	// A lock held by a process that crashed between acquire and release must not
+	// wedge the session forever.
+	fs.writeFileSync(file, String(2_147_483_646), "utf-8");
+	assert.equal(runner.acquireRunLock(id), true, "a dead holder is reclaimed");
+	assert.equal(fs.readFileSync(file, "utf-8"), String(process.pid));
+
+	// Release is owner-scoped: a process must not drop someone else's lock.
+	fs.writeFileSync(file, String(process.ppid), "utf-8");
+	runner.releaseRunLock(id);
+	assert.equal(fs.existsSync(file), true, "not ours to release");
+
+	fs.writeFileSync(file, String(process.pid), "utf-8");
+	runner.releaseRunLock(id);
+	assert.equal(fs.existsSync(file), false);
 });
