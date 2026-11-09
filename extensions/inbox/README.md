@@ -115,7 +115,7 @@ What to expect:
   ```
 
   `allow-all` includes write-capable tools and should be used only when unattended writes are intentional.
-- **At most 6 run at once** (set `PI_INBOX_MAX_AGENTS` to change it). Extra ones show `● queued`.
+- **At most 20 run at once** (set `PI_INBOX_MAX_AGENTS` to change it). Extra ones show `● queued`.
 - **They outlive this window.** Agents are detached processes: quitting pi, closing the tab (or a shell watchdog killing pi) does **not** stop them; the run in flight finishes on its own. Their state, including queued messages, is kept in `~/.pi/agent/inbox-agents/`. The window that started an agent owns it (heartbeat every 5s). If the owner goes away, any other open pi window adopts the agent within ~20s, or the next pi you start does. Adopting means it replays what the agent did so far, keeps following it, pings when it finishes, and delivers queued messages. Queued messages only start once some pi window is open. Stop an agent explicitly with `/stop`, `ctrl+shift+s` or `C`. Switching sessions doesn't stop agents either. Other windows see agents they don't own as `● working` but can't reply to them.
 - **Parallel agents in one repo can collide** when they edit the same files. Give each its own git worktree, or keep parallel work to separate files or read-only tasks.
 
