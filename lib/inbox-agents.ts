@@ -402,6 +402,25 @@ const agentFile = (id: string, ext: "json" | "out" | "err" | "exit" | "stop" | "
 /** Owner heartbeat cadence / how stale before another pi adopts the agent. */
 const OWNER_BEAT_MS = 5_000;
 const OWNER_STALE_MS = 20_000;
+/**
+ * How long a run whose owning pi is gone may keep its writer slot before the
+ * live record stops counting as a writer.
+ *
+ * A background child is deliberately `detached` so it outlives its parent: a
+ * closed tab must not kill an agent mid-task. That is the point of adoption. But
+ * when no live pi adopts it, nothing is left to stop it either, and a run blocked
+ * forever inside one tool call (a `bash` that never returns) keeps a LIVE pid and
+ * a FRESH heartbeat -- so every clause of `isWriting` is satisfied and the
+ * session reads as "another pi is running it" indefinitely. Observed: a run left
+ * 3h40m past its parent's exit, blocking the session it shared.
+ *
+ * Adoption rescues the normal case well inside this window: `mayAdopt` only
+ * requires the owner to be 20s stale, and an adoptee then heartbeats again. So a
+ * run still orphaned after two minutes is not being rescued, it is stuck. Wide
+ * enough that adoption always wins the race; narrow enough that a wedged run
+ * cannot block a session for an afternoon.
+ */
+export const ORPHANED_RUN_GRACE_MS = 2 * 60_000;
 /** Child heartbeat staleness (after a startup grace) that means the child died without a word. */
 export const CHILD_STALE_MS = 45_000;
 export const CHILD_GRACE_MS = 90_000;
@@ -904,11 +923,27 @@ export interface LiveRecord {
 	/** Set when this process is a background agent: pid of the pi that runs it. */
 	bgParent?: number;
 	/**
-	 * How long a `working` claim may go unrefreshed before it stops counting as a
-	 * writer -- a process frozen mid-turn (orphaned tab, suspended laptop) cannot
-	 * refresh, and it must not own the session forever.
+	 * How long this claim has failed to count as a writer, in minutes, once it has
+	 * stopped counting.
+	 *
+	 * Two different things produce it, and the UI says "no progress" rather than
+	 * "silent" because of the second: a process frozen mid-turn (orphaned tab,
+	 * suspended laptop) stops refreshing `updated` entirely, while a background
+	 * run whose owning pi is gone keeps pulsing happily inside one tool call that
+	 * never returns. Only `isWriting` decides; this is display state.
 	 */
 	stuckMin?: number;
+	/**
+	 * When this run began, written once when the record is created and preserved
+	 * by the heartbeat, which only rewrites `updated`.
+	 *
+	 * The staleness cutoff cannot see a run wedged inside one tool call: the pulse
+	 * keeps `updated` fresh, so it looks maximally busy while making no progress.
+	 * This is the clock that catches that.
+	 * Absent on records written before it existed; `liveRecordBirthMs` is the
+	 * fallback, and an unknown start keeps the conservative "still a writer".
+	 */
+	startedAt?: number;
 }
 
 /**
@@ -946,12 +981,104 @@ export const LIVE_STALE_MS = 5 * 60_000;
  * run has already flipped to `idle`, and a crashed one has no pid left.
  */
 export function isWriting(
-	rec: Pick<LiveRecord, "pid" | "state" | "updated">,
+	rec: Pick<LiveRecord, "pid" | "state" | "updated" | "bgParent" | "startedAt">,
 	since: number = Date.now(),
 ): boolean {
 	if (rec.state !== "working") return false;
 	if (!pidAlive(rec.pid)) return false;
-	return since - (Number(rec.updated) || 0) <= LIVE_STALE_MS;
+	if (since - (Number(rec.updated) || 0) > LIVE_STALE_MS) return false;
+	return !ownerGone(rec, since);
+}
+
+/**
+ * True when a background run has outlived the pi that started it, long enough
+ * that it is stuck rather than merely waiting to be adopted.
+ *
+ * Deliberately asks about the RUN'S AGE, not only about `bgParent` being dead.
+ * Those are different questions, and the difference is what keeps this safe:
+ *
+ *   - The parent being gone is NORMAL and expected. The child is spawned
+ *     `detached` precisely so a closed tab does not kill an agent mid-task, and
+ *     a live pi picks it up through `adoptOrphans`. Releasing the writer slot on
+ *     "parent is dead" alone would let a second writer start beside a perfectly
+ *     healthy orphan during the ~20s before adoption -- the exact two-writer
+ *     bug (`zero-token aborts`) this area has been fixed for twice.
+ *   - A run still unadopted after `ORPHANED_RUN_GRACE_MS` is not being rescued.
+ *     Either no pi is running, or the one that could has already had ample time.
+ *     It is then stuck, and must stop owning the session.
+ *
+ * A run with no `bgParent` is an interactive pi's own turn: its user is sitting
+ * in front of it, so a live pid with a fresh heartbeat really is a writer.
+ *
+ * Age comes from the live file's CREATION time, not from `updated`: the pulse
+ * rewrites `updated` every second, so a run wedged inside one tool call looks
+ * maximally fresh forever. That freshness is exactly what a plain staleness
+ * cutoff cannot catch, and why this needed its own clock.
+ */
+function ownerGone(
+	rec: Pick<LiveRecord, "updated" | "bgParent" | "pid" | "startedAt">,
+	now: number,
+): boolean {
+	if (!rec.bgParent) return false;
+	if (pidAlive(rec.bgParent)) return false;
+	// The record's own `startedAt` is the clock; a file creation time is only a
+	// fallback for records written before that field existed. An unknown start
+	// keeps the safe answer (still a writer) rather than guessing.
+	const started = Number(rec.startedAt) > 0
+		? Number(rec.startedAt)
+		: liveRecordBirthMs(rec);
+	if (started === undefined) return false;
+	return now - started > ORPHANED_RUN_GRACE_MS;
+}
+
+/**
+ * When this live record was created, or undefined when that cannot be known.
+ *
+ * The file is named by pid and written once at `session_start`, so its creation
+ * time is the run's start. An unknowable age is reported as undefined so callers
+ * keep the conservative "still a writer" answer rather than guessing.
+ */
+function liveRecordBirthMs(rec: Pick<LiveRecord, "pid" | "updated">): number | undefined {
+	const file = path.join(getAgentDir(), "inbox-live", `${rec.pid}.json`);
+	try {
+		const st = fs.statSync(file);
+		// birthtime can be 0 on filesystems that do not record it; the mtime is a
+		// LOWER bound on age (the pulse only moves it forward), so using it can only
+		// make a run look YOUNGER than it is -- the safe direction, since younger
+		// means "still a writer".
+		return Number.isFinite(st.birthtimeMs) && st.birthtimeMs > 0
+			? st.birthtimeMs
+			: st.mtimeMs;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * True when `pid` holds a writer slot it can no longer justify: a background run
+ * whose owning pi is gone and that no other pi picked up in time.
+ *
+ * `pidAlive` alone cannot answer this. A wedged run keeps a live pid and a fresh
+ * heartbeat while sitting inside one tool call that never returns, so every
+ * cheap liveness check says "busy" forever. This is where a run that `isWriting`
+ * has already stopped counting must also give up its `runlock`, or the lock keeps
+ * enforcing the stale claim the read path just rejected.
+ *
+ * An unreadable or missing live record means "cannot prove it is abandoned", so
+ * the lock is left alone.
+ */
+export function abandonedWriter(pid: number, now: number = Date.now()): boolean {
+	if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+	let rec: LiveRecord;
+	try {
+		rec = JSON.parse(
+			fs.readFileSync(path.join(getAgentDir(), "inbox-live", `${pid}.json`), "utf-8"),
+		);
+	} catch {
+		return false;
+	}
+	if (rec.pid !== pid) return false;
+	return ownerGone(rec, now);
 }
 
 /**
@@ -1096,7 +1223,14 @@ export function acquireRunLock(id: string): boolean {
 	// Our own pid: a later run in this process implies the earlier one ended,
 	// and two runs of one session cannot coexist here anyway (`a.proc`). So this
 	// is a release we missed on an error path, not a competitor.
-	if (holder !== process.pid && pidAlive(holder)) return false;
+	//
+	// A live holder is normally a competitor. The exception is an abandoned
+	// background run: its pid is alive and its heartbeat is fresh, but its owning
+	// pi is gone and nobody adopted it, so it is wedged rather than working. It
+	// kept this session unwritable indefinitely (observed: 3h40m past its
+	// parent's exit). `isWriting` already stopped counting it; the lock must not
+	// go on enforcing the claim the read path rejected.
+	if (holder !== process.pid && pidAlive(holder) && !abandonedWriter(holder)) return false;
 	try {
 		fs.writeFileSync(file, String(process.pid));
 		return true;
