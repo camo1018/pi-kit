@@ -897,6 +897,8 @@ interface Row {
 	expanded?: boolean;
 	/** Last child in its family: the client draws the tree tail. */
 	lastChild?: boolean;
+	/** Human-readable group name, when the daemon knows the group. */
+	groupName?: string;
 	firstPrompt: string;
 	lastSaid?: { role: string; text: string };
 	lastText: string;
@@ -979,6 +981,8 @@ export function buildRows(opts: {
 		}
 	})();
 	const groupOf = (id: string): string | undefined => groups.sessions?.[id];
+	const groupName = (id?: string): string | undefined =>
+		id ? groups.groups?.find((g) => g.id === id)?.name : undefined;
 	const parentOf = new Map<string, string>();
 	for (const link of links as WorkerLink[]) parentOf.set(link.id, link.parentId);
 
@@ -1025,6 +1029,7 @@ export function buildRows(opts: {
 			unread:
 				(meta.unreadAt ?? 0) > (meta.seenAt ?? 0) || !!bg?.needsYou,
 			groupId: groupOf(h.id),
+			groupName: groupName(groupOf(h.id)),
 			parentId: parentOf.get(h.id),
 			firstPrompt: cleanTitle(firstUserText(h.path)),
 			lastSaid: tail.lastSaid,
@@ -1057,6 +1062,7 @@ export function buildRows(opts: {
 			hidden: meta.filter === "hide",
 			unread: !!a.needsYou,
 			groupId: groupOf(a.id),
+			groupName: groupName(groupOf(a.id)),
 			parentId: parentOf.get(a.id),
 			firstPrompt: cleanTitle(a.title),
 			lastSaid: a.lastText
@@ -1095,6 +1101,9 @@ export function buildRows(opts: {
 	return {
 		rows: ordered,
 		groups: groups.groups ?? [],
+		// The TUI persists the All-groups layout; the phone draws the same list,
+		// so it honours the same choice instead of inventing a second one.
+		layout: groups.layout === "flat" ? ("flat" as const) : ("groups" as const),
 		defaultGroupId: groups.defaultGroupId,
 		summary: agentsSummary(),
 		capacity: { running: rows.filter((r) => r.state === "working").length, max: MAX_CONCURRENT },
@@ -2146,9 +2155,10 @@ function doClone(id: string) {
 
 /** Create / rename / remove a group, or change the default. */
 async function doGroupEdit(body: {
-	action: "create" | "rename" | "remove" | "default";
+	action: "create" | "rename" | "remove" | "default" | "layout";
 	id?: string;
 	name?: string;
+	layout?: "flat" | "groups";
 }) {
 	const groups = new InboxGroups(AGENT_DIR);
 	switch (body?.action) {
@@ -2173,6 +2183,13 @@ async function doGroupEdit(body: {
 		case "default": {
 			await groups.setDefaultGroup(body.id || undefined);
 			return { ok: true, defaultGroupId: body.id || undefined };
+		}
+		case "layout": {
+			// Anything but an explicit "flat" is the grouped list, matching the
+			// TUI's own fallback for a store that never recorded a choice.
+			const layout = body.layout === "flat" ? "flat" : "groups";
+			await groups.setLayout(layout);
+			return { ok: true, layout };
 		}
 		default:
 			throw new Error("unknown group action");

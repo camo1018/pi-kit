@@ -568,6 +568,42 @@ test("an ungrouped session's own-group scope is empty, not everything", () => {
 	fs.rmSync(groupsFile, { force: true });
 });
 
+test("rows carry the persisted list layout and their group's name", () => {
+	const gid = "grp-layout";
+	const inGroup = "jjjj-1010";
+	const loose = "kkkk-1111";
+	writeSession({ id: inGroup, messages: [user("in a group")] });
+	writeSession({ id: loose, messages: [user("no group")] });
+	const groupsFile = path.join(agentDir, "inbox-groups.json");
+	const store = (extra: Record<string, unknown>) =>
+		fs.writeFileSync(groupsFile, JSON.stringify({
+			version: 1,
+			groups: [{ id: gid, name: "Layouts", templateEnabled: false, template: "" }],
+			sessions: { [inGroup]: gid },
+			...extra,
+		}));
+
+	// A store that never recorded a choice draws the grouped list, like the TUI.
+	store({});
+	assert.equal(buildRows().layout, "groups");
+	assert.equal(
+		buildRows().rows.find((r) => r.id === inGroup)?.groupName,
+		"Layouts",
+	);
+	assert.equal(buildRows().rows.find((r) => r.id === loose)?.groupName, undefined);
+
+	// The TUI's `s` persists `layout` in the same file: the phone reads it back
+	// so the two front ends show one list, not two different ones.
+	store({ layout: "flat" });
+	assert.equal(buildRows().layout, "flat");
+	// Membership is still reported in flat, where the group name rides the row.
+	assert.equal(buildRows().rows.find((r) => r.id === inGroup)?.groupId, gid);
+
+	store({ layout: "groups" });
+	assert.equal(buildRows().layout, "groups");
+	fs.rmSync(groupsFile, { force: true });
+});
+
 // ───────────────────────── stale live records ─────────────────────────
 
 /**
