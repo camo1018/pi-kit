@@ -74,6 +74,7 @@ import {
 	recordTouchedAt,
 } from "./prune.ts";
 import { fingerprintOf, type Fingerprint } from "./fingerprint.ts";
+import { fitToWidth } from "./fit-text.ts";
 import {
 	allMessagesText,
 	canResume,
@@ -1893,9 +1894,7 @@ function shortCwd(cwd: string): string {
 }
 
 function fit(s: string, w: number): string {
-	if (w <= 0) return "";
-	const t = truncateToWidth(s, w, "…");
-	return t + " ".repeat(Math.max(0, w - visibleWidth(t)));
+	return fitToWidth(s, w, { visibleWidth, truncate: truncateToWidth });
 }
 
 function printable(data: string): string | undefined {
