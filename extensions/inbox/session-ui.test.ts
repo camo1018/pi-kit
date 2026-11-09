@@ -1808,7 +1808,7 @@ test("membership is saved before starting a new agent", async (t) => {
 	await done;
 	// Occupy all slots using fake process handles: NEVER launch real children.
 	const busy = await f.visit("slot blocker");
-	for (let i = 0; i < 6; i++) {
+	for (let i = 0; i < MAX_CONCURRENT; i++) {
 		registry().agents.set(`blocker-${i}`, { ...busy, id: `blocker-${i}` });
 	}
 	// Avoid the interactive auto-open watcher; test only the routing boundary.
@@ -2740,4 +2740,125 @@ test("ctrl+q refuses a working current session instead of aborting it", async (t
 		String((f.ui.notify as any).mock.calls.at(-1).arguments[0]),
 		/working, and jumping away would abort it/,
 	);
+});
+
+test("the idle refresh timer skips work until something on disk moves", async (t) => {
+	const f = await setup(t);
+	const { list, done } = await f.openInbox();
+	// Let the constructor's own refresh settle so `builtFrom` is populated.
+	for (let i = 0; i < 200; i++) {
+		await list.refresh();
+		if (list.builtFrom) break;
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	assert.ok(list.builtFrom, "a completed refresh must record a fingerprint");
+
+	// The skip is observable through `onRows`: an unchanged state must not rebuild
+	// the row list at all, which is the whole point of the fingerprint.
+	const rowsBefore = list.rows;
+	await list.refresh(undefined, true);
+	assert.equal(list.rows, rowsBefore, "an unchanged state must not reload rows");
+
+	// A brand-new session changes the containing directory's mtime, so the next
+	// timer refresh has to notice it.
+	const fresh = SessionManager.create(dir);
+	fresh.appendMessage({
+		role: "user",
+		content: "a session that just appeared",
+		timestamp: Date.now(),
+	});
+	const changed = await (async () => {
+		for (let i = 0; i < 200; i++) {
+			await list.refresh(undefined, true);
+			if (list.rows !== rowsBefore) return true;
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
+		return false;
+	})();
+	assert.ok(changed, "a new session must invalidate the fingerprint");
+	assert.ok(
+		list.visible.some((row: any) => row.info.id === fresh.getSessionId()),
+		"and it must show up in the list",
+	);
+
+	// Appending to a session OPEN IN ANOTHER PROCESS must invalidate, even though
+	// it moves no directory mtime. This is the case a pure directory fingerprint
+	// misses: the file sits in a slug dir whose listing is already cached, and it
+	// is not this window's own session, so nothing else in the fingerprint moves.
+	// A live record with `state: "idle"` is the hard form of it — pi writes
+	// session entries (a rename, a model/thinking change, compaction) while no run
+	// is in flight, and `working` would let a `state === "working"` filter off the
+	// hook.
+	const foreign = SessionManager.create(join(dir, "elsewhere"));
+	foreign.appendMessage({ role: "user", content: "foreign", timestamp: 1 });
+	// Let the list see it, and settle `builtFrom` on that state.
+	for (let i = 0; i < 200; i++) {
+		await list.refresh(undefined, true);
+		if (list.rows.some((r: any) => r.info.id === foreign.getSessionId()))
+			break;
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	await list.refresh(undefined, true);
+	const foreignBefore = list.rows
+		.find((r: any) => r.info.id === foreign.getSessionId()).info.messageCount;
+	// A live record for it, claiming idle: someone has the session open but is not
+	// running. A `bgParent` of this process is how `readLive()` marks a record as
+	// ours, which keeps it from being pruned for liveness — and it is the realistic
+	// shape of the case: a background agent this window supervises, idle between
+	// runs, whose session file still gets written. A made-up or merely-`ppid` pid is
+	// not reliably in `pgrep`'s visible set here, so the record would be dropped on
+	// the next read and the test would prove nothing.
+	const liveDir = join(dir, "inbox-live");
+	mkdirSync(liveDir, { recursive: true });
+	writeFileSync(
+		join(liveDir, "424242.json"),
+		JSON.stringify({
+			pid: 424242,
+			bgParent: process.pid,
+			sessionId: foreign.getSessionId(),
+			sessionFile: foreign.getSessionFile(),
+			state: "idle",
+			updated: Date.now(),
+		}),
+	);
+	// Settle the fingerprint on the post-live-record state. Creating the record just
+	// bumped the live directory's mtime, and that must not be what invalidates here:
+	// the append below has to be the only thing that moves.
+	await list.refresh(undefined, true);
+	assert.ok(list.builtFrom, "the settle refresh must record a fingerprint");
+	foreign.appendMessage({ role: "user", content: "written while idle", timestamp: Date.now() });
+	const foreignGrown = await (async () => {
+		for (let i = 0; i < 200; i++) {
+			await list.refresh(undefined, true);
+			const row = list.rows.find(
+				(r: any) => r.info.id === foreign.getSessionId(),
+			);
+			if (row && row.info.messageCount > foreignBefore) return true;
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
+		return false;
+	})();
+	assert.ok(
+		foreignGrown,
+		"a write to a session held open elsewhere while idle must invalidate the fingerprint",
+	);
+
+	// And the same for this window's own session.
+	const mainId = f.main.getSessionId();
+	const before = list.rows
+		.find((r: any) => r.info.id === mainId).info.messageCount;
+	f.main.appendMessage({ role: "user", content: "more", timestamp: Date.now() });
+	const grown = await (async () => {
+		for (let i = 0; i < 200; i++) {
+			await list.refresh(undefined, true);
+			const row = list.rows.find((r: any) => r.info.id === mainId);
+			if (row && row.info.messageCount > before) return true;
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
+		return false;
+	})();
+	assert.ok(grown, "an append to an open session must invalidate the fingerprint");
+
+	list.handleInput("\x1b");
+	await done;
 });

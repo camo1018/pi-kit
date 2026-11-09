@@ -49,7 +49,7 @@
  * Q leaves the mode.
  */
 
-import { spawn, spawnSync } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { sectionByGroup } from "./group-layout.ts";
 import {
@@ -60,6 +60,29 @@ import {
 	type WorkerLink,
 } from "./families.ts";
 import { promptAutocomplete } from "../../lib/prompt-autocomplete.ts";
+import {
+	dirReusable,
+	pruneCacheByPath,
+	sameStamp,
+	shouldFlushCache,
+	type DirEntry,
+} from "./scan-cache.ts";
+import {
+	isPrunableOrphan,
+	ORPHAN_GRACE_MS,
+	PRUNE_BATCH,
+	recordTouchedAt,
+} from "./prune.ts";
+import { fingerprintOf, type Fingerprint } from "./fingerprint.ts";
+import {
+	allMessagesText,
+	canResume,
+	emptyTally,
+	foldLine,
+	messageText,
+	splitLines,
+	type SessionTally,
+} from "./incremental-parse.ts";
 import {
 	GroupSelector, isGroupShortcut, type GroupPickerMode, type GroupSelection,
 } from "./group-selector.ts";
@@ -402,6 +425,115 @@ function saveStore(store: Store) {
 	fs.renameSync(tmp, STORE_PATH);
 }
 
+/**
+ * Everything the pruner needs to know about what still refers to a session.
+ * Read from directory listings rather than by stat-ing each id: the set of
+ * agent records and worker links is small, and one `readdir` covers all of it.
+ */
+interface References {
+	sessionIds: ReadonlySet<string>;
+	liveIds: ReadonlySet<string>;
+	agentIds: ReadonlySet<string>;
+	linkIds: ReadonlySet<string>;
+}
+
+function idsInDir(dir: string): Set<string> {
+	const out = new Set<string>();
+	let names: string[];
+	try {
+		names = fs.readdirSync(dir);
+	} catch {
+		return out;
+	}
+	for (const name of names) {
+		if (!name.endsWith(".json")) continue;
+		out.add(name.slice(0, -5));
+	}
+	return out;
+}
+
+/**
+ * Drop `inbox.json` records that no longer describe anything: no session file, no
+ * live record, no agent record, no worker link. See `isPrunableOrphan` for why
+ * each of those is checked, and `ORPHAN_GRACE_MS` for the quiet period.
+ *
+ * Runs on the refresh path at most once per `PRUNE_INTERVAL_MS`, and only ever
+ * deletes from the store it just re-read, so a concurrent writer's unrelated
+ * record cannot be clobbered by a stale snapshot.
+ */
+const PRUNE_INTERVAL_MS = 10 * 60_000;
+let prunedAt = 0;
+/** Set when a prune pass stopped at PRUNE_BATCH with more left to do. */
+let pruneBacklog = false;
+
+function pruneOrphanRecords(refs: References): { dropped: number; more: boolean } {
+	const store = loadStore();
+	const now = Date.now();
+	const doomed: string[] = [];
+	let more = false;
+	for (const [id, meta] of Object.entries(store.sessions)) {
+		if (
+			isPrunableOrphan(
+				{
+					hasSessionFile: refs.sessionIds.has(id),
+					hasLiveRecord: refs.liveIds.has(id),
+					hasAgentRecord: refs.agentIds.has(id),
+					hasWorkerLink: refs.linkIds.has(id),
+					lastTouched: recordTouchedAt(meta ?? {}),
+				},
+				now,
+			)
+		) {
+			// Keep counting past the batch cap: `more` tells the caller to come
+			// back on the next refresh instead of after a full interval.
+			if (doomed.length < PRUNE_BATCH) doomed.push(id);
+			else more = true;
+		}
+	}
+	if (doomed.length === 0) return { dropped: 0, more };
+	for (const id of doomed) delete store.sessions[id];
+	saveStore(store);
+	return { dropped: doomed.length, more };
+}
+
+/**
+ * Drop worker link records whose session is gone and that nothing can resolve any
+ * more, so a dead team stops contributing rows and family nesting.
+ *
+ * `session-workers` already prunes reported workers, but only while sweeping that
+ * parent's team: a parent that never runs again keeps its records forever. The
+ * extra conditions here are what make deleting from outside that module safe —
+ * the child has no session file, no live record and no agent record, the parent is
+ * equally idle, and the record is old enough that a follow-up is not expected.
+ */
+function pruneDeadWorkerLinks(refs: References, links: WorkerLink[]): number {
+	const now = Date.now();
+	let dropped = 0;
+	for (const link of links) {
+		if (now - link.createdAt <= ORPHAN_GRACE_MS) continue;
+		if (refs.sessionIds.has(link.id)) continue;
+		if (refs.liveIds.has(link.id) || refs.agentIds.has(link.id)) continue;
+		// The owner may still be alive and about to report this worker.
+		if (refs.liveIds.has(link.parentId) || refs.agentIds.has(link.parentId))
+			continue;
+		try {
+			fs.rmSync(
+				path.join(
+					AGENT_DIR,
+					"session-workers",
+					"workers",
+					`${link.id}.json`,
+				),
+				{ force: true },
+			);
+			dropped++;
+		} catch {
+			// Best effort: an unpruned link is harmless.
+		}
+	}
+	return dropped;
+}
+
 /** Start unread tracking (once). Everything written before now counts as read. */
 function unreadBaseline(store: Store): number {
 	if (store.unreadSince) return store.unreadSince;
@@ -696,18 +828,50 @@ function installHangupGuard() {
  * hangs around (orphaned) and never reaps it: kill(pid, 0) still succeeds on a zombie forever
  * (even across sandboxes, where a live process would give EPERM).
  * pgrep can't see our own sandbox (this pi + its background agents), so callers vouch for those.
+ *
+ * This used to be a `spawnSync("pgrep", ["."])` on the read path, which blocked the event loop
+ * — and therefore the TUI — for ~25ms on this machine (~960 processes), once per refresh (2.5s)
+ * and once per supervisor tick (5s). It is now a backgrounded `execFile` behind a short TTL, so
+ * the answer the reader sees can be up to VISIBLE_TTL_MS stale. That is fine: the only consumer
+ * is the zombie guard below, and the staleness window that rule protects against
+ * (`isWriting`'s LIVE_STALE_MS, five minutes) is orders of magnitude larger.
  */
-function visiblePids(): Set<number> | undefined {
+const VISIBLE_TTL_MS = 15_000;
+/** Don't stack up pgrep invocations while one is in flight or just came back empty. */
+const VISIBLE_RETRY_MS = 5_000;
+let visibleCache: Set<number> | undefined;
+let visibleTakenAt = 0;
+let visibleAskedAt = 0;
+
+function refreshVisiblePids(): void {
+	const now = Date.now();
+	if (now - visibleAskedAt < VISIBLE_RETRY_MS) return;
+	visibleAskedAt = now;
 	try {
-		const r = spawnSync("pgrep", ["."], {
-			encoding: "utf-8",
-			timeout: 2000,
-		});
-		if (r.status !== 0 || !r.stdout) return undefined;
-		return new Set(r.stdout.split("\n").filter(Boolean).map(Number));
+		execFile(
+			"pgrep",
+			["."],
+			{ encoding: "utf-8", timeout: 5000, maxBuffer: 4 << 20 },
+			(error, stdout) => {
+				// On failure keep the previous answer rather than forgetting about
+				// zombies entirely; an unavailable pgrep is "no opinion", which is
+				// how this behaved before the cache existed.
+				if (error || !stdout) return;
+				visibleCache = new Set(
+					stdout.split("\n").filter(Boolean).map(Number),
+				);
+				visibleTakenAt = Date.now();
+			},
+		);
 	} catch {
-		return undefined;
+		// Best effort: no opinion.
 	}
+}
+
+function visiblePids(): Set<number> | undefined {
+	if (!visibleCache || Date.now() - visibleTakenAt > VISIBLE_TTL_MS)
+		refreshVisiblePids();
+	return visibleCache;
 }
 
 function pidAlive(pid: number, visible?: () => Set<number> | undefined): boolean {
@@ -775,14 +939,6 @@ interface TailInfo {
 
 const tailCache = new Map<string, { mtimeMs: number; size: number; info: TailInfo }>();
 
-function messageText(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.filter((b: any) => b?.type === "text" && typeof b.text === "string")
-		.map((b: any) => b.text)
-		.join("\n");
-}
 
 function readTail(file: string): TailInfo {
 	let st: fs.Stats;
@@ -905,15 +1061,38 @@ interface Row {
 async function loadRows(
 	currentId: string | undefined,
 	wantArchived = false,
+	/** Pre-taken header scan; the refresh path takes it once and fingerprints it. */
+	headers?: HeaderInfo[],
 ): Promise<Row[]> {
 	const [store, live, filters] = [loadStore(), readLive(), loadFilters()];
-	const links = readWorkerLinks(AGENT_DIR);
+	const scan = headers ?? scanHeaders();
+	let links = readWorkerLinks(AGENT_DIR);
+	// Housekeeping rides the refresh loop: it is the one place that already knows the
+	// full set of sessions, live records, agent records, and worker links. Throttled to
+	// once per PRUNE_INTERVAL_MS so a 2.5s refresh never pays for it — unless the last
+	// pass hit its batch cap, in which case the next refresh continues the drain.
+	if (pruneBacklog || Date.now() - prunedAt > PRUNE_INTERVAL_MS) {
+		prunedAt = Date.now();
+		const refs: References = {
+			sessionIds: new Set(scan.map((h) => h.id)),
+			liveIds: new Set(live.keys()),
+			agentIds: idsInDir(path.join(AGENT_DIR, "inbox-agents")),
+			linkIds: new Set(links.map((link) => link.id)),
+		};
+		const droppedLinks = pruneDeadWorkerLinks(refs, links);
+		const { dropped, more } = pruneOrphanRecords(refs);
+		pruneBacklog = more;
+		if (droppedLinks || dropped) {
+			links = readWorkerLinks(AGENT_DIR);
+			store.sessions = loadStore().sessions;
+		}
+	}
 	const contextParents = new Set(
 		links
 			.filter((link) => !store.sessions[link.id]?.archivedAt)
 			.map((link) => link.parentId),
 	);
-	const infos = await scanSessions(store, wantArchived, contextParents);
+	const infos = await scanSessions(store, wantArchived, contextParents, scan);
 	const rows: Row[] = [];
 	for (const info of infos) {
 		const isCurrent = info.id === currentId;
@@ -1087,9 +1266,13 @@ interface HeaderInfo {
 }
 
 /** First line of a session file is always the `session` header: id, timestamp, cwd. */
-function readSessionHeaderLine(file: string): HeaderInfo | undefined {
+function readSessionHeaderLine(
+	file: string,
+	/** Already-taken `statSync` for this file, when the caller has one (the scan does). */
+	known?: fs.Stats,
+): HeaderInfo | undefined {
 	try {
-		const st = fs.statSync(file);
+		const st = known ?? fs.statSync(file);
 		if (st.size === 0) return;
 		const fd = fs.openSync(file, "r");
 		try {
@@ -1126,7 +1309,24 @@ function readSessionHeaderLine(file: string): HeaderInfo | undefined {
 	}
 }
 
-/** Cheap directory walk of ~/.pi/agent/sessions: header line only, one file at a time. */
+/**
+ * Per-file header cache. A session file's header NEVER changes once written (it is pi's first
+ * JSONL line, and rewriting it means a new file: `moveSessionDir` writes a temp file and
+ * renames), so an unchanged `(mtime, size)` means the header we already parsed is still right.
+ * This is the difference between re-reading 750 files and re-reading the handful that moved.
+ */
+const headerCache = new Map<string, { mtimeMs: number; size: number; info: HeaderInfo }>();
+/** Directory listings, reused while the directory's own mtime is unchanged. */
+const dirCache = new Map<string, DirEntry>();
+
+/**
+ * Cheap directory walk of ~/.pi/agent/sessions: header line only, one file at a time.
+ *
+ * Two caches keep this off the hot path. A slug directory's listing is reused until the
+ * directory's mtime moves (appending to a file does not bump it; adding or removing one does),
+ * and a file's header is reused until its own mtime/size moves. What remains per refresh is one
+ * `statSync` per file — a few milliseconds — instead of an open, a read, and a `JSON.parse`.
+ */
 function scanHeaders(): HeaderInfo[] {
 	const root = path.join(AGENT_DIR, "sessions");
 	let dirs: fs.Dirent[];
@@ -1136,21 +1336,158 @@ function scanHeaders(): HeaderInfo[] {
 		return [];
 	}
 	const out: HeaderInfo[] = [];
+	const livePaths = new Set<string>();
+	const liveDirs = new Set<string>();
 	for (const d of dirs) {
 		if (!d.isDirectory() && !d.isSymbolicLink()) continue;
-		let files: string[];
+		const dir = path.join(root, d.name);
+		let dirStat: fs.Stats;
 		try {
-			files = fs.readdirSync(path.join(root, d.name));
+			dirStat = fs.statSync(dir);
 		} catch {
 			continue;
 		}
+		liveDirs.add(dir);
+		let files: string[];
+		const cached = dirCache.get(dir);
+		if (dirReusable(cached, dirStat.mtimeMs)) {
+			files = cached.files;
+		} else {
+			try {
+				files = fs
+					.readdirSync(dir)
+					.filter((f) => f.endsWith(".jsonl"));
+			} catch {
+				continue;
+			}
+			dirCache.set(dir, { mtimeMs: dirStat.mtimeMs, files });
+		}
 		for (const f of files) {
-			if (!f.endsWith(".jsonl")) continue;
-			const h = readSessionHeaderLine(path.join(root, d.name, f));
-			if (h) out.push(h);
+			const file = path.join(dir, f);
+			livePaths.add(file);
+			let st: fs.Stats;
+			try {
+				st = fs.statSync(file);
+			} catch {
+				continue;
+			}
+			const hit = headerCache.get(file);
+			if (sameStamp(hit, st)) {
+				out.push(hit!.info);
+				continue;
+			}
+			const h = readSessionHeaderLine(file, st);
+			if (!h) {
+				headerCache.delete(file);
+				continue;
+			}
+			headerCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, info: h });
+			out.push(h);
 		}
 	}
+	// Keep all three caches bounded: they are pure functions of the directories and
+	// files that still exist. Pruning `infoCache` here (rather than only when a lookup
+	// misses) is what stops the persisted copy growing forever as sessions are moved
+	// and deleted: it is the same set of paths this scan just walked.
+	pruneCacheByPath(headerCache, livePaths);
+	pruneCacheByPath(dirCache, liveDirs);
+	if (infoCache.size) {
+		const dropped = pruneCacheByPath(infoCache, livePaths);
+		if (dropped) infoCacheDirty = true;
+	}
 	return out;
+}
+
+/**
+ * A cheap "could anything have changed" token for the row list.
+ *
+ * Every input a refresh reads is file state, so this stats the directories those
+ * files live in rather than the files themselves. Two exceptions are deliberate:
+ * a file being appended to does not bump its directory's mtime, and a session
+ * that is mid-write is exactly the one whose row content moves — so the session
+ * files that are currently open get their own mtime/size folded in.
+ *
+ * Returns `undefined` when the state cannot be read at all, which the caller
+ * treats as "refresh anyway".
+ */
+function currentFingerprint(
+	live: Map<string, LiveRecord>,
+	/** The session this window owns; always tracked, live record or not. */
+	currentId?: string,
+): Fingerprint | undefined {
+	const root = path.join(AGENT_DIR, "sessions");
+	const dirs: Array<{ name: string; mtimeMs: number; entries: number }> = [];
+	try {
+		for (const d of fs.readdirSync(root, { withFileTypes: true })) {
+			if (!d.isDirectory() && !d.isSymbolicLink()) continue;
+			const dir = path.join(root, d.name);
+			const st = fs.statSync(dir);
+			dirs.push({
+				name: d.name,
+				mtimeMs: st.mtimeMs,
+				entries: dirCache.get(dir)?.files.length ?? -1,
+			});
+		}
+	} catch {
+		return undefined;
+	}
+	const dirMeta = (dir: string) => {
+		try {
+			const st = fs.statSync(dir);
+			return {
+				mtimeMs: st.mtimeMs,
+				entries: fs.readdirSync(dir).length,
+			};
+		} catch {
+			return undefined;
+		}
+	};
+	const storeStat = (() => {
+		try {
+			const st = fs.statSync(STORE_PATH);
+			return { mtimeMs: st.mtimeMs, size: st.size };
+		} catch {
+			return undefined;
+		}
+	})();
+	// Directory mtimes do not move when an existing file is APPENDED to, so the
+	// directory stamps alone would miss the sessions that are actually being driven.
+	// Every live record names its session file, so track all of those: a run, a
+	// compaction, or any other in-place rewrite moves one of these stamps and the
+	// skip stands down for that refresh.
+	//
+	// A live record whose file is not on disk yet contributes nothing, which is
+	// correct — creating it moves the containing directory's mtime instead.
+	const tracked: Array<{ path: string; mtimeMs: number; size: number }> = [];
+	const track = (file: string | undefined) => {
+		if (!file) return;
+		if (tracked.some((t) => t.path === file)) return;
+		try {
+			const st = fs.statSync(file);
+			tracked.push({ path: file, mtimeMs: st.mtimeMs, size: st.size });
+		} catch {
+			// Gone since the record was written; the directory stamp covers creation.
+		}
+	};
+	// Stable order, so two identical states cannot fingerprint differently.
+	const records = [...live.values()].sort((a, b) =>
+		a.sessionId < b.sessionId ? -1 : 1,
+	);
+	const liveState = records
+		.map((r) => `${r.sessionId}:${r.state}:${r.updated}`)
+		.join(";");
+	for (const rec of records) track(rec.sessionFile);
+	// This window's own session is open whether or not anything wrote a live
+	// record for it (the record is per-process; the row is per-session).
+	if (currentId) track(findSessionFile(currentId));
+	return fingerprintOf({
+		dirs,
+		store: storeStat,
+		live: dirMeta(LIVE_DIR),
+		links: dirMeta(path.join(AGENT_DIR, "session-workers", "workers")),
+		tracked,
+		liveState,
+	});
 }
 
 /**
@@ -1158,60 +1495,61 @@ function scanHeaders(): HeaderInfo[] {
  * count, session name, first message, and a *capped* text index (first/last few messages) —
  * search still finds every session, it just can't match on deep middle-of-history text.
  */
-async function buildInfo(h: HeaderInfo): Promise<SessionInfo> {
-	let messageCount = 0;
-	let name: string | undefined;
-	let firstMessage = "";
-	let lastActivityMs = 0;
-	const head: string[] = [];
-	const tail: string[] = [];
-	// bounded text index: newest + oldest messages kept for search + filter rules (`text` regexes);
-	// deep middle-of-history text isn't searchable — the tradeoff for not holding full transcripts.
-	const KEEP_HEAD = 5;
-	const KEEP_TAIL = 10;
+/**
+ * Read the bytes of `h.path` from `from` to EOF and fold them into `tally`.
+ *
+ * Only complete lines are consumed: a session being appended to is frequently
+ * read mid-line, and counting a truncated final line would both miscount and
+ * mis-parse. `tally.offset` therefore always lands on a line boundary, which is
+ * what makes the next resume safe.
+ *
+ * `from` is 0 for a full read and `tally.offset` to continue. The whole point:
+ * for an append-only file that an agent is driving, this reads the new KB rather
+ * than the existing MB (measured 100x cheaper on a 15MB session).
+ */
+async function readInto(h: HeaderInfo, tally: SessionTally, from: number): Promise<void> {
+	let carry = "";
+	let offset = from;
 	try {
-		const rl = readline.createInterface({
-			input: fs.createReadStream(h.path, { encoding: "utf-8" }),
-			crlfDelay: Infinity,
+		const stream = fs.createReadStream(h.path, {
+			encoding: "utf-8",
+			start: from,
 		});
-		for await (const line of rl) {
-			let entry: any;
-			try {
-				entry = JSON.parse(line);
-			} catch {
-				continue;
-			}
-			if (entry.type === "session_info" && typeof entry.name === "string")
-				name = entry.name.trim() || undefined;
-			if (entry.type !== "message" || !entry.message) continue;
-			// parity with pi's buildSessionInfo: every message entry counts, any role.
-			messageCount++;
-			const ts = entry.message.timestamp ?? entry.timestamp;
-			const t = typeof ts === "number" ? ts : Date.parse(ts);
-			if (!Number.isNaN(t)) lastActivityMs = Math.max(lastActivityMs, t);
-			const m = entry.message;
-			if (!["user", "assistant"].includes(m.role)) continue;
-			const text = messageText(m.content).trim();
-			if (!text) continue;
-			if (m.role === "user" && !firstMessage) firstMessage = text;
-			if (tail.length >= KEEP_TAIL) tail.shift();
-			tail.push(text);
-			if (head.length < KEEP_HEAD) head.push(text);
+		// Iterate the raw chunks rather than readline's lines: readline emits a final
+		// UNTERMINATED line at EOF, and a session being appended to is routinely read
+		// mid-line. Counting that partial line would inflate `messageCount` and parse a
+		// truncated JSON object. `splitLines` consumes only up to the last newline and
+		// hands the remainder back, so `offset` always lands on a line boundary.
+		for await (const chunk of stream) {
+			const piece = typeof chunk === "string" ? chunk : String(chunk);
+			const { lines, carry: rest, consumed } = splitLines(piece, carry);
+			for (const line of lines) if (line) foldLine(tally, line);
+			offset += consumed;
+			carry = rest;
 		}
 	} catch {
-		// unreadable → empty-ish
+		// Unreadable: leave the tally as-is rather than half-updating it.
+		return;
 	}
-	const overlap = Math.min(head.length, tail.length, KEEP_HEAD);
+	tally.offset = offset;
+	tally.size = h.size;
+}
+
+/** Derive the `SessionInfo` view from a tally. */
+function infoFrom(h: HeaderInfo, tally: SessionTally): SessionInfo {
 	return {
 		path: h.path,
 		id: h.id,
 		cwd: h.cwd,
-		name,
+		name: tally.name,
 		created: h.created,
-		modified: lastActivityMs > 0 ? new Date(lastActivityMs) : h.modified,
-		messageCount,
-		firstMessage: firstMessage || "(no messages)",
-		allMessagesText: head.concat(tail.slice(overlap)).join(" "),
+		modified:
+			tally.lastActivityMs > 0
+				? new Date(tally.lastActivityMs)
+				: h.modified,
+		messageCount: tally.messageCount,
+		firstMessage: tally.firstMessage || "(no messages)",
+		allMessagesText: allMessagesText(tally),
 	};
 }
 
@@ -1220,13 +1558,140 @@ interface ScanPartition {
 	archived: HeaderInfo[];
 }
 
-const infoCache = new Map<string, { mtimeMs: number; size: number; info: SessionInfo }>();
+/**
+ * Full-parse cache, keyed by session path and validated on `(mtime, size)`.
+ *
+ * Also persisted to `~/.pi/agent/inbox-session-cache.json`, because it is otherwise lost on
+ * every process start: opening the Archived / All / Filtered tabs cold re-parsed the whole
+ * history (881MB, ~2.2s here) each time a new pi came up. The on-disk copy is a pure cache —
+ * it is validated entry by entry against the file stamps, dropped wholesale if its version or
+ * shape is wrong, and never written on a read-only path.
+ */
+interface CachedInfo {
+	mtimeMs: number;
+	size: number;
+	info: SessionInfo;
+	/** Running totals, so the next change folds in only the new bytes. */
+	tally: SessionTally;
+}
+const infoCache = new Map<string, CachedInfo>();
+const INFO_CACHE_PATH = path.join(AGENT_DIR, "inbox-session-cache.json");
+// v2 adds the tally. A v1 file is simply discarded (one cold parse) rather than
+// migrated, since a wrong tally resumes from the wrong offset and corrupts counts.
+const INFO_CACHE_VERSION = 2;
 
+interface InfoCacheFile {
+	version: number;
+	entries: Record<string, {
+		mtimeMs: number;
+		size: number;
+		info: any;
+		tally?: SessionTally;
+	}>;
+}
+
+/** Parse-time `Date` fields, which JSON round-trips as strings. */
+function reviveInfo(raw: any): SessionInfo | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	if (typeof raw.path !== "string" || typeof raw.id !== "string") return undefined;
+	const created = new Date(raw.created);
+	const modified = new Date(raw.modified);
+	if (Number.isNaN(created.getTime()) || Number.isNaN(modified.getTime()))
+		return undefined;
+	return {
+		...raw,
+		cwd: typeof raw.cwd === "string" ? raw.cwd : "",
+		created,
+		modified,
+		messageCount: Number(raw.messageCount) || 0,
+		firstMessage: typeof raw.firstMessage === "string" ? raw.firstMessage : "(no messages)",
+		allMessagesText: typeof raw.allMessagesText === "string" ? raw.allMessagesText : "",
+	};
+}
+
+let infoCacheLoaded = false;
+let infoCacheDirty = false;
+
+/** Load the persisted cache once, lazily, so nothing pays for it unless it parses something. */
+function loadInfoCache(): void {
+	if (infoCacheLoaded) return;
+	infoCacheLoaded = true;
+	let data: InfoCacheFile;
+	try {
+		data = JSON.parse(fs.readFileSync(INFO_CACHE_PATH, "utf-8"));
+	} catch {
+		return; // missing or corrupt: start cold, which is what it was before
+	}
+	if (data?.version !== INFO_CACHE_VERSION || !data.entries) return;
+	for (const [key, entry] of Object.entries(data.entries)) {
+		const info = reviveInfo(entry?.info);
+		if (!info) continue;
+		if (typeof entry.mtimeMs !== "number" || typeof entry.size !== "number") continue;
+		// A persisted entry without a tally cannot be resumed from; dropping it just
+		// means one full parse of that file, never a wrong one.
+		if (!entry.tally || typeof entry.tally.offset !== "number") continue;
+		infoCache.set(key, {
+			mtimeMs: entry.mtimeMs,
+			size: entry.size,
+			info,
+			tally: entry.tally,
+		});
+	}
+}
+
+let infoCacheFlushedAt = 0;
+
+/**
+ * Write the cache back if it is dirty and has been quiet long enough — see
+ * `CACHE_FLUSH_MS` for why it is throttled rather than written on every refresh.
+ *
+ * Best effort throughout: a cache that cannot be written only means a cold start
+ * next time. Deferred, never dropped: `force` is passed on shutdown so the work
+ * is not lost.
+ */
+function saveInfoCache(force = false): void {
+	if (!shouldFlushCache({ dirty: infoCacheDirty, flushedAt: infoCacheFlushedAt, force }))
+		return;
+	infoCacheDirty = false;
+	infoCacheFlushedAt = Date.now();
+	try {
+		const entries: InfoCacheFile["entries"] = {};
+		for (const [key, { mtimeMs, size, info, tally }] of infoCache)
+			entries[key] = { mtimeMs, size, info, tally };
+		const tmp = `${INFO_CACHE_PATH}.${process.pid}.tmp`;
+		const body: InfoCacheFile = { version: INFO_CACHE_VERSION, entries };
+		fs.mkdirSync(AGENT_DIR, { recursive: true });
+		fs.writeFileSync(tmp, JSON.stringify(body), "utf-8");
+		fs.renameSync(tmp, INFO_CACHE_PATH);
+	} catch {
+		// Best effort.
+	}
+}
+
+/**
+ * Parse a session, re-reading only what changed.
+ *
+ * A file whose `(mtime, size)` is unchanged is served from cache outright. A file
+ * that only grew is resumed from the last complete line — which is what keeps an
+ * actively driven session from re-reading its whole history every 2.5s. Anything
+ * that shrank (compaction, a move, a rewrite) or has no usable tally is parsed
+ * from the top.
+ */
 async function parseCached(h: HeaderInfo): Promise<SessionInfo> {
+	loadInfoCache();
 	const c = infoCache.get(h.path);
 	if (c && c.mtimeMs === h.mtimeMs && c.size === h.size) return c.info;
-	const info = await buildInfo(h);
-	infoCache.set(h.path, { mtimeMs: h.mtimeMs, size: h.size, info });
+
+	const resumeFrom =
+		c && canResume(c.tally, { size: h.size }) ? c.tally.offset : 0;
+	// A resume keeps the accumulated totals; a full read starts a fresh tally so a
+	// truncated file can never inherit the old file's counts.
+	const tally = resumeFrom > 0 ? c!.tally : emptyTally();
+	await readInto(h, tally, resumeFrom);
+
+	const info = infoFrom(h, tally);
+	infoCache.set(h.path, { mtimeMs: h.mtimeMs, size: h.size, info, tally });
+	infoCacheDirty = true;
 	return info;
 }
 
@@ -1241,8 +1706,8 @@ async function scanSessions(
 	store: Store,
 	wantArchived: boolean,
 	contextParents = new Set<string>(),
+	headers = scanHeaders(),
 ): Promise<SessionInfo[]> {
-	const headers = scanHeaders();
 	const archivedIds = new Set(Object.entries(store.sessions).filter(([, m]) => m.archivedAt).map(([id]) => id));
 	const part: ScanPartition = { active: [], archived: [] };
 	for (const h of headers) (archivedIds.has(h.id) ? part.archived : part.active).push(h);
@@ -1260,6 +1725,9 @@ async function scanSessions(
 		while (next < targets.length) out.push(await parseCached(targets[next++]!));
 	};
 	await Promise.all(Array.from({ length: Math.min(QUEUE, targets.length) }, worker));
+	// One write for the whole page of parses, so a cold archived load populates the
+	// on-disk cache once instead of once per file.
+	saveInfoCache();
 	return out;
 }
 
@@ -1510,7 +1978,7 @@ class InboxComponent {
 		this.rows = initialRows;
 		this.rebuild();
 		void this.refresh();
-		this.timer = setInterval(() => void this.refresh(), 2500);
+		this.timer = setInterval(() => void this.refresh(undefined, true), 2500);
 	}
 
 	dispose() {
@@ -1520,15 +1988,32 @@ class InboxComponent {
 
 	invalidate() {}
 
+	/** Fingerprint of the state the current rows were built from, to skip idle refreshes. */
+	private builtFrom?: string;
+
 	private async refresh(
 		wantArchived = this.archivedLoaded ||
 			viewWantsArchived(this.state.view),
+		/** Set by the timer path: skip the work when nothing on disk has moved. */
+		skipIfUnchanged = false,
 	) {
 		if (this.loading) return;
 		this.loading = true;
 		try {
-			this.rows = await loadRows(this.currentId, wantArchived);
+			// Fingerprint FIRST. Everything it needs is directory stamps plus the live
+			// records, so the idle case — the overwhelmingly common one — costs a
+			// handful of syscalls instead of a full header scan, a store read, and a
+			// worker-link parse. Those used to run before the check could say
+			// "unchanged", which was ~92% of the idle tick spent to learn there was
+			// nothing to do.
+			const live = readLive();
+			const fingerprint = currentFingerprint(live, this.currentId);
+			if (skipIfUnchanged && fingerprint && fingerprint === this.builtFrom)
+				return;
+			const headers = scanHeaders();
+			this.rows = await loadRows(this.currentId, wantArchived, headers);
 			this.links = readWorkerLinks(AGENT_DIR);
+			this.builtFrom = fingerprint;
 			this.archivedLoaded ||= wantArchived;
 			this.onRows(this.rows);
 			this.rebuild();
@@ -4745,6 +5230,10 @@ export default function (pi: ExtensionAPI) {
 		) markRead(id);
 	});
 	pi.on("session_shutdown", async (e: any, ctx) => {
+		// A deferred cache write must not be lost on the way out. This is the one
+		// place it is worth paying the synchronous cost, and the session is ending
+		// anyway, so nothing is waiting on the event loop.
+		saveInfoCache(true);
 		// Shutdown runs only after switch cancellation checks have passed.
 		// A module-local variable would be lost when extensions are reloaded
 		// for the replacement runtime. Do not persist this as a global default.
