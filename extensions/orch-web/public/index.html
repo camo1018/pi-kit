@@ -340,6 +340,12 @@
     models: null,
     /** "inbox" | "archived" | "all" | "hidden" — the same four tabs the TUI has. */
     view: localStorage.getItem("orch.view") || "inbox",
+    /**
+     * "groups" | "flat" — the All-groups list layout, shared with the TUI via
+     * the group store. Seeded from the last fetch; null until then so the list
+     * never draws the wrong shape for a frame.
+     */
+    layout: null,
     id: null,
     row: null,
     es: null,
@@ -493,6 +499,15 @@
       list.append(el("div", "empty", emptyText()));
       return;
     }
+    // Flat is the same rows in one run, each naming its own group. Grouped is
+    // the TUI's sections. Both honour pinned-first, which is the one ordering
+    // rule the two views share.
+    if (store.layout === "flat") {
+      const rows = store.rows.slice().sort((a, b) =>
+        (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0));
+      for (const row of rows) list.append(renderRow(row));
+      return;
+    }
     const byGroup = new Map();
     for (const row of store.rows) {
       const key = row.groupId || "__none";
@@ -575,6 +590,12 @@
     title.append(document.createTextNode(row.title));
     body.append(title);
     const bits = [label(row), ago(row.updated)].filter(Boolean);
+    // In the flat list the section header is gone, so the group has to travel
+    // with the row or the grouping is simply lost.
+    if (store.layout === "flat") {
+      const group = groupNameOf(row);
+      if (group) bits.push(group);
+    }
     if (row.archived) bits.push("archived");
     if (row.model) bits.push(shortModel(row.model));
     body.append(el("div", "meta", bits.join(" · ")));
@@ -649,6 +670,9 @@
         : (r) => !r.archived,
       );
       store.groups = data.groups;
+      if (data.layout === "flat" || data.layout === "groups") {
+        store.layout = data.layout;
+      }
       // Asked once per refresh; a daemon without terminals just says so.
       void termAvailable();
       // Keep the open session's row current so a mention's group resolves and
@@ -1279,10 +1303,15 @@
     });
   }
 
+  /** The daemon's own name for the row's group, or nothing when ungrouped. */
+  function groupNameOf(row) {
+    if (row.groupName) return row.groupName;
+    if (!row.groupId) return undefined;
+    return store.groups.find((x) => x.id === row.groupId)?.name;
+  }
+
   function groupLabelOf(row) {
-    if (!row.groupId) return "Ungrouped";
-    const g = store.groups.find((x) => x.id === row.groupId);
-    return g ? g.name : "Ungrouped";
+    return groupNameOf(row) || "Ungrouped";
   }
 
   async function setMeta(row, patch, message) {
@@ -1461,6 +1490,10 @@
     try {
       const data = await api("/api/rows");
       store.groups = data.groups;
+      // Another window (or the TUI) may have flipped the layout since.
+      if (data.layout === "flat" || data.layout === "groups") {
+        store.layout = data.layout;
+      }
     } catch {
       // keep the old list
     }
@@ -1525,6 +1558,25 @@
           run: () => groupsSheet(),
         });
       }
+      // The TUI's `s`: one persisted All-groups layout, shared by both views.
+      // Offered even with no groups defined, since flat then means "no section
+      // headers" — which is what a single-group list looks like anyway.
+      act(items, {
+        icon: "▤",
+        label: store.layout === "flat" ? "Group by group" : "Flat list",
+        sub: store.layout === "flat" ? "one list, group per row" : "sections per group",
+        run: async () => {
+          try {
+            await api("/api/group/edit", {
+              action: "layout",
+              layout: store.layout === "flat" ? "groups" : "flat",
+            });
+            await refresh();
+          } catch (e) {
+            toast(e.message, 5000);
+          }
+        },
+      });
       // A terminal is the one thing the agent list cannot stand in for: an
       // interactive prompt (re-auth, sudo, a TUI). Hidden unless the daemon
       // was started with ORCH_WEB_ALLOW_TERM=1.
