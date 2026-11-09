@@ -21,8 +21,8 @@ const agentDir = path.join(home, ".pi", "agent");
 fs.mkdirSync(path.join(agentDir, "sessions"), { recursive: true });
 
 const { buildRows, eventBytes, firstUserText, lanAddress, liveItems,
-	modelChoices, readLinesAt, readName, readTail, sanitizeForLog } =
-	await import("./server.ts");
+	mentionChoices, modelChoices, readLinesAt, readName, readTail,
+	sanitizeForLog } = await import("./server.ts");
 
 function writeSession(opts: {
 	id: string;
@@ -471,6 +471,100 @@ test("no enabledModels means an empty picker, not a crash", () => {
 	);
 	assert.deepEqual(modelChoices().models, []);
 	assert.equal(modelChoices().source, "none");
+});
+
+test("mentions list sessions with the id as the inserted token", async () => {
+	const seen = writeSession({
+		id: "aaaa-1111",
+		messages: [user("mention target one")],
+		name: "Target One",
+	});
+	assert.ok(seen);
+	writeSession({ id: "bbbb-2222", messages: [user("target two")] });
+	const data = mentionChoices();
+	assert.ok(data.mentions.length >= 2);
+	const hit = data.mentions.find((m) => m.id === "aaaa-1111");
+	assert.ok(hit, "the named session is offered");
+	assert.equal(hit.label, "Target One");
+	assert.equal(hit.value, "@[aaaa-1111]");
+});
+
+test("a session is not offered as a mention of itself", () => {
+	const me = writeSession({ id: "cccc-3333", messages: [user("me")] });
+	const other = writeSession({ id: "dddd-4444", messages: [user("them")] });
+	assert.ok(me && other);
+	const from = mentionChoices({ from: "cccc-3333" }).mentions.map((m) => m.id);
+	assert.ok(!from.includes("cccc-3333"));
+	assert.ok(from.includes("dddd-4444"));
+	// Opting in is explicit, because referencing your own transcript is legal.
+	const withSelf = mentionChoices({ from: "cccc-3333", includeSelf: true })
+		.mentions.map((m) => m.id);
+	assert.ok(withSelf.includes("cccc-3333"));
+});
+
+test("archived sessions are left out of mentions unless asked for", () => {
+	const store = path.join(agentDir, "inbox.json");
+	const id = "eeee-5555";
+	writeSession({ id, messages: [user("archived one")] });
+	fs.writeFileSync(store, JSON.stringify({
+		version: 1,
+		sessions: { [id]: { archivedAt: 1 } },
+	}));
+	const hidden = mentionChoices().mentions.map((m) => m.id);
+	assert.ok(!hidden.includes(id));
+	const shown = mentionChoices({ withArchived: true }).mentions.map((m) => m.id);
+	assert.ok(shown.includes(id));
+	fs.rmSync(store, { force: true });
+});
+
+test("mentions can be narrowed to one inbox group", () => {
+	const gid = "grp-mention";
+	const inGroup = "ffff-6666";
+	const outGroup = "gggg-7777";
+	writeSession({ id: inGroup, messages: [user("inside the group")] });
+	writeSession({ id: outGroup, messages: [user("outside the group")] });
+	const groupsFile = path.join(agentDir, "inbox-groups.json");
+	fs.writeFileSync(groupsFile, JSON.stringify({
+		version: 1,
+		groups: [{ id: gid, name: "Mentions", templateEnabled: false, template: "" }],
+		sessions: { [inGroup]: gid },
+	}));
+	const scoped = mentionChoices({ groupId: gid }).mentions.map((m) => m.id);
+	assert.deepEqual(scoped, [inGroup]);
+	assert.equal(mentionChoices({ groupId: gid }).group, gid);
+	// `group=all` is the TUI's `@[`: no group filter at all.
+	const all = mentionChoices({ groupId: "all" }).mentions.map((m) => m.id);
+	assert.ok(all.includes(inGroup) && all.includes(outGroup));
+	// Ungrouped means "no membership", which is a real filter too.
+	const loose = mentionChoices({ groupId: "ungrouped" }).mentions.map((m) => m.id);
+	assert.ok(loose.includes(outGroup) && !loose.includes(inGroup));
+	// A session with no group of its own defaults to the unscoped list.
+	const fromLoose = mentionChoices({ from: outGroup }).mentions.map((m) => m.id);
+	assert.ok(fromLoose.includes(inGroup));
+	fs.rmSync(groupsFile, { force: true });
+});
+
+test("an ungrouped session's own-group scope is empty, not everything", () => {
+	const loose = "hhhh-8888";
+	const grouped = "iiii-9999";
+	writeSession({ id: loose, messages: [user("no group")] });
+	writeSession({ id: grouped, messages: [user("grouped")] });
+	const groupsFile = path.join(agentDir, "inbox-groups.json");
+	fs.writeFileSync(groupsFile, JSON.stringify({
+		version: 1,
+		groups: [{ id: "grp-self", name: "Self", templateEnabled: false, template: "" }],
+		sessions: { [grouped]: "grp-self" },
+	}));
+	// `@g[` from an ungrouped session: the TUI shows nothing has a group here.
+	const self = mentionChoices({ from: loose, groupId: "self" });
+	assert.deepEqual(self.mentions.map((m) => m.id), [grouped].filter(() => false));
+	assert.equal(self.group, "ungrouped");
+	assert.equal(self.fromGroup, undefined);
+	// The same scope from a grouped session returns that group's other members.
+	const fromGrouped = mentionChoices({ from: grouped, groupId: "self" });
+	assert.equal(fromGrouped.group, "grp-self");
+	assert.equal(fromGrouped.fromGroup, "grp-self");
+	fs.rmSync(groupsFile, { force: true });
 });
 
 test.after(() => fs.rmSync(home, { recursive: true, force: true }));
