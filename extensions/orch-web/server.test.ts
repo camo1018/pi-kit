@@ -664,7 +664,7 @@ test("a stale record's silence still downgrades to idle, and says how long", () 
 	assert.notEqual(row.state, "working");
 });
 
-test("a queued message behind a live foreign run reads as writer, not slot", () => {
+test("a queued message behind a live foreign run reads as writer, not slot", async () => {
 	// The exact phone symptom: another process holds the session, so the reply
 	// cannot start. The UI used to call this "waiting for a free agent slot",
 	// which sent the reader looking for a capacity problem that did not exist.
@@ -679,10 +679,26 @@ test("a queued message behind a live foreign run reads as writer, not slot", () 
 		state: "working",
 		updated: Date.now(),
 	});
+	// A pending message is what makes the reason meaningful.
+	const { registry } = await import("../../lib/inbox-agents.ts");
+	registry().agents.set(id, {
+		id,
+		cwd: "/scratch",
+		title: "mirror the change",
+		state: "queued",
+		pending: ["and again"],
+		createdAt: Date.now(),
+		updatedAt: Date.now(),
+		needsYou: false,
+		runs: 1,
+		log: [],
+		liveText: "",
+	} as any);
 
 	const row = buildRows().rows.find((r) => r.id === id);
 	assert.ok(row);
-	assert.equal(row.state, "working", "a foreign run is still a run");
+	assert.equal(row.queueReason, "writer", "a foreign holder is not a slot problem");
+	registry().agents.delete(id);
 	fs.rmSync(path.join(agentDir, "inbox-live", `${process.ppid}.json`), { force: true });
 });
 
