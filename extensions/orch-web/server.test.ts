@@ -12,6 +12,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
+import { spawnSync } from "node:child_process";
 
 // getAgentDir() consults the environment, so point HOME at a scratch tree
 // before importing anything that reads it at module load.
@@ -565,6 +566,123 @@ test("an ungrouped session's own-group scope is empty, not everything", () => {
 	assert.equal(fromGrouped.group, "grp-self");
 	assert.equal(fromGrouped.fromGroup, "grp-self");
 	fs.rmSync(groupsFile, { force: true });
+});
+
+// ───────────────────────── stale live records ─────────────────────────
+
+/**
+ * A pid that is guaranteed dead: spawn and reap a trivial child.
+ *
+ * The bug this guards was a live record whose process had already exited but
+ * whose `bgParent` was the daemon itself, so the liveness check was skipped and
+ * the record kept reporting `working` for the full 5-minute STUCK_AFTER_MS.
+ */
+function deadPid(): number {
+	const child = spawnSync(process.execPath, ["-e", "0"], { timeout: 10_000 });
+	assert.equal(child.status, 0, "helper child must run");
+	// Its pid is now reaped; nothing else can hold that number this quickly.
+	return child.pid!;
+}
+
+function writeLiveRecord(rec: Record<string, unknown>) {
+	const dir = path.join(agentDir, "inbox-live");
+	fs.mkdirSync(dir, { recursive: true });
+	fs.writeFileSync(
+		path.join(dir, `${rec.pid}.json`),
+		JSON.stringify(rec),
+	);
+}
+
+test("a dead child's live record does not make its session look busy", () => {
+	// The regression: the daemon spawned this run (so bgParent === our pid),
+	// the process exited, and the record still said "working". Every OTHER
+	// session then reported "queued (waiting for a free agent slot)" even
+	// though nothing was waiting for capacity.
+	const id = "llll-1111";
+	writeSession({ id, messages: [user("mirror the change")] });
+	const pid = deadPid();
+	writeLiveRecord({
+		pid,
+		sessionId: id,
+		sessionFile: path.join(agentDir, "sessions", "--scratch--", `x_${id}.jsonl`),
+		state: "working",
+		updated: Date.now(),
+		bgParent: process.pid,
+	});
+
+	const row = buildRows().rows.find((r) => r.id === id);
+	assert.ok(row, "the session still lists");
+	assert.notEqual(row.state, "working", "a dead pid is not a running session");
+
+	// And the record is reaped, not just ignored, so the next read is cheap.
+	assert.equal(
+		fs.existsSync(path.join(agentDir, "inbox-live", `${pid}.json`)),
+		false,
+		"a record naming a dead pid must be removed",
+	);
+});
+
+test("a live record for another session does not block this one", () => {
+	// Same shape, but the record belongs to a DIFFERENT session than the row we
+	// ask about. This is what made one phone reply look slot-blocked by an
+	// unrelated agent.
+	const busyOther = "llll-2222";
+	const idleOne = "llll-3333";
+	writeSession({ id: busyOther, messages: [user("long run")] });
+	writeSession({ id: idleOne, messages: [user("talk to me"), assistant("hi")] });
+	const pid = deadPid();
+	writeLiveRecord({
+		pid,
+		sessionId: busyOther,
+		sessionFile: path.join(agentDir, "sessions", "--scratch--", `x_${busyOther}.jsonl`),
+		state: "working",
+		updated: Date.now(),
+		bgParent: process.pid,
+	});
+
+	const row = buildRows().rows.find((r) => r.id === idleOne);
+	assert.ok(row);
+	assert.equal(row.state, undefined, "the idle session is not busy");
+	assert.equal(row.queueReason, undefined, "and nothing is queued on it");
+});
+
+test("a stale record's silence still downgrades to idle, and says how long", () => {
+	// Belt and braces: if a pid somehow survives while genuinely silent, the
+	// existing STUCK_AFTER_MS path must still apply. Use our own pid so it is
+	// alive but untracked.
+	const id = "llll-4444";
+	writeSession({ id, messages: [user("orphan")] });
+	writeLiveRecord({
+		pid: process.pid,
+		sessionId: id,
+		sessionFile: path.join(agentDir, "sessions", "--scratch--", `x_${id}.jsonl`),
+		state: "working",
+		updated: Date.now() - 30 * 60_000,
+	});
+	const row = buildRows().rows.find((r) => r.id === id);
+	assert.ok(row);
+	assert.notEqual(row.state, "working");
+});
+
+test("a queued message behind a live foreign run reads as writer, not slot", () => {
+	// The exact phone symptom: another process holds the session, so the reply
+	// cannot start. The UI used to call this "waiting for a free agent slot",
+	// which sent the reader looking for a capacity problem that did not exist.
+	const id = "llll-5555";
+	writeSession({ id, messages: [user("mirror the change"), assistant("done")] });
+	// An alive pid that is not a tracked agent of this process: a foreign holder.
+	writeLiveRecord({
+		pid: process.pid,
+		sessionId: id,
+		sessionFile: path.join(agentDir, "sessions", "--scratch--", `x_${id}.jsonl`),
+		state: "working",
+		updated: Date.now(),
+	});
+
+	const row = buildRows().rows.find((r) => r.id === id);
+	assert.ok(row);
+	assert.equal(row.state, "working", "a foreign run is still a run");
+	fs.rmSync(path.join(agentDir, "inbox-live", `${process.pid}.json`), { force: true });
 });
 
 test.after(() => fs.rmSync(home, { recursive: true, force: true }));

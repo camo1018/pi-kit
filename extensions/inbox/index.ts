@@ -143,6 +143,7 @@ import {
 	getAgent,
 	isRunning,
 	listAgents,
+	MAX_CONCURRENT,
 	onAgentEvent,
 	holdAgent,
 	installAgentChildHooks,
@@ -4148,6 +4149,38 @@ function showStartingPrompt(
 	);
 }
 
+/**
+ * The reason an attached agent's queued message has not started, in words.
+ *
+ * "waiting for a free agent slot" used to be shown for every case, including a
+ * run held by another live process -- which capacity cannot fix, and which made
+ * the window look capacity-blocked when it was not.
+ */
+function queuedWhy(id: string): string {
+	const a = getAgent(id);
+	if (a?.proc || a?.hold) return "after this run";
+	// A live record for this session held by another process is not capacity.
+	const dir = path.join(AGENT_DIR, "inbox-live");
+	try {
+		for (const name of fs.readdirSync(dir)) {
+			const rec = JSON.parse(fs.readFileSync(path.join(dir, name), "utf-8"));
+			if (rec.sessionId !== id || !rec.pid) continue;
+			if (rec.pid === process.pid) continue;
+			try {
+				process.kill(rec.pid, 0);
+			} catch (e: any) {
+				if (e?.code !== "EPERM") continue;
+			}
+			if (rec.state === "working") return "another pi is running it";
+		}
+	} catch {
+		// no live records: fall through to the capacity answer
+	}
+	const running = listAgents().filter((x) => x.proc).length;
+	if (running >= MAX_CONCURRENT) return "waiting for a free agent slot";
+	return "starting…";
+}
+
 /** Live stream for an attached session while its background run is going. */
 function showLiveStream(ctx: ExtensionContext) {
 	if (!ctx.hasUI) return;
@@ -4168,7 +4201,7 @@ function showLiveStream(ctx: ExtensionContext) {
 					? "⟳ working in the background"
 					: a.hold
 						? "↻ loading the last turn…"
-						: "⏸ queued (waiting for a free agent slot)",
+						: `⏸ queued (${queuedWhy(a.id)})`,
 			),
 		];
 		if (a.pending.length) {
@@ -4230,7 +4263,7 @@ function showLiveStream(ctx: ExtensionContext) {
 	// string widgets at 10 lines; this is 1–2.
 	const th = ctx.ui.theme;
 	const status: string[] = [
-		th.fg("accent", a.proc ? "⟳ working in the background" : a.hold ? "↻ loading the last turn…" : "⏸ queued (waiting for a free agent slot)"),
+		th.fg("accent", a.proc ? "⟳ working in the background" : a.hold ? "↻ loading the last turn…" : `⏸ queued (${queuedWhy(a.id)})`),
 	];
 	if (a.pending.length) {
 		const count = `${a.pending.length} message(s) queued`;

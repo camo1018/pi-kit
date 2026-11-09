@@ -1006,7 +1006,10 @@
     q.textContent = "";
     if (pending?.length) {
       q.classList.remove("hidden");
-      q.append(el("div", "who", `queued (${pending.length})`));
+      // Say WHY it is waiting. "waiting for a free agent slot" was the only
+      // wording before, shown for every reason -- including a run held by
+      // another process, which no amount of capacity would fix.
+      q.append(el("div", "who", `queued (${pending.length})${queueSuffix(row)}`));
       pending.forEach((text, i) => {
         const item = el("div", "item");
         item.append(el("span", null, text.replace(/\s+/g, " ")));
@@ -1030,7 +1033,28 @@
     const send = $("#send");
     const busy = row.state === "working" || row.state === "queued";
     send.textContent = busy ? "Queue" : "Send";
+    send.title = busy ? busyHint(row) : "";
     if (atBottom) log.scrollTop = log.scrollHeight;
+  }
+
+  /**
+   * The reason a queued message has not started, in the user's terms.
+   *
+   * Only `slot` is a capacity problem. `writer` means another live pi holds the
+   * session and will run it when it is done; `running` is this agent's own run
+   * still in flight. Conflating them made an idle session look capacity-blocked.
+   */
+  function queueSuffix(row) {
+    if (row.queueReason === "slot") return " — waiting for a free slot";
+    if (row.queueReason === "writer") return " — another pi is running it";
+    if (row.queueReason === "running") return " — after this run";
+    return "";
+  }
+
+  function busyHint(row) {
+    if (row.queueReason === "slot") return "All agent slots are busy; this will start when one frees";
+    if (row.queueReason === "writer") return "Another pi process is running this session; your message runs after it";
+    return "Working — your message will run after this turn";
   }
 
   // Messages sent but not yet echoed back in the transcript. The server reads
