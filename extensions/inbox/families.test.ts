@@ -249,3 +249,115 @@ test("parallel processes serialize fold read/modify/write", async (t) => {
 	assert.deepEqual(new WorkerFolds(agent).load(), new Set(ids));
 	assert.deepEqual(fs.readdirSync(agent), ["inbox-worker-folds.json"]);
 });
+
+/** Mimic `writeJson` in session-workers/workers.ts: temp file + rename. */
+function writeWorkerRecord(
+	dir: string,
+	id: string,
+	value: Record<string, unknown>,
+) {
+	fs.mkdirSync(dir, { recursive: true });
+	const file = path.join(dir, `${id}.json`);
+	const tmp = `${file}.${Math.random().toString(36).slice(2)}.tmp`;
+	fs.writeFileSync(tmp, JSON.stringify(value), { flag: "wx" });
+	fs.renameSync(tmp, file);
+	try {
+		fs.rmSync(tmp, { force: true });
+	} catch {
+		// already renamed
+	}
+}
+
+/**
+ * `readWorkerLinks` caches on the directory stamp to keep the 2.5s refresh cheap.
+ * A stale read here is invisible and wrong — it is the team tree and the worker
+ * counts in the list — so every way a record can change gets pinned. The stamp
+ * only works because `writeJson` renames rather than rewriting in place; case 2
+ * below is the one that would break if that ever changed.
+ */
+test("worker link cache invalidates on every kind of record change", (t) => {
+	const agent = temporaryDir(t);
+	const dir = path.join(agent, "session-workers", "workers");
+	// Distinct mtimes: APFS has nanosecond resolution, but be explicit rather than
+	// relying on two writes landing in different ticks.
+	const pause = () => {
+		const until = Date.now() + 12;
+		while (Date.now() < until) {
+			// spin: nothing else to do in a sync test
+		}
+	};
+
+	writeWorkerRecord(dir, "a", { id: "a", parentId: "P1", createdAt: 1 });
+	assert.deepEqual(
+		readWorkerLinks(agent).map((l) => l.parentId),
+		["P1"],
+	);
+
+	// 1. Rewrite an existing record (same id, same length, different content).
+	pause();
+	writeWorkerRecord(dir, "a", { id: "a", parentId: "P2", createdAt: 1 });
+	assert.deepEqual(
+		readWorkerLinks(agent).map((l) => l.parentId),
+		["P2"],
+		"an in-place rewrite must invalidate: this is why the writer renames",
+	);
+
+	// 2. Add a record.
+	pause();
+	writeWorkerRecord(dir, "b", { id: "b", parentId: "P3", createdAt: 2 });
+	assert.deepEqual(
+		readWorkerLinks(agent).map((l) => l.parentId),
+		["P2", "P3"],
+	);
+
+	// 3. Remove one.
+	pause();
+	fs.rmSync(path.join(dir, "a.json"));
+	assert.deepEqual(
+		readWorkerLinks(agent).map((l) => l.parentId),
+		["P3"],
+	);
+
+	// 4. Remove every record.
+	pause();
+	fs.rmSync(path.join(dir, "b.json"));
+	assert.deepEqual(readWorkerLinks(agent), []);
+
+	// 5. A malformed sibling must not poison or block the cache.
+	pause();
+	writeWorkerRecord(dir, "c", { id: "c", parentId: "P4", createdAt: 3 });
+	fs.writeFileSync(path.join(dir, "broken.json"), "{not json");
+	assert.deepEqual(
+		readWorkerLinks(agent).map((l) => l.parentId),
+		["P4"],
+	);
+});
+
+test("worker link cache is keyed per agent dir and survives a missing dir", (t) => {
+	const one = temporaryDir(t);
+	const two = temporaryDir(t);
+	writeWorkerRecord(
+		path.join(one, "session-workers", "workers"),
+		"a",
+		{ id: "a", parentId: "P-one", createdAt: 1 },
+	);
+	writeWorkerRecord(
+		path.join(two, "session-workers", "workers"),
+		"a",
+		{ id: "a", parentId: "P-two", createdAt: 1 },
+	);
+	assert.deepEqual(readWorkerLinks(one).map((l) => l.parentId), ["P-one"]);
+	assert.deepEqual(readWorkerLinks(two).map((l) => l.parentId), ["P-two"]);
+	// A directory that appears after a cached miss must still be picked up.
+	const three = temporaryDir(t);
+	assert.deepEqual(readWorkerLinks(three), []);
+	writeWorkerRecord(
+		path.join(three, "session-workers", "workers"),
+		"a",
+		{ id: "a", parentId: "P-three", createdAt: 1 },
+	);
+	assert.deepEqual(
+		readWorkerLinks(three).map((l) => l.parentId),
+		["P-three"],
+	);
+});
