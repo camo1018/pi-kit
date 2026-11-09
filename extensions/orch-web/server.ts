@@ -939,8 +939,17 @@ function queueReasonFor(
 	a: BgAgent | undefined,
 	live?: LiveRecord,
 ): Row["queueReason"] {
-	if (live?.state === "working" && !a?.proc) return "writer";
+	// A live record only means "someone else" when that someone is not us. The
+	// daemon does not normally run the session it is displaying, but a record
+	// naming this pid would still be this process's own run -- and calling that
+	// "another pi is running it" is the mistake the label made before.
+	if (live?.state === "working" && !a?.proc && live.pid !== process.pid) {
+		return "writer";
+	}
 	if (!a?.pending.length) return undefined;
+	// Our own live record means our own run is in flight, which is "running":
+	// it is the same wait, just not someone else's.
+	if (live?.state === "working") return "running";
 	// The daemon's own cap, read once per process.
 	if (a.proc || a.hold) return "running";
 	const running = listAgents().filter((x) => x.proc).length;
@@ -1309,10 +1318,20 @@ interface TranscriptMessage {
 	tools?: { name: string; arg?: string; error?: boolean }[];
 	stopped?: "error" | "aborted";
 	error?: string;
+	/**
+	 * The run's concluding assistant message.
+	 *
+	 * Same definition the TUI's final-answer-divider uses: the model finished of
+	 * its own accord (`stopReason === "stop"`) and did not ask for another tool.
+	 * That is what makes it the answer rather than a step towards one, and it is
+	 * read from the transcript rather than tracked separately, so a reload,
+	 * another front end, or a historical session all agree.
+	 */
+	final?: boolean;
 	ts?: string;
 }
 
-function transcript(file: string, limit = 200): TranscriptMessage[] {
+export function transcript(file: string, limit = 200): TranscriptMessage[] {
 	let branch: any[] = [];
 	try {
 		branch = SessionManager.open(file).getBranch() as any[];
@@ -1333,10 +1352,13 @@ function transcript(file: string, limit = 200): TranscriptMessage[] {
 		} else if (m?.role === "assistant") {
 			const tools: TranscriptMessage["tools"] = [];
 			let said = false;
+			let hasToolCall = false;
 			for (const b of Array.isArray(m.content) ? m.content : []) {
 				if (b?.type === "text" && b.text?.trim()) said = true;
-				else if (b?.type === "toolCall")
+				else if (b?.type === "toolCall") {
+					hasToolCall = true;
 					tools.push({ name: b.name, arg: summarizeArgs(b.arguments) });
+				}
 			}
 			const text = messageText(m.content).trim();
 			if (!said && !tools.length) continue;
@@ -1344,6 +1366,10 @@ function transcript(file: string, limit = 200): TranscriptMessage[] {
 				role: "assistant",
 				text,
 				tools: tools.length ? tools : undefined,
+				// Final answer, by the same rule the TUI's divider uses. A message
+				// that also called a tool is a step, not the conclusion.
+				final:
+					m.stopReason === "stop" && !hasToolCall && said ? true : undefined,
 				stopped:
 					m.stopReason === "error"
 						? "error"
@@ -2287,6 +2313,7 @@ function streamAgent(res: http.ServerResponse, id: string) {
 				last?.text?.length,
 				last?.text?.slice(-40),
 				last?.tools?.length,
+				last?.final,
 				payload.live.length,
 				payload.live.at(-1) ?? null,
 				payload.activity,
