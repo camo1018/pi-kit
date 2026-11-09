@@ -454,7 +454,9 @@ function writeAtomic(file: string, data: string) {
  * session-workers' `<id>.wake` / `<id>.wake-state`, so finishing a parent run
  * silently destroyed its own undelivered wake).
  */
-const AGENT_SIDECARS = ["json", "out", "err", "exit", "stop", "beat"] as const;
+const AGENT_SIDECARS = [
+	"json", "out", "err", "exit", "stop", "beat", "runlock",
+] as const;
 
 function isAgentSidecar(id: string, name: string): boolean {
 	const suffix = name.slice(id.length + 1);
@@ -881,6 +883,78 @@ export function sessionCwd(file: string | undefined): string | undefined {
 }
 
 /**
+ * One process's claim about one session, written to `inbox-live/<pid>.json`.
+ *
+ * The file is written on `session_start`, so it means "this process has this
+ * session open" -- `open: true`. `state` is the separate, narrower claim:
+ * `working` only while a run is actually in flight. Several processes may hold
+ * a session open; only one may write it.
+ *
+ * Those two facts used to be conflated, and each reader invented its own rule
+ * for telling them apart. That drift is what parked messages behind "queued
+ * (after this run)" and what let a frozen orphan block a session forever. They
+ * are one function now: `isWriting`.
+ */
+export interface LiveRecord {
+	pid: number;
+	sessionId: string;
+	sessionFile: string;
+	state: "working" | "idle";
+	updated: number;
+	/** Set when this process is a background agent: pid of the pi that runs it. */
+	bgParent?: number;
+	/**
+	 * How long a `working` claim may go unrefreshed before it stops counting as a
+	 * writer -- a process frozen mid-turn (orphaned tab, suspended laptop) cannot
+	 * refresh, and it must not own the session forever.
+	 */
+	stuckMin?: number;
+}
+
+/**
+ * A `working` claim older than this no longer counts as a writer.
+ *
+ * This is a safety margin against a process that is ALIVE but has stopped
+ * refreshing -- a frozen tab, a suspended laptop, a SIGSTOPped run. It is not a
+ * cooldown after finishing, and a normal finish does not wait it out:
+ *
+ *   - `agent_settled` writes `state: "idle"` immediately, so a finished run
+ *     stops counting on the very next read (0s).
+ *   - a crash or SIGKILL leaves the pid gone, which `isWriting` rejects on the
+ *     first read (0s).
+ *   - only a live pid that stopped stamping `updated` waits, and only because it
+ *     might still be mid-write; releasing it early is how two writers end up on
+ *     one session file.
+ *
+ * The writer refreshes every `LIVE_STALE_MS / 5`, so real work is never near the
+ * edge -- five missed pulses is the margin for a long GC pause or a tool call
+ * that blocks the event loop.
+ */
+export const LIVE_STALE_MS = 5 * 60_000;
+
+/**
+ * The single reading rule for a live record: is this process WRITING `id`
+ * right now?
+ *
+ * A record is "open" on `session_start`, which is a much weaker claim than
+ * "writing", and a pid can be alive while frozen mid-turn. So a writer is all
+ * three of: it says `working`, its pid is alive, and that claim is fresh. Every
+ * gate that asks "may I spawn / move / answer this" uses this, so the three
+ * answers cannot drift apart again.
+ *
+ * The freshness clause only matters for a live-but-silent process: a finished
+ * run has already flipped to `idle`, and a crashed one has no pid left.
+ */
+export function isWriting(
+	rec: Pick<LiveRecord, "pid" | "state" | "updated">,
+	since: number = Date.now(),
+): boolean {
+	if (rec.state !== "working") return false;
+	if (!pidAlive(rec.pid)) return false;
+	return since - (Number(rec.updated) || 0) <= LIVE_STALE_MS;
+}
+
+/**
  * True when some OTHER process is already running this session.
  *
  * The single chokepoint every spawn path shares. `a.proc` only guards within
@@ -895,10 +969,23 @@ export function sessionCwd(file: string | undefined): string | undefined {
  * older `runningElsewhere` helpers do, and why they miss a writer held by this
  * very process under a different session.
  *
- * A recorded pid that is gone is stale, not a writer: crash recovery depends on
- * being able to take over.
+ * Uses `isWriting`, which is why a session merely held OPEN (an attached view,
+ * a taken-over window, the phone) does not block, and why a frozen orphan does
+ * not block forever.
  */
 export function writerElsewhere(id: string): boolean {
+	return liveRecordsFor(id).some((rec) => isWriting(rec));
+}
+
+/**
+ * The live records naming `id`.
+ *
+ * A record is written on `session_start`, so it means "this process has the
+ * session open" — which is NOT the same claim as "this process is writing it".
+ * Ask `isWriting` for the narrow question; use these directly only when the
+ * distinction is what you are displaying.
+ */
+function liveRecordsFor(id: string): LiveRecord[] {
 	// Resolved at call time, not from the module-level AGENTS_DIR: that constant
 	// is captured at import, so a test (or any caller with a redirected agent
 	// dir) would read the wrong directory entirely -- and silently report "no
@@ -908,10 +995,11 @@ export function writerElsewhere(id: string): boolean {
 	try {
 		names = fs.readdirSync(dir);
 	} catch {
-		return false;
+		return [];
 	}
+	const out: LiveRecord[] = [];
 	for (const name of names) {
-		let rec: { sessionId?: string; pid?: number; state?: string };
+		let rec: LiveRecord;
 		try {
 			rec = JSON.parse(fs.readFileSync(path.join(dir, name), "utf-8"));
 		} catch {
@@ -919,19 +1007,117 @@ export function writerElsewhere(id: string): boolean {
 		}
 		if (rec.sessionId !== id) continue;
 		if (!rec.pid || !Number.isSafeInteger(rec.pid) || rec.pid <= 0) continue;
-		// Our OWN pid counts: a live record is written by the child on
-		// `agent_start`, so one naming this pid is a different session this same
-		// process is running -- a real writer. Skipping it was the bug.
-		if (rec.pid === process.pid) return true;
-		try {
-			process.kill(rec.pid, 0);
-			return true;
-		} catch (error) {
-			// ESRCH: stale record for a process that is gone. EPERM: alive.
-			if ((error as NodeJS.ErrnoException).code === "EPERM") return true;
-		}
+		out.push(rec);
 	}
-	return false;
+	return out;
+}
+
+/**
+ * Why a pending message has not started yet.
+ *
+ * "queued" used to be one word for three unrelated situations, and the UI
+ * reported all of them as "waiting for a free agent slot". Only `slot` is that.
+ * `writer` is the one-writer gate: another process is actively writing this
+ * session, and no amount of capacity would help. "running" is simply this
+ * agent's own run still being in flight.
+ */
+export type QueueReason = "running" | "slot" | "writer";
+
+/**
+ * True when a live record for `id` names a process other than this one that is
+ * actually WORKING on it.
+ *
+ * `writerElsewhere` deliberately counts our own pid too: from `run()`'s point of
+ * view a run this process holds here is exactly the writer it must not spawn
+ * beside. That is right for the gate and wrong for the label, which then told
+ * the user "another pi is running it" about the window they were typing in.
+ *
+ * So the label asks the narrower question. Same records, same rule, but our own
+ * pid is this session, not a stranger. Note both questions now exclude an `idle`
+ * record: having a session OPEN is not writing it.
+ */
+function writerIsForeign(id: string): boolean {
+	return liveRecordsFor(id).some(
+		(rec) => rec.pid !== process.pid && isWriting(rec),
+	);
+}
+
+/**
+ * Why `id`'s queued messages are not running, or undefined when they can.
+ *
+ * `writerElsewhere` is checked before the cap because it is the reason that
+ * looks identical in the UI but is not capacity at all -- a stale live record
+ * for a session whose process is gone used to read as "working" until the
+ * 5-minute silence cutoff, which is what made an idle session look busy.
+ */
+export function queueReason(id: string): QueueReason | undefined {
+	const a = getAgent(id);
+	if (a?.proc) return "running";
+	if (a && a.hold) return "running";
+	// Our own live record means our own run is in flight, which is "running".
+	// Only a record naming a DIFFERENT live process is a foreign writer.
+	if (writerIsForeign(id)) return "writer";
+	if (writerElsewhere(id)) return "running";
+	if (runningCount() >= MAX_CONCURRENT) return "slot";
+	return undefined;
+}
+
+/**
+ * Exclusive cross-process lock for one session's writer slot.
+ *
+ * `writerElsewhere` closes the common case (a live record already exists)
+ * but it is a READ: two processes calling `run()` at the same instant both
+ * observe no writer and both spawn. `a.proc` cannot help -- it is one
+ * process's registry. `O_EXCL` create is the atomic primitive, the same one
+ * `claimEpisodeWake` uses for the wake side. The lock records the pid that
+ * holds it, so one left behind by a process that crashed between acquire and
+ * release is reclaimed rather than wedging the session forever.
+ */
+function runLockFile(id: string): string {
+	return path.join(getAgentDir(), "inbox-agents", `${id}.runlock`);
+}
+
+export function acquireRunLock(id: string): boolean {
+	const file = runLockFile(id);
+	try {
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, String(process.pid), { flag: "wx" });
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
+	}
+	let holder = NaN;
+	try {
+		holder = Number(fs.readFileSync(file, "utf-8").trim());
+	} catch {
+		return false;
+	}
+	if (!Number.isSafeInteger(holder) || holder <= 0) return false;
+	// Our own pid: a later run in this process implies the earlier one ended,
+	// and two runs of one session cannot coexist here anyway (`a.proc`). So this
+	// is a release we missed on an error path, not a competitor.
+	if (holder !== process.pid && pidAlive(holder)) return false;
+	try {
+		fs.writeFileSync(file, String(process.pid));
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** Drop the run lock, but only when this process holds it. */
+export function releaseRunLock(id: string): void {
+	const file = runLockFile(id);
+	try {
+		if (Number(fs.readFileSync(file, "utf-8").trim()) !== process.pid) return;
+	} catch {
+		return;
+	}
+	try {
+		fs.rmSync(file, { force: true });
+	} catch {
+		// Best effort: a dead-pid lock is reclaimed by the next acquire.
+	}
 }
 
 function run(a: BgAgent) {
@@ -940,9 +1126,22 @@ function run(a: BgAgent) {
 	// Leave the message queued rather than racing the live writer; the next pump
 	// after that run ends picks it up.
 	// The registry's own `proc` is the authoritative "this session is running
-	// here" check, so only a writer OUTSIDE this process blocks. `writerElsewhere`
-	// includes our own pid for other sessions, which is the case that mattered.
+	// here" check, so only a writer OUTSIDE this process blocks -- and only an
+	// ACTIVE one: a `writerElsewhere` hit means some process is working this
+	// session right now. A session merely held OPEN (an attached view, a
+	// taken-over window, the phone) is not writing it, and blocking on that made
+	// an ordinary open session read as unwritable forever.
 	if (writerElsewhere(a.id) && !a.proc) {
+		a.state = a.pending.length ? "queued" : a.state;
+		persist(a);
+		return;
+	}
+	// `writerElsewhere` is a READ of the live records: two processes calling run()
+	// in the same instant both see no writer and both spawn. Take an exclusive
+	// lock so the guarantee is mutual exclusion rather than a likely-correct
+	// glance. Ordered after the advisory check so the common case (a writer
+	// already visible) does not touch the filesystem twice.
+	if (!acquireRunLock(a.id)) {
 		a.state = a.pending.length ? "queued" : a.state;
 		persist(a);
 		return;
@@ -1021,6 +1220,9 @@ function run(a: BgAgent) {
 		a.state = "error";
 		a.error = `spawn failed: ${e instanceof Error ? e.message : String(e)}`;
 		a.needsYou = true;
+		// Nothing is running, so the session must not stay locked: a lock held by a
+		// failed spawn would block every later run of this session.
+		releaseRunLock(a.id);
 		touch(a);
 		persist(a);
 		return;
@@ -1202,6 +1404,9 @@ function finishRun(a: BgAgent, code: number, signal?: string) {
 	});
 	const wasSettled = a.settledAt !== undefined;
 	a.proc = undefined;
+	// The run's writer slot is free again. Released before any pump can be
+	// triggered below, so the next run of this session can take it.
+	releaseRunLock(a.id);
 	a.pid = undefined;
 	a.settledAt = undefined;
 	flushPendingModel(a);
