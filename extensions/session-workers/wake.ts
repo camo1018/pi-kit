@@ -23,6 +23,7 @@ import {
 	readWakeRequest,
 	clearReported,
 	consumeWakeRequest,
+	releaseAllEpisodeClaims,
 	releaseEpisodeClaim,
 	writeReported,
 	writeWakeArm,
@@ -438,7 +439,6 @@ export function sweepWakeRequests(team: WorkerTeam, callerId: string): boolean {
 			if (!readWakeRequest(team.stateDir, parentId)) {
 				writeWakeRequest(team.stateDir, {
 					parentId,
-					signature: next,
 					content: wakeContent(parentId, episodeAgents),
 					workers: episodeAgents.map(({ id, agent }) => ({
 						id,
@@ -566,6 +566,10 @@ function pruneDeadArms(team: WorkerTeam): void {
 			if (arm.pendingWorkers?.length) continue;
 			if (readWakeRequest(team.stateDir, parentId)) continue;
 			clearWakeArm(team.stateDir, parentId);
+			// The arm carried the episode number, and the claims are named after it.
+			// Dropping the arm restarts numbering at 1, so a leftover claim for a
+			// reused episode would suppress a real wake.
+			releaseAllEpisodeClaims(team.stateDir, parentId);
 			// The reported-workers sidecar describes the same fan-out and nothing
 			// else prunes it: `removeAgentFiles` deliberately ignores this
 			// directory's wake sidecars, so without this it accumulates forever.
