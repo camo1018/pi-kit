@@ -67,11 +67,22 @@ First connection triggers a macOS firewall prompt for `node` — **Allow**.
 | See what's queued | the queue strip above the composer: **now** / **✕** per item, plus why it is waiting (see below) |
 | Start an agent | **＋** in the header (prompt, directory, group, model) |
 | Groups | **☰** → Groups |
+| List layout (grouped / flat) | **☰** → Flat list / Group by group (the TUI's `s`) |
 | Insert a skill | `$` — the popup opens as you type (`$graf` → `$grafana`) |
 | Insert a command | `/` at the start of the message |
 | Reference another session | `@` — the popup opens on the `@` itself (`@ot` → `@[<session-id>]`) |
 | Terminal | **☰** → Terminal (needs `--term`) |
 | Refresh | automatic; **⟳** forces it |
+
+### List layout: grouped or flat
+
+The **☰** menu flips the list between sections per group and one flat run of
+rows with the group named on each row. It is not a phone-only setting: the
+choice is written to `inbox-groups.json`'s `layout`, the same field the TUI's
+`s` key toggles on **All groups**, so the two front ends show the same list.
+Either one flips it for both, and the phone re-reads it on every refresh.
+Pinned rows sort first in both layouts, matching the TUI's `★ PINNED`
+partition.
 
 Status dots: `●` working · `◆` your turn · `✗` error · `⚠` stalled (run was cut
 off) · `⏸` aborted.
