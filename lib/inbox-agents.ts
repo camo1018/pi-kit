@@ -328,6 +328,10 @@ export const MAX_CONCURRENT = Math.max(1, Number(process.env.PI_INBOX_MAX_AGENTS
 
 /** How to re-invoke this same pi binary (compiled binary, or node/bun + script). */
 function piCommand(): { cmd: string; pre: string[] } {
+	// A host that embeds this lib without being pi (e.g. a separate daemon) points
+	// PI_INBOX_AGENT_CMD at the pi launcher; otherwise every child would re-run the host.
+	const override = process.env.PI_INBOX_AGENT_CMD?.trim();
+	if (override) return { cmd: override, pre: [] };
 	const exe = process.execPath;
 	if (/^(node|bun)(\.exe)?$/i.test(path.basename(exe)) && process.argv[1]) return { cmd: exe, pre: [process.argv[1]] };
 	return { cmd: exe, pre: [] };
@@ -399,8 +403,8 @@ const agentFile = (id: string, ext: "json" | "out" | "err" | "exit" | "stop" | "
 const OWNER_BEAT_MS = 5_000;
 const OWNER_STALE_MS = 20_000;
 /** Child heartbeat staleness (after a startup grace) that means the child died without a word. */
-const CHILD_STALE_MS = 45_000;
-const CHILD_GRACE_MS = 90_000;
+export const CHILD_STALE_MS = 45_000;
+export const CHILD_GRACE_MS = 90_000;
 /** A JSON-mode child should exit immediately after agent_settled. */
 const SETTLED_EXIT_GRACE_MS = 5_000;
 
@@ -443,6 +447,25 @@ function writeAtomic(file: string, data: string) {
 	fs.renameSync(tmp, file);
 }
 
+/**
+ * Sidecar files this module owns for one agent. `removeAgentFiles` must touch
+ * only these: `AGENTS_DIR` is shared, and a blanket `${id}.*` glob deleted
+ * state written by other subsystems that happen to live beside it (notably
+ * session-workers' `<id>.wake` / `<id>.wake-state`, so finishing a parent run
+ * silently destroyed its own undelivered wake).
+ */
+const AGENT_SIDECARS = ["json", "out", "err", "exit", "stop", "beat"] as const;
+
+function isAgentSidecar(id: string, name: string): boolean {
+	const suffix = name.slice(id.length + 1);
+	for (const ext of AGENT_SIDECARS) {
+		// `<id>.json`, plus the `<id>.json.<pid>.tmp` written by writeAtomic.
+		if (suffix === ext || suffix.startsWith(`${ext}.`)) return true;
+	}
+	// Adoption claim directories: `<id>.adopt-<owner>-<ownerBeat>`.
+	return suffix.startsWith("adopt-");
+}
+
 function removeAgentFiles(id: string, keepName = false) {
 	let names: string[] = [];
 	try {
@@ -453,6 +476,7 @@ function removeAgentFiles(id: string, keepName = false) {
 	for (const n of names) {
 		if (!n.startsWith(`${id}.`)) continue;
 		if (keepName && n === `${id}.name`) continue;
+		if (!isAgentSidecar(id, n)) continue;
 		try {
 			fs.rmSync(path.join(AGENTS_DIR, n), { recursive: true, force: true });
 		} catch {
@@ -569,13 +593,51 @@ function requestStop(id: string) {
 }
 
 /** Exit marker written by the child itself ({pid, code}); only trusted for the expected pid. */
-function readExit(a: BgAgent): number | undefined {
+export function readExit(a: BgAgent): number | undefined {
 	try {
 		const m = JSON.parse(fs.readFileSync(agentFile(a.id, "exit"), "utf-8"));
 		if (a.pid && m.pid && m.pid !== a.pid) return undefined;
+		// The stop path writes this marker BEFORE signalling itself (`writeExit`
+		// then SIGTERM, SIGKILL after 3s). Treating the marker as proof of exit
+		// let the supervisor finish the run -- and `pump()` the next one -- while
+		// the old child was still alive, so two runs could overlap on one session
+		// file. Only trust it once the pid is gone.
+		if (a.pid && pidAlive(a.pid)) return undefined;
 		return typeof m.code === "number" ? m.code : 1;
 	} catch {
 		return undefined;
+	}
+}
+
+/**
+ * True when a long-silent adopted run should be treated as exited.
+ *
+ * Silence alone is not proof: a process suspended by GC or the OS stops beating
+ * while still running its child, and concluding "gone" finished the run and
+ * pumped the next one while the original was still alive. The recorded pid must
+ * also be gone. Exported so this can be tested without waiting out the grace
+ * windows on a real adopted run.
+ */
+export function silenceMeansGone(a: {
+	id: string;
+	runStartedAt?: number;
+	pid?: number;
+}): boolean {
+	const age = Date.now() - (a.runStartedAt ?? 0);
+	if (age <= CHILD_GRACE_MS) return false;
+	if (childBeatAge(a.id) <= CHILD_STALE_MS) return false;
+	return !a.pid || !pidAlive(a.pid);
+}
+
+/** True when this pid names a live process we can see. */
+function pidAlive(pid: number): boolean {
+	if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		// EPERM: alive, just not ours.
+		return (error as NodeJS.ErrnoException).code === "EPERM";
 	}
 }
 
@@ -716,7 +778,7 @@ function adoptOrphans(allowedIds?: ReadonlySet<string>) {
 		} catch {
 			continue;
 		}
-		if (s.owner !== process.pid && Date.now() - s.ownerBeat < OWNER_STALE_MS) continue; // someone else has it
+		if (!mayAdopt(s)) continue;
 		// Atomic claim: only one pi can adopt from this particular (owner, beat).
 		try {
 			fs.mkdirSync(path.join(AGENTS_DIR, `${id}.adopt-${s.owner}-${s.ownerBeat}`));
@@ -725,6 +787,29 @@ function adoptOrphans(allowedIds?: ReadonlySet<string>) {
 		}
 		adopt(s);
 	}
+}
+
+/**
+ * True when this process may take over a saved agent record.
+ *
+ * A stale heartbeat is NOT proof the owner died: a process suspended by GC or
+ * the OS stops beating while still running its child. Adopting then pumping puts
+ * a second writer on that session, which is the two-writer shape this whole
+ * area keeps rediscovering. So the recorded pids must also be gone; a live pid
+ * we cannot signal (EPERM) still counts as "theirs".
+ *
+ * Exported so the rule can be tested without a real foreign process.
+ */
+export function mayAdopt(s: {
+	owner: number;
+	ownerBeat: number;
+	pid?: number;
+}): boolean {
+	const mine = s.owner === process.pid;
+	if (!mine && Date.now() - s.ownerBeat < OWNER_STALE_MS) return false;
+	if (!mine && s.owner > 0 && pidAlive(s.owner)) return false;
+	if (s.pid && pidAlive(s.pid)) return false;
+	return true;
 }
 
 function adopt(s: SavedAgent) {
@@ -779,11 +864,106 @@ function adopt(s: SavedAgent) {
 	pump();
 }
 
+/**
+ * The cwd recorded in a session file's header, i.e. the directory that session
+ * belongs to. `--session-id` only searches the current process cwd's project
+ * directory, so a run started from the wrong cwd silently creates a brand-new
+ * file for the same id instead of reopening the existing one.
+ */
+export function sessionCwd(file: string | undefined): string | undefined {
+	if (!file) return undefined;
+	try {
+		const cwd = SessionManager.open(file).getHeader()?.cwd;
+		return typeof cwd === "string" && cwd ? cwd : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * True when some OTHER process is already running this session.
+ *
+ * The single chokepoint every spawn path shares. `a.proc` only guards within
+ * one process's registry, so a second pi -- an adopted orphan, a window that
+ * reopened the session, the orch-web daemon -- could start a second
+ * `pi --session <path>` beside a live one. Two writers on one session file is
+ * what produced the zero-token aborts this was traced from, and patching one
+ * caller at a time left the others open (the wake path, `sendToAgent`, and
+ * orphan adoption each had their own check, or none).
+ *
+ * Consults the live records by session id -- NOT by pid, which is what the
+ * older `runningElsewhere` helpers do, and why they miss a writer held by this
+ * very process under a different session.
+ *
+ * A recorded pid that is gone is stale, not a writer: crash recovery depends on
+ * being able to take over.
+ */
+export function writerElsewhere(id: string): boolean {
+	// Resolved at call time, not from the module-level AGENTS_DIR: that constant
+	// is captured at import, so a test (or any caller with a redirected agent
+	// dir) would read the wrong directory entirely -- and silently report "no
+	// writer" because the folder is missing.
+	const dir = path.join(getAgentDir(), "inbox-live");
+	let names: string[] = [];
+	try {
+		names = fs.readdirSync(dir);
+	} catch {
+		return false;
+	}
+	for (const name of names) {
+		let rec: { sessionId?: string; pid?: number; state?: string };
+		try {
+			rec = JSON.parse(fs.readFileSync(path.join(dir, name), "utf-8"));
+		} catch {
+			continue;
+		}
+		if (rec.sessionId !== id) continue;
+		if (!rec.pid || !Number.isSafeInteger(rec.pid) || rec.pid <= 0) continue;
+		// Our OWN pid counts: a live record is written by the child on
+		// `agent_start`, so one naming this pid is a different session this same
+		// process is running -- a real writer. Skipping it was the bug.
+		if (rec.pid === process.pid) return true;
+		try {
+			process.kill(rec.pid, 0);
+			return true;
+		} catch (error) {
+			// ESRCH: stale record for a process that is gone. EPERM: alive.
+			if ((error as NodeJS.ErrnoException).code === "EPERM") return true;
+		}
+	}
+	return false;
+}
+
 function run(a: BgAgent) {
+	// One writer per session, enforced here so every caller is covered: `pump()`,
+	// `sendToAgent`, wake delivery, and orphan adoption all funnel through this.
+	// Leave the message queued rather than racing the live writer; the next pump
+	// after that run ends picks it up.
+	// The registry's own `proc` is the authoritative "this session is running
+	// here" check, so only a writer OUTSIDE this process blocks. `writerElsewhere`
+	// includes our own pid for other sessions, which is the case that mattered.
+	if (writerElsewhere(a.id) && !a.proc) {
+		a.state = a.pending.length ? "queued" : a.state;
+		persist(a);
+		return;
+	}
 	// Capture before the child can append its prompt or any tool steps.
 	a.runStartedAt = Date.now();
 	a.runBaseLeafId = a.sessionFile && fs.existsSync(a.sessionFile)
 		? SessionManager.open(a.sessionFile).getLeafId() : null;
+	// Reopen the session by PATH, not by id. `--session-id` is resolved against
+	// the cwd's project directory only, so a run whose cwd differs from where
+	// the session was created does not find it and pi quietly starts a new,
+	// blank session under the same id ("No project session found with id ...,
+	// creating a new session"), orphaning the real transcript. A path is
+	// unambiguous, and the header supplies the cwd the session actually belongs
+	// to, so the child reopens the same conversation wherever it was started.
+	const existing = a.sessionFile && fs.existsSync(a.sessionFile)
+		? a.sessionFile
+		: findSessionFile(a.id);
+	const cwd = sessionCwd(existing) ?? a.cwd;
+	// Keep the durable record pointing at the directory the session lives in.
+	a.cwd = cwd;
 	const message = a.pending.shift()!;
 	a.log = [];
 	a.liveText = "";
@@ -792,9 +972,10 @@ function run(a: BgAgent) {
 	a.liveRun = newLiveRun();
 	liveUser(a, cleanUserText(message));
 	const { cmd, pre } = piCommand();
-	const args = [
-		...pre, "--mode", "json", "--session-id", a.id, ...extensionArgs(),
-	];
+	const target = existing
+		? ["--session", existing]
+		: ["--session-id", a.id];
+	const args = [...pre, "--mode", "json", ...target, ...extensionArgs()];
 	for (const extension of a.extensionPaths ?? []) {
 		args.push("--extension", extension);
 	}
@@ -815,7 +996,7 @@ function run(a: BgAgent) {
 		// and not in pi's process group. Output goes to files, so nothing breaks when we're gone.
 		// stdin is a pipe we write the message to (see spawn below).
 		child = spawn(cmd, args, {
-			cwd: a.cwd,
+			cwd,
 			env: {
 				...process.env,
 				PI_INBOX_BG_PARENT: String(process.pid),
@@ -870,7 +1051,28 @@ function run(a: BgAgent) {
 	a.activity = "starting…";
 	persist(a);
 	touch(a);
+	traceRun("run_start", a, { pid: child.pid, runs: a.runs });
 	monitor(a, child);
+}
+
+/**
+ * Wake-path tracing, gated behind `PI_WAKE_TRACE=1`.
+ *
+ * Lives here rather than in the extension because the question is about RUN
+ * lifecycle: a follow-up can be aborted at zero tokens before a model call, and
+ * that is only answerable by correlating run start/end with the delivery
+ * decision. Imported lazily so the extension stays optional.
+ */
+function traceRun(
+	event: string,
+	a: BgAgent,
+	extra: Record<string, unknown> = {},
+): void {
+	void import("../../extensions/session-workers/trace.ts")
+		.then((m) => m.trace(event, { sessionId: a.id, ...extra }))
+		.catch(() => {
+			// Tracing is strictly optional.
+		});
 }
 
 /** Tail the agent's event file and notice when its run ends (child exit, exit marker, or silence). */
@@ -964,8 +1166,13 @@ function monitor(a: BgAgent, child?: ChildProcess) {
 		if (code === undefined && !child) {
 			// adopted: no exit event to wait for. A child that died hard (SIGKILL, crash) leaves no
 			// marker, so a long-silent heartbeat means it's gone.
-			const age = Date.now() - (a.runStartedAt ?? 0);
-			if (age > CHILD_GRACE_MS && childBeatAge(a.id) > CHILD_STALE_MS) code = -1;
+			//
+			// Silence is not proof of death. A process suspended by GC or the OS
+			// stops beating while still running, and concluding "-1" here finished
+			// the run and pumped the next one while the original was alive -- the
+			// same two-writer shape the exit-marker fix closed. Require the pid to
+			// be gone before treating silence as an exit.
+			if (silenceMeansGone(a)) code = -1;
 		}
 		if (
 			code === undefined &&
@@ -987,6 +1194,12 @@ function monitor(a: BgAgent, child?: ChildProcess) {
 }
 
 function finishRun(a: BgAgent, code: number, signal?: string) {
+	traceRun("run_end", a, {
+		code,
+		signal,
+		settled: a.settledAt !== undefined,
+		pending: a.pending.length,
+	});
 	const wasSettled = a.settledAt !== undefined;
 	a.proc = undefined;
 	a.pid = undefined;
