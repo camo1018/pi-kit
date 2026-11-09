@@ -156,7 +156,7 @@ already have the same filesystem permissions. Do not put credentials in notes.
 - Workers load normal Pi settings, skills, and project instructions. Runtime
   trust, tool exclusions, and MCP approval rules still apply. The extension
   does not turn on blanket approval or bypass human-input requirements.
-- The existing inbox concurrency cap applies (six per supervising process by
+- The existing inbox concurrency cap applies (twenty per supervising process by
   default; `PI_INBOX_MAX_AGENTS` overrides it). Extra workers queue. This isn't
   a machine-wide cap across independently running parents.
 - **Use separate worktrees for concurrent code edits**, or assign disjoint
