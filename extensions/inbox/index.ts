@@ -777,6 +777,12 @@ function writeLive(ctx: ExtensionContext, state: LiveRecord["state"]) {
 		};
 		const bgParent = Number(process.env.PI_INBOX_BG_PARENT);
 		if (bgParent) rec.bgParent = bgParent;
+		// This turn's start. `agent_start` fires exactly once per turn, and the
+		// heartbeat writes `updated` directly without going through here, so the
+		// stamp survives for the life of the run. That is what tells a run wedged
+		// inside one tool call apart from one making progress -- the pulse keeps
+		// `updated` fresh either way.
+		rec.startedAt = Date.now();
 		fs.writeFileSync(liveFile(), JSON.stringify(rec), "utf-8");
 		setPulse(state === "working");
 	} catch {
@@ -2963,7 +2969,9 @@ class InboxComponent {
 			else if (r.live && !r.isCurrent)
 				meta.push(
 					r.live.stuckMin
-						? `pid ${r.live.pid} looks stuck (silent ${r.live.stuckMin}m; kill -9 ${r.live.pid})`
+						// Not "silent": a run wedged inside one tool call still pulses, so
+						// it looks busy. What it lost was its owning pi.
+						? `pid ${r.live.pid} looks stuck (no progress ${r.live.stuckMin}m; kill -9 ${r.live.pid})`
 						: `open in pid ${r.live.pid}`,
 				);
 			const first = r.info.name
