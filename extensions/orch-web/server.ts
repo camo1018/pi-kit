@@ -58,6 +58,9 @@ import {
 	getAgent,
 	listAgents,
 	markSeen,
+	isWriting,
+	queueReason,
+	type QueueReason,
 	removeQueuedMessage,
 	renameAgent,
 	sendQueuedMessageNow,
@@ -92,7 +95,6 @@ const SESSIONS_DIR = path.join(AGENT_DIR, "sessions");
 const LIVE_DIR = path.join(AGENT_DIR, "inbox-live");
 const STORE_PATH = path.join(AGENT_DIR, "inbox.json");
 const TAIL_BYTES = 128 * 1024;
-const STUCK_AFTER_MS = 5 * 60_000;
 /** Live SSE seed: only the last N transcript messages, so a phone on 4G stays cheap. */
 const SSE_TRANSCRIPT_LIMIT = 60;
 
@@ -824,26 +826,27 @@ function readLive(): Map<string, LiveRecord> {
 		const full = path.join(LIVE_DIR, f);
 		try {
 			const rec = JSON.parse(fs.readFileSync(full, "utf-8")) as LiveRecord;
-			// A live record is a CLAIM about a pid: "this process is running this
-			// session right now". The claim is over when the pid is gone, no matter
-			// who spawned it. `ours` used to skip the liveness check entirely for
-			// this daemon's own children (`bgParent === process.pid`), so a child
-			// that had already exited kept reporting `working` until the 5-minute
-			// STUCK_AFTER_MS cutoff -- which made an unrelated idle session read as
-			// busy, disabled its Send button into Queue, and blocked its run behind
-			// the cross-process writer gate. Only a pid this daemon is actually
+			// A live record is a CLAIM about a pid: "this process has this session
+			// open, and may be writing it right now". The claim is over when the pid
+			// is gone, no matter who spawned it. `ours` used to skip the liveness
+			// check entirely for this daemon's own children (`bgParent ===
+			// process.pid`), so a child that had already exited kept reporting
+			// `working` until the stale cutoff -- which made an unrelated idle
+			// session read as busy, disabled its Send button into Queue, and blocked
+			// its run behind writerElsewhere. Only a pid this daemon is actually
 			// tracking (`listAgents()`) may vouch for a record without being alive.
 			const tracked = listAgents().some((a) => a.pid === rec.pid);
 			if (!tracked && !pidAlive(rec.pid)) {
 				fs.rmSync(full, { force: true });
 				continue;
 			}
-			if (rec.state === "working") {
-				const silent = Date.now() - rec.updated;
-				if (silent > STUCK_AFTER_MS) {
-					rec.state = "idle";
-					rec.stuckMin = Math.round(silent / 60_000);
-				}
+			// Age a stale `working` claim down to how we DISPLAY it. The rule itself
+			// lives in `isWriting`, so this can no longer disagree with the gates.
+			if (!isWriting(rec) && rec.state === "working") {
+				rec.state = "idle";
+				rec.stuckMin = Math.round(
+					(Date.now() - rec.updated) / 60_000,
+				);
 			}
 			const prev = out.get(rec.sessionId);
 			if (!prev || rec.updated > prev.updated) out.set(rec.sessionId, rec);
@@ -868,7 +871,7 @@ interface Row {
 	 * `running` means its own run is simply still in flight. Absent when nothing
 	 * is waiting.
 	 */
-	queueReason?: "running" | "slot" | "writer";
+	queueReason?: QueueReason;
 	live?: boolean;
 	livePid?: number;
 	stuckMin?: number;
@@ -930,12 +933,13 @@ function busyState(a: BgAgent | undefined, live?: LiveRecord) {
 /**
  * Why a row's queued message has not started.
  *
- * "queued" used to be one word for three unrelated situations, and every
- * surface reported all of them as "waiting for a free agent slot". Only a full
- * concurrency budget is that: a run held by another live process is not, and
- * neither is this agent's own run still being in flight.
+ * `queueReason` answers this against the in-memory registry, which only knows
+ * the agents THIS process runs. The daemon also has to account for a run held
+ * by another live pi (`live`), so that case is folded in here: a row whose work
+ * is waiting because some other process is mid-run is not waiting for capacity.
  */
 function queueReasonFor(
+	id: string,
 	a: BgAgent | undefined,
 	live?: LiveRecord,
 ): Row["queueReason"] {
@@ -946,15 +950,14 @@ function queueReasonFor(
 	if (live?.state === "working" && !a?.proc && live.pid !== process.pid) {
 		return "writer";
 	}
-	if (!a?.pending.length) return undefined;
-	// Our own live record means our own run is in flight, which is "running":
-	// it is the same wait, just not someone else's.
-	if (live?.state === "working") return "running";
-	// The daemon's own cap, read once per process.
+	if (!a) return undefined;
+	// The daemon's own cap, not the one baked into inbox-agents at import time:
+	// PI_INBOX_MAX_AGENTS is read once per module load, and the daemon is a
+	// separate process with its own copy.
 	if (a.proc || a.hold) return "running";
 	const running = listAgents().filter((x) => x.proc).length;
 	if (running >= MAX_CONCURRENT) return "slot";
-	return undefined;
+	return queueReason(id);
 }
 
 export function buildRows(opts: {
@@ -996,7 +999,14 @@ export function buildRows(opts: {
 			cwd: h.cwd,
 			status: tail.status,
 			state,
-			queueReason: queueReasonFor(bg, liveRec),
+			// Only rows with work actually waiting get a reason, so the UI can say
+			// "queued behind another process" instead of "waiting for a slot". A row
+			// whose own run is in flight still gets "running" -- that is the label
+			// for messages queued behind the turn you are watching.
+			queueReason:
+				(bg?.pending.length ?? 0) > 0
+					? queueReasonFor(h.id, bg, liveRec)
+					: undefined,
 			live: !!liveRec,
 			livePid: liveRec?.pid,
 			stuckMin: liveRec?.stuckMin,
@@ -1031,7 +1041,8 @@ export function buildRows(opts: {
 			cwd: a.cwd,
 			status: "empty",
 			state: busyState(a),
-			queueReason: queueReasonFor(a),
+			queueReason:
+				a.pending.length > 0 ? queueReasonFor(a.id, a) : undefined,
 			live: true,
 			livePid: a.pid,
 			model: a.model ?? a.nextModel,
