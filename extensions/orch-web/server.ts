@@ -947,6 +947,9 @@ function queueReasonFor(
 		return "writer";
 	}
 	if (!a?.pending.length) return undefined;
+	// Our own live record means our own run is in flight, which is "running":
+	// it is the same wait, just not someone else's.
+	if (live?.state === "working") return "running";
 	// The daemon's own cap, read once per process.
 	if (a.proc || a.hold) return "running";
 	const running = listAgents().filter((x) => x.proc).length;
