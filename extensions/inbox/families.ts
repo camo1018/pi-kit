@@ -35,15 +35,66 @@ function compareLinks(a: WorkerLink, b: WorkerLink): number {
 	);
 }
 
-/** Read-only metadata: never import the worker runner or start supervisors. */
+/**
+ * One directory's worth of cached links, validated on the directory's own stamp.
+ *
+ * Every write to `session-workers/workers` goes through `writeJson`, which writes
+ * a temp file and renames it into place. A rename creates a new directory entry,
+ * which bumps the directory's mtime — verified for the hard case too (rewriting
+ * the same file with identical-length content still moves it). That is what makes
+ * the directory stamp a sound invalidation key here, and it is the reason this
+ * does not need to stat the records themselves: an in-place rewrite, which would
+ * slip past a directory stamp, is exactly what `writeJson` never does.
+ */
+interface LinkCacheEntry {
+	mtimeMs: number;
+	entries: number;
+	links: WorkerLink[];
+}
+
+/** Keyed by `agentDir`: tests and the preview run against temporary agent dirs. */
+const linkCache = new Map<string, LinkCacheEntry>();
+
+/**
+ * Read-only metadata: never import the worker runner or start supervisors.
+ *
+ * Cached on the directory stamp. These records only change when a worker is
+ * spawned, renamed, or settled, but the inbox re-read and re-parsed all of them
+ * on every 2.5s refresh — `loadRows` and `refresh` each called this separately,
+ * so ~150 files were parsed twice per tick, ~3ms a time, 44% of a warm refresh.
+ * Replacing it with a `statSync` of the directory plus a `readdirSync` for the
+ * entry count costs ~0.07ms.
+ *
+ * The entry count is checked as well as the mtime because the two failure modes
+ * differ: adding or removing a record changes the count, while rewriting an
+ * existing one changes only the mtime.
+ *
+ * Returns the cached array directly rather than a copy: it is shared by every
+ * caller in this process, so treat it as read-only. (`projectFamilies` sorts a
+ * `.filter()` of it, which is a fresh array, so nothing mutates it today.)
+ */
 export function readWorkerLinks(agentDir: string): WorkerLink[] {
 	const dir = path.join(agentDir, "session-workers", "workers");
 	let names: string[];
+	let dirStat: fs.Stats;
+	// Stat BEFORE listing, not after. Two writers racing this read could otherwise
+	// leave us caching a stamp taken after a change whose records we listed before
+	// it — the cache would then look valid while holding the pre-change listing.
+	// Statting first can only cost a redundant re-read, never a stale hit.
 	try {
+		dirStat = fs.statSync(dir);
 		names = fs.readdirSync(dir);
 	} catch {
+		linkCache.delete(agentDir);
 		return [];
 	}
+	const cached = linkCache.get(agentDir);
+	if (
+		cached &&
+		cached.mtimeMs === dirStat.mtimeMs &&
+		cached.entries === names.length
+	)
+		return cached.links;
 	const links: WorkerLink[] = [];
 	for (const name of names) {
 		if (!name.endsWith(".json")) continue;
@@ -62,7 +113,13 @@ export function readWorkerLinks(agentDir: string): WorkerLink[] {
 			// A missing, partial, or malformed record must not break the inbox.
 		}
 	}
-	return links.sort(compareLinks);
+	const sorted = links.sort(compareLinks);
+	linkCache.set(agentDir, {
+		mtimeMs: dirStat.mtimeMs,
+		entries: names.length,
+		links: sorted,
+	});
+	return sorted;
 }
 
 export interface FamilyItem<T> {
