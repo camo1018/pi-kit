@@ -46,7 +46,6 @@ export function writeWakeRequest(
 	agentsDir: string,
 	request: {
 		parentId: string;
-		signature: string;
 		content: string;
 		workers: WakeWorker[];
 	},
@@ -507,5 +506,35 @@ export function releaseEpisodeClaim(
 		);
 	} catch {
 		// ignore
+	}
+}
+
+/**
+ * Release every episode claim belonging to a parent.
+ *
+ * Called when the arming record itself is pruned: the arm is what carries the
+ * episode number, so once it is gone the numbering restarts at 1 and a claim
+ * naming an already-used number would silently suppress a real wake. A crash
+ * between claim and release can also leave a claim behind with no arm to ever
+ * clear it, since `releaseEpisodeClaim` is only reached from the emit path.
+ */
+export function releaseAllEpisodeClaims(
+	agentsDir: string,
+	parentId: string,
+): void {
+	const prefix = `${parentId}.wake-claim-`;
+	let names: string[] = [];
+	try {
+		names = fs.readdirSync(agentsDir);
+	} catch {
+		return;
+	}
+	for (const name of names) {
+		if (!name.startsWith(prefix)) continue;
+		try {
+			fs.rmSync(path.join(agentsDir, name), { force: true });
+		} catch {
+			// Best effort: a stale claim is reclaimed by a dead owner.
+		}
 	}
 }
