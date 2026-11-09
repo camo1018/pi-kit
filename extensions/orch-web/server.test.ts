@@ -23,7 +23,7 @@ fs.mkdirSync(path.join(agentDir, "sessions"), { recursive: true });
 
 const { buildRows, eventBytes, firstUserText, lanAddress, liveItems,
 	mentionChoices, modelChoices, readLinesAt, readName, readTail,
-	sanitizeForLog } = await import("./server.ts");
+	sanitizeForLog, transcript } = await import("./server.ts");
 
 function writeSession(opts: {
 	id: string;
@@ -683,6 +683,56 @@ test("a queued message behind a live foreign run reads as writer, not slot", () 
 	assert.ok(row);
 	assert.equal(row.state, "working", "a foreign run is still a run");
 	fs.rmSync(path.join(agentDir, "inbox-live", `${process.pid}.json`), { force: true });
+});
+
+
+test("the concluding assistant message is flagged final, tool steps are not", () => {
+	const file = writeSession({
+		id: "jjjj-0001",
+		messages: [
+			user("do the thing"),
+			// A step: the model wanted another tool, so this is not the answer.
+			{ role: "assistant", stopReason: "toolUse", content: [
+				{ type: "text", text: "Let me look." },
+				{ type: "toolCall", name: "read", arguments: { path: "/x" } },
+			] },
+			{ role: "toolResult", isError: false, content: [{ type: "text", text: "ok" }] },
+			assistant("Done — it worked."),
+		],
+	});
+	const msgs = transcript(file);
+	const finals = msgs.filter((m) => m.final);
+	assert.equal(finals.length, 1, "exactly one final answer");
+	assert.equal(finals[0]?.text, "Done — it worked.");
+	// The step is still visible; only the flag is withheld.
+	assert.ok(msgs.some((m) => m.role === "assistant" && !m.final && m.tools?.length));
+});
+
+test("a run that errored or aborted has no final answer", () => {
+	const file = writeSession({
+		id: "kkkk-0002",
+		messages: [
+			user("go"),
+			assistant("boom", { stopReason: "error", errorMessage: "rate limited" }),
+			assistant("cut off", { stopReason: "aborted" }),
+		],
+	});
+	const msgs = transcript(file);
+	assert.equal(msgs.filter((m) => m.final).length, 0);
+	assert.equal(msgs.find((m) => m.stopped === "error")?.error, "rate limited");
+	assert.ok(msgs.some((m) => m.stopped === "aborted"));
+});
+
+test("an empty-text stop is not a final answer", () => {
+	const file = writeSession({
+		id: "llll-0003",
+		messages: [
+			user("go"),
+			{ role: "assistant", stopReason: "stop", content: [] },
+		],
+	});
+	// A stop with nothing said has nothing to mark: it is skipped entirely.
+	assert.equal(transcript(file).filter((m) => m.final).length, 0);
 });
 
 test.after(() => fs.rmSync(home, { recursive: true, force: true }));
