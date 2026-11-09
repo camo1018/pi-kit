@@ -69,8 +69,7 @@ First connection triggers a macOS firewall prompt for `node` — **Allow**.
 | Groups | **☰** → Groups |
 | Insert a skill | `$` — the popup opens as you type (`$graf` → `$grafana`) |
 | Insert a command | `/` at the start of the message |
-| Reference another session | `@[` (all), `@g[` (this group), `@ga[` (this group + archived) |
-| Trigger a popup without a keyboard | `$` `/` `@` buttons left of the composer |
+| Reference another session | `@` — the popup opens on the `@` itself (`@ot` → `@[<session-id>]`) |
 | Terminal | **☰** → Terminal (needs `--term`) |
 | Refresh | automatic; **⟳** forces it |
 
@@ -118,11 +117,20 @@ thing because the same extensions expand them on the request side:
 | `/skill:name args` | the portable skill form; works in any mode | pi itself |
 | `/command` | listed for parity, but pi-kit's handlers need a TUI, so they are inert in a background run | — |
 
-`@[` lists every session, `@g[` only this session's group (and says so when the
-session is ungrouped), `@ga[` adds archived ones. The dropdown in the popup
-header switches the filter for that token without retyping it. Up/Down/Tab/Enter
-move and accept, Escape dismisses, and the group picker is the only control that
-steals focus.
+Every trigger is just the prefix character: type `$`, `/` or `@` and the list
+opens. There are no insert buttons on the composer — the characters are one key
+each on a real keyboard, and a phone keyboard reaches them in the same place.
+
+Sessions are filtered from the popup, because the raw triggers are the TUI's and
+they are awkward on glass: a plain `@` lists every session (`@[` still works and
+means the same thing), and the dropdown in the popup header switches to this
+session's group, that group plus archived, or any group by name — without
+retyping the token. Picking a row always inserts the full `@[<session-id>]`
+form, whatever the filter. Up/Down/Tab/Enter move and accept, Escape dismisses,
+and the group picker is the only control that steals focus.
+
+The new-agent prompt (header **＋**) offers the same list, since its prompt is
+expanded by the same extensions on the request side.
 
 ### Session actions
 
