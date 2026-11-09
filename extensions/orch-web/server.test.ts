@@ -12,6 +12,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
+import { spawnSync } from "node:child_process";
 
 // getAgentDir() consults the environment, so point HOME at a scratch tree
 // before importing anything that reads it at module load.
@@ -21,8 +22,8 @@ const agentDir = path.join(home, ".pi", "agent");
 fs.mkdirSync(path.join(agentDir, "sessions"), { recursive: true });
 
 const { buildRows, eventBytes, firstUserText, lanAddress, liveItems,
-	modelChoices, readLinesAt, readName, readTail, sanitizeForLog } =
-	await import("./server.ts");
+	mentionChoices, modelChoices, readLinesAt, readName, readTail,
+	sanitizeForLog } = await import("./server.ts");
 
 function writeSession(opts: {
 	id: string;
@@ -471,6 +472,217 @@ test("no enabledModels means an empty picker, not a crash", () => {
 	);
 	assert.deepEqual(modelChoices().models, []);
 	assert.equal(modelChoices().source, "none");
+});
+
+test("mentions list sessions with the id as the inserted token", async () => {
+	const seen = writeSession({
+		id: "aaaa-1111",
+		messages: [user("mention target one")],
+		name: "Target One",
+	});
+	assert.ok(seen);
+	writeSession({ id: "bbbb-2222", messages: [user("target two")] });
+	const data = mentionChoices();
+	assert.ok(data.mentions.length >= 2);
+	const hit = data.mentions.find((m) => m.id === "aaaa-1111");
+	assert.ok(hit, "the named session is offered");
+	assert.equal(hit.label, "Target One");
+	assert.equal(hit.value, "@[aaaa-1111]");
+});
+
+test("a session is not offered as a mention of itself", () => {
+	const me = writeSession({ id: "cccc-3333", messages: [user("me")] });
+	const other = writeSession({ id: "dddd-4444", messages: [user("them")] });
+	assert.ok(me && other);
+	const from = mentionChoices({ from: "cccc-3333" }).mentions.map((m) => m.id);
+	assert.ok(!from.includes("cccc-3333"));
+	assert.ok(from.includes("dddd-4444"));
+	// Opting in is explicit, because referencing your own transcript is legal.
+	const withSelf = mentionChoices({ from: "cccc-3333", includeSelf: true })
+		.mentions.map((m) => m.id);
+	assert.ok(withSelf.includes("cccc-3333"));
+});
+
+test("archived sessions are left out of mentions unless asked for", () => {
+	const store = path.join(agentDir, "inbox.json");
+	const id = "eeee-5555";
+	writeSession({ id, messages: [user("archived one")] });
+	fs.writeFileSync(store, JSON.stringify({
+		version: 1,
+		sessions: { [id]: { archivedAt: 1 } },
+	}));
+	const hidden = mentionChoices().mentions.map((m) => m.id);
+	assert.ok(!hidden.includes(id));
+	const shown = mentionChoices({ withArchived: true }).mentions.map((m) => m.id);
+	assert.ok(shown.includes(id));
+	fs.rmSync(store, { force: true });
+});
+
+test("mentions can be narrowed to one inbox group", () => {
+	const gid = "grp-mention";
+	const inGroup = "ffff-6666";
+	const outGroup = "gggg-7777";
+	writeSession({ id: inGroup, messages: [user("inside the group")] });
+	writeSession({ id: outGroup, messages: [user("outside the group")] });
+	const groupsFile = path.join(agentDir, "inbox-groups.json");
+	fs.writeFileSync(groupsFile, JSON.stringify({
+		version: 1,
+		groups: [{ id: gid, name: "Mentions", templateEnabled: false, template: "" }],
+		sessions: { [inGroup]: gid },
+	}));
+	const scoped = mentionChoices({ groupId: gid }).mentions.map((m) => m.id);
+	assert.deepEqual(scoped, [inGroup]);
+	assert.equal(mentionChoices({ groupId: gid }).group, gid);
+	// `group=all` is the TUI's `@[`: no group filter at all.
+	const all = mentionChoices({ groupId: "all" }).mentions.map((m) => m.id);
+	assert.ok(all.includes(inGroup) && all.includes(outGroup));
+	// Ungrouped means "no membership", which is a real filter too.
+	const loose = mentionChoices({ groupId: "ungrouped" }).mentions.map((m) => m.id);
+	assert.ok(loose.includes(outGroup) && !loose.includes(inGroup));
+	// A session with no group of its own defaults to the unscoped list.
+	const fromLoose = mentionChoices({ from: outGroup }).mentions.map((m) => m.id);
+	assert.ok(fromLoose.includes(inGroup));
+	fs.rmSync(groupsFile, { force: true });
+});
+
+test("an ungrouped session's own-group scope is empty, not everything", () => {
+	const loose = "hhhh-8888";
+	const grouped = "iiii-9999";
+	writeSession({ id: loose, messages: [user("no group")] });
+	writeSession({ id: grouped, messages: [user("grouped")] });
+	const groupsFile = path.join(agentDir, "inbox-groups.json");
+	fs.writeFileSync(groupsFile, JSON.stringify({
+		version: 1,
+		groups: [{ id: "grp-self", name: "Self", templateEnabled: false, template: "" }],
+		sessions: { [grouped]: "grp-self" },
+	}));
+	// `@g[` from an ungrouped session: the TUI shows nothing has a group here.
+	const self = mentionChoices({ from: loose, groupId: "self" });
+	assert.deepEqual(self.mentions.map((m) => m.id), [grouped].filter(() => false));
+	assert.equal(self.group, "ungrouped");
+	assert.equal(self.fromGroup, undefined);
+	// The same scope from a grouped session returns that group's other members.
+	const fromGrouped = mentionChoices({ from: grouped, groupId: "self" });
+	assert.equal(fromGrouped.group, "grp-self");
+	assert.equal(fromGrouped.fromGroup, "grp-self");
+	fs.rmSync(groupsFile, { force: true });
+});
+
+// ───────────────────────── stale live records ─────────────────────────
+
+/**
+ * A pid that is guaranteed dead: spawn and reap a trivial child.
+ *
+ * The bug this guards was a live record whose process had already exited but
+ * whose `bgParent` was the daemon itself, so the liveness check was skipped and
+ * the record kept reporting `working` for the full 5-minute STUCK_AFTER_MS.
+ */
+function deadPid(): number {
+	const child = spawnSync(process.execPath, ["-e", "0"], { timeout: 10_000 });
+	assert.equal(child.status, 0, "helper child must run");
+	// Its pid is now reaped; nothing else can hold that number this quickly.
+	return child.pid!;
+}
+
+function writeLiveRecord(rec: Record<string, unknown>) {
+	const dir = path.join(agentDir, "inbox-live");
+	fs.mkdirSync(dir, { recursive: true });
+	fs.writeFileSync(
+		path.join(dir, `${rec.pid}.json`),
+		JSON.stringify(rec),
+	);
+}
+
+test("a dead child's live record does not make its session look busy", () => {
+	// The regression: the daemon spawned this run (so bgParent === our pid),
+	// the process exited, and the record still said "working". Every OTHER
+	// session then reported "queued (waiting for a free agent slot)" even
+	// though nothing was waiting for capacity.
+	const id = "llll-1111";
+	writeSession({ id, messages: [user("mirror the change")] });
+	const pid = deadPid();
+	writeLiveRecord({
+		pid,
+		sessionId: id,
+		sessionFile: path.join(agentDir, "sessions", "--scratch--", `x_${id}.jsonl`),
+		state: "working",
+		updated: Date.now(),
+		bgParent: process.pid,
+	});
+
+	const row = buildRows().rows.find((r) => r.id === id);
+	assert.ok(row, "the session still lists");
+	assert.notEqual(row.state, "working", "a dead pid is not a running session");
+
+	// And the record is reaped, not just ignored, so the next read is cheap.
+	assert.equal(
+		fs.existsSync(path.join(agentDir, "inbox-live", `${pid}.json`)),
+		false,
+		"a record naming a dead pid must be removed",
+	);
+});
+
+test("a live record for another session does not block this one", () => {
+	// Same shape, but the record belongs to a DIFFERENT session than the row we
+	// ask about. This is what made one phone reply look slot-blocked by an
+	// unrelated agent.
+	const busyOther = "llll-2222";
+	const idleOne = "llll-3333";
+	writeSession({ id: busyOther, messages: [user("long run")] });
+	writeSession({ id: idleOne, messages: [user("talk to me"), assistant("hi")] });
+	const pid = deadPid();
+	writeLiveRecord({
+		pid,
+		sessionId: busyOther,
+		sessionFile: path.join(agentDir, "sessions", "--scratch--", `x_${busyOther}.jsonl`),
+		state: "working",
+		updated: Date.now(),
+		bgParent: process.pid,
+	});
+
+	const row = buildRows().rows.find((r) => r.id === idleOne);
+	assert.ok(row);
+	assert.equal(row.state, undefined, "the idle session is not busy");
+	assert.equal(row.queueReason, undefined, "and nothing is queued on it");
+});
+
+test("a stale record's silence still downgrades to idle, and says how long", () => {
+	// Belt and braces: if a pid somehow survives while genuinely silent, the
+	// existing STUCK_AFTER_MS path must still apply. Use our own pid so it is
+	// alive but untracked.
+	const id = "llll-4444";
+	writeSession({ id, messages: [user("orphan")] });
+	writeLiveRecord({
+		pid: process.pid,
+		sessionId: id,
+		sessionFile: path.join(agentDir, "sessions", "--scratch--", `x_${id}.jsonl`),
+		state: "working",
+		updated: Date.now() - 30 * 60_000,
+	});
+	const row = buildRows().rows.find((r) => r.id === id);
+	assert.ok(row);
+	assert.notEqual(row.state, "working");
+});
+
+test("a queued message behind a live foreign run reads as writer, not slot", () => {
+	// The exact phone symptom: another process holds the session, so the reply
+	// cannot start. The UI used to call this "waiting for a free agent slot",
+	// which sent the reader looking for a capacity problem that did not exist.
+	const id = "llll-5555";
+	writeSession({ id, messages: [user("mirror the change"), assistant("done")] });
+	// An alive pid that is not a tracked agent of this process: a foreign holder.
+	writeLiveRecord({
+		pid: process.pid,
+		sessionId: id,
+		sessionFile: path.join(agentDir, "sessions", "--scratch--", `x_${id}.jsonl`),
+		state: "working",
+		updated: Date.now(),
+	});
+
+	const row = buildRows().rows.find((r) => r.id === id);
+	assert.ok(row);
+	assert.equal(row.state, "working", "a foreign run is still a run");
+	fs.rmSync(path.join(agentDir, "inbox-live", `${process.pid}.json`), { force: true });
 });
 
 test.after(() => fs.rmSync(home, { recursive: true, force: true }));

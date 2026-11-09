@@ -9,6 +9,8 @@
  *   GET  /                      the single-page client (public/index.html)
  *   GET  /api/rows              inbox rows: sessions, live state, groups, unread
  *   GET  /api/models            selectable models (enabledModels + thinking levels)
+ *   GET  /api/catalog           $skills, /commands and prompt templates for the composer
+ *   GET  /api/mentions          sessions an @[ mention can reference, by group
  *   GET  /api/agent/:id/stream  SSE: transcript + live run events (poll-based)
  *   POST /api/send              { id, text }      queue or start a run
  *   POST /api/new               { prompt, cwd?, model?, groupId?, title? }
@@ -39,6 +41,7 @@
  * being raced.
  */
 
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
@@ -76,6 +79,13 @@ import { InboxGroups } from "../inbox/groups.ts";
 import { beforeRun } from "../../lib/session-branch.ts";
 import { writeClone } from "../../lib/session-clone.ts";
 import { loadPty, ptyStatus, TermError, TerminalHost } from "./terminal.ts";
+import {
+	CATALOG_MARKER,
+	type Catalog,
+	type CatalogCommand,
+	type CatalogPrompt,
+	type CatalogSkill,
+} from "./catalog.ts";
 
 const AGENT_DIR = getAgentDir();
 const SESSIONS_DIR = path.join(AGENT_DIR, "sessions");
@@ -654,6 +664,132 @@ export function modelChoices(): {
 	};
 }
 
+// ───────────────────────────── completion catalog ─────────────────────────────
+
+/**
+ * What `$`, `/` and `@` can offer in the phone's composer.
+ *
+ * The TUI answers this from live pi objects. The daemon can't: it is not a pi
+ * process, and extension factories (which is where `/command` comes from) must
+ * not be run in a long-lived host. So catalog.ts runs pi's own discovery in a
+ * one-shot child and prints JSON, and the answer is cached here.
+ *
+ * Session mentions are deliberately *not* cached: sessions are created, renamed
+ * and archived constantly, and the daemon already has their headers on disk.
+ */
+const CATALOG_TTL_MS = 5 * 60_000;
+const CATALOG_TIMEOUT_MS = 30_000;
+let catalogCache: { catalog: Catalog; at: number } | undefined;
+let catalogInflight: Promise<Catalog> | undefined;
+
+export function catalogPath(): string {
+	return path.join(
+		import.meta.dirname ?? __dirname,
+		"catalog.ts",
+	);
+}
+
+/** The node that runs the daemon; the child imports the same pi package. */
+function catalogNode(): string {
+	const override = process.env.ORCH_WEB_NODE?.trim();
+	if (override) return override;
+	return process.execPath;
+}
+
+/**
+ * Run the catalog child. Failures are soft: an empty catalog means the phone
+ * offers no completions, which is exactly how the composer behaves today.
+ *
+ * Node, not `pi`: pi's own CLI parses the arguments, so node flags would be
+ * rejected. The daemon's NODE_PATH (set by scripts/orch-web.sh) is what lets
+ * this child resolve @earendil-works/pi-coding-agent at all.
+ */
+function runCatalog(): Promise<Catalog> {
+	return new Promise((resolve, reject) => {
+		const child = spawn(
+			catalogNode(),
+			[
+				"--experimental-transform-types",
+				"--no-warnings",
+				catalogPath(),
+			],
+			{ stdio: ["ignore", "pipe", "pipe"], env: { ...process.env } },
+		);
+		let out = "";
+		let err = "";
+		const timer = setTimeout(() => {
+			child.kill("SIGKILL");
+			reject(new Error(`catalog timed out after ${CATALOG_TIMEOUT_MS}ms`));
+		}, CATALOG_TIMEOUT_MS);
+		child.stdout.setEncoding("utf-8");
+		child.stderr.setEncoding("utf-8");
+		child.stdout.on("data", (chunk: string) => {
+			out += chunk;
+		});
+		child.stderr.on("data", (chunk: string) => {
+			err += chunk;
+		});
+		child.on("error", (e) => {
+			clearTimeout(timer);
+			reject(e);
+		});
+		child.on("close", (code) => {
+			clearTimeout(timer);
+			const line = out
+				.split("\n")
+				.find((l) => l.startsWith(`${CATALOG_MARKER}`));
+			if (!line) {
+				reject(
+					new Error(
+						`catalog exited ${code}: ${err.trim().split("\n").at(-1) ?? "no output"}`,
+					),
+				);
+				return;
+			}
+			try {
+				resolve(JSON.parse(line.slice(CATALOG_MARKER.length)) as Catalog);
+			} catch (e) {
+				reject(e instanceof Error ? e : new Error(String(e)));
+			}
+		});
+	});
+}
+
+/** Cached catalog for the composer; a stale or failed build is reported. */
+export async function commandCatalog(force = false): Promise<{
+	catalog: Catalog | undefined;
+	stale: boolean;
+	loading?: boolean;
+	error?: string;
+}> {
+	const now = Date.now();
+	if (!force && catalogCache && now - catalogCache.at < CATALOG_TTL_MS) {
+		return { catalog: catalogCache.catalog, stale: false };
+	}
+	if (catalogInflight) {
+		// Someone else is building it. Answer with what we have and let the next
+		// call pick up the fresh catalog, rather than holding two requests open.
+		return {
+			catalog: catalogCache?.catalog,
+			stale: !!catalogCache,
+			loading: true,
+		};
+	}
+	catalogInflight = runCatalog().finally(() => {
+		catalogInflight = undefined;
+	});
+	try {
+		const catalog = await catalogInflight;
+		catalogCache = { catalog, at: Date.now() };
+		return { catalog, stale: false };
+	} catch (e) {
+		const message = e instanceof Error ? e.message : String(e);
+		say("catalog-failed", { error: message });
+		// Keep serving the previous catalog rather than emptying the picker.
+		return { catalog: catalogCache?.catalog, stale: true, error: message };
+	}
+}
+
 // ───────────────────────────── live records ─────────────────────────────
 
 interface LiveRecord {
@@ -688,11 +824,17 @@ function readLive(): Map<string, LiveRecord> {
 		const full = path.join(LIVE_DIR, f);
 		try {
 			const rec = JSON.parse(fs.readFileSync(full, "utf-8")) as LiveRecord;
-			const ours =
-				rec.pid === process.pid ||
-				rec.bgParent === process.pid ||
-				listAgents().some((a) => a.pid === rec.pid);
-			if (!ours && !pidAlive(rec.pid)) {
+			// A live record is a CLAIM about a pid: "this process is running this
+			// session right now". The claim is over when the pid is gone, no matter
+			// who spawned it. `ours` used to skip the liveness check entirely for
+			// this daemon's own children (`bgParent === process.pid`), so a child
+			// that had already exited kept reporting `working` until the 5-minute
+			// STUCK_AFTER_MS cutoff -- which made an unrelated idle session read as
+			// busy, disabled its Send button into Queue, and blocked its run behind
+			// the cross-process writer gate. Only a pid this daemon is actually
+			// tracking (`listAgents()`) may vouch for a record without being alive.
+			const tracked = listAgents().some((a) => a.pid === rec.pid);
+			if (!tracked && !pidAlive(rec.pid)) {
 				fs.rmSync(full, { force: true });
 				continue;
 			}
@@ -720,6 +862,13 @@ interface Row {
 	cwd: string;
 	status: string;
 	state?: BgAgent["state"];
+	/**
+	 * Why this row's queued work has not started. Only `slot` is a capacity
+	 * problem; `writer` means another live process holds the session, and
+	 * `running` means its own run is simply still in flight. Absent when nothing
+	 * is waiting.
+	 */
+	queueReason?: "running" | "slot" | "writer";
 	live?: boolean;
 	livePid?: number;
 	stuckMin?: number;
@@ -778,6 +927,27 @@ function busyState(a: BgAgent | undefined, live?: LiveRecord) {
 	return undefined;
 }
 
+/**
+ * Why a row's queued message has not started.
+ *
+ * "queued" used to be one word for three unrelated situations, and every
+ * surface reported all of them as "waiting for a free agent slot". Only a full
+ * concurrency budget is that: a run held by another live process is not, and
+ * neither is this agent's own run still being in flight.
+ */
+function queueReasonFor(
+	a: BgAgent | undefined,
+	live?: LiveRecord,
+): Row["queueReason"] {
+	if (live?.state === "working" && !a?.proc) return "writer";
+	if (!a?.pending.length) return undefined;
+	// The daemon's own cap, read once per process.
+	if (a.proc || a.hold) return "running";
+	const running = listAgents().filter((x) => x.proc).length;
+	if (running >= MAX_CONCURRENT) return "slot";
+	return undefined;
+}
+
 export function buildRows(opts: {
 	currentId?: string;
 	withArchived?: boolean;
@@ -817,6 +987,7 @@ export function buildRows(opts: {
 			cwd: h.cwd,
 			status: tail.status,
 			state,
+			queueReason: queueReasonFor(bg, liveRec),
 			live: !!liveRec,
 			livePid: liveRec?.pid,
 			stuckMin: liveRec?.stuckMin,
@@ -851,6 +1022,7 @@ export function buildRows(opts: {
 			cwd: a.cwd,
 			status: "empty",
 			state: busyState(a),
+			queueReason: queueReasonFor(a),
 			live: true,
 			livePid: a.pid,
 			model: a.model ?? a.nextModel,
@@ -905,6 +1077,118 @@ export function buildRows(opts: {
 		summary: agentsSummary(),
 		capacity: { running: rows.filter((r) => r.state === "working").length, max: MAX_CONCURRENT },
 		now: Date.now(),
+	};
+}
+
+// ───────────────────────────── session mentions ─────────────────────────────
+
+/**
+ * Sessions the composer can reference with `@[`.
+ *
+ * The TUI's picker reads `SessionManager.listAll()`, which parses every line of
+ * every session file (hundreds of files, hundreds of megabytes) to build a
+ * message count. The daemon already walks headers for the list, and the phone
+ * only ever sends the id, so headers plus a name is all the choice needs.
+ *
+ * `label` is what the picker shows; `value` is the immutable token inserted into
+ * the prompt. Selection is stable across renames, exactly like the TUI's.
+ */
+export interface MentionChoice {
+	id: string;
+	label: string;
+	cwd: string;
+	dir: string;
+	group?: string;
+	groupName?: string;
+	modified: number;
+	value: string;
+}
+
+export function mentionChoices(opts: {
+	/** Session doing the mentioning: excluded, and its group is the default scope. */
+	from?: string;
+	/**
+	 * Restrict to one inbox group. `"all"` means no filter, `"self"` means the
+	 * `from` session's own group (the TUI's `@g[`), and `"ungrouped"` means a
+	 * session with no membership. Any other value is a group id.
+	 */
+	groupId?: string;
+	withArchived?: boolean;
+	includeSelf?: boolean;
+} = {}): {
+	mentions: MentionChoice[];
+	groups: Array<{ id: string; name: string }>;
+	defaultGroupId?: string;
+	/** The filter that was applied, when one was. */
+	group?: string;
+	/** The mentioning session's own group; absent means it is ungrouped. */
+	fromGroup?: string;
+} {
+	const store = loadStore();
+	const groups = (() => {
+		try {
+			return new InboxGroups(AGENT_DIR).load();
+		} catch {
+			return {
+				groups: [],
+				sessions: {},
+			} as unknown as ReturnType<InboxGroups["load"]>;
+		}
+	})();
+	const nameOf = new Map(
+		(groups.groups ?? []).map((g) => [g.id, g.name] as const),
+	);
+	const groupOf = (id: string): string | undefined => groups.sessions?.[id];
+
+	// `group=all` is the TUI's `@[`: every session, whatever its group.
+	// `group=self` is its `@g[` / `@ga[`: this session's group. An ungrouped
+	// session's `@g[` matches *nothing* — quietly listing every session (or
+	// every ungrouped one) looked like the filter had worked when it hadn't.
+	// `group=ungrouped` is the explicit "no membership" filter. Any other value
+	// is a group id.
+	const fromGroup = opts.from ? groupOf(opts.from) : undefined;
+	const selfScope = opts.groupId === "self";
+	const none = selfScope && !fromGroup;
+	const scope = opts.groupId === "all" || none
+		? undefined
+		: selfScope || opts.groupId === undefined
+			? fromGroup
+			: opts.groupId;
+	const ungrouped = opts.groupId === "ungrouped";
+
+	const mentions: MentionChoice[] = [];
+	for (const h of none ? [] : scanHeaders()) {
+		const meta = store.sessions[h.id] ?? {};
+		if (meta.archivedAt && !opts.withArchived) continue;
+		if (meta.filter === "hide") continue;
+		if (!opts.includeSelf && opts.from && h.id === opts.from) continue;
+		const gid = groupOf(h.id);
+		if (ungrouped ? !!gid : scope ? gid !== scope : false) continue;
+		mentions.push({
+			id: h.id,
+			label: cleanTitle(
+				readName(h.path) || firstUserText(h.path) || "(no messages)",
+			),
+			cwd: h.cwd,
+			dir: h.cwd.split("/").filter(Boolean).pop() ?? h.cwd,
+			group: gid,
+			groupName: gid ? nameOf.get(gid) : undefined,
+			modified: h.modified.getTime(),
+			// The same token the TUI inserts: the id, never the title.
+			value: `@[${h.id}]`,
+		});
+	}
+	mentions.sort((a, b) => b.modified - a.modified);
+	return {
+		mentions,
+		groups: (groups.groups ?? []).map((g) => ({ id: g.id, name: g.name })),
+		defaultGroupId: groups.defaultGroupId,
+		group: opts.groupId === "all"
+			? undefined
+			: opts.groupId ? (none ? "ungrouped" : scope) : undefined,
+		// The client says `@g[` found nothing because *this* session has no
+		// group, rather than leaving an empty list to guess at.
+		fromGroup,
 	};
 }
 
@@ -1179,6 +1463,15 @@ export function startOrchWeb(cfg: Config) {
 	// phone can hide thinking levels that would be rejected. Optional: a failure
 	// just leaves every level on offer.
 	void loadModelRuntime();
+	// Building the composer catalog spawns a one-shot child, so start it now
+	// rather than making the first `$` on a phone wait for it.
+	void commandCatalog().then((r) => {
+		say("catalog-ready", {
+			skills: r.catalog?.skills.length ?? 0,
+			commands: r.catalog?.commands.length ?? 0,
+			error: r.error,
+		});
+	});
 
 	// A spawned child that dies unnoticed is the failure mode that hid the last
 	// bug: say so on the log the moment the agent reports an error.
@@ -1405,6 +1698,32 @@ async function handle(
 
 	if (req.method === "GET" && url.pathname === "/api/models") {
 		return sendJson(res, 200, modelChoices());
+	}
+
+	if (req.method === "GET" && url.pathname === "/api/catalog") {
+		const result = await commandCatalog(url.searchParams.get("refresh") === "1");
+		return sendJson(res, 200, {
+			skills: result.catalog?.skills ?? [],
+			prompts: result.catalog?.prompts ?? [],
+			commands: result.catalog?.commands ?? [],
+			loadedAt: result.catalog?.loadedAt,
+			stale: result.stale,
+			loading: result.loading,
+			error: result.error,
+		});
+	}
+
+	if (req.method === "GET" && url.pathname === "/api/mentions") {
+		return sendJson(
+			res,
+			200,
+			mentionChoices({
+				from: url.searchParams.get("from") ?? undefined,
+				groupId: url.searchParams.get("group") ?? undefined,
+				withArchived: url.searchParams.get("archived") === "1",
+				includeSelf: url.searchParams.get("self") === "1",
+			}),
+		);
 	}
 
 	if (req.method === "GET" && url.pathname.startsWith("/api/stream/")) {

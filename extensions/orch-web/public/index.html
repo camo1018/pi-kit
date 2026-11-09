@@ -191,6 +191,47 @@
     resize: none; min-height: 40px; max-height: 40vh;
   }
   #input:focus { outline: 1px solid var(--accent); }
+  /* Insertion triggers: mobile keyboards make `$` and `@` awkward, and the TUI
+     has a keybinding for each anyway. Three narrow buttons, not a menu. */
+  #picks { display: flex; gap: 4px; flex: 0 0 auto; align-items: flex-end;
+    padding-bottom: 2px; }
+  .pick { font-family: var(--mono); font-size: 14px; min-height: 34px;
+    padding: 4px 8px; color: var(--dim); background: transparent;
+    border-color: transparent; }
+  .pick:active { color: var(--accent); background: var(--panel-2); }
+
+  /* ── composer completions ($skill, /command, @[session]) ── */
+  /* Sits directly above the composer, inside the overlay's flex column so it
+     pushes the transcript up instead of covering the newest message. */
+  #comp {
+    flex: 0 0 auto; margin: 0 10px 6px; border: 1px solid var(--line);
+    border-radius: 12px; background: var(--panel-2); overflow: hidden;
+    display: flex; flex-direction: column; max-height: 46vh;
+  }
+  #comp .head { display: flex; align-items: center; gap: 8px;
+    padding: 7px 10px 5px; color: var(--dim); font-size: 11.5px;
+    text-transform: uppercase; letter-spacing: .05em;
+    border-bottom: 1px solid var(--line); flex: 0 0 auto; }
+  #comp .head .scope { flex: 1; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; text-transform: none; letter-spacing: 0;
+    font-size: 11.5px; }
+  #comp .head select { font: inherit; color: var(--text);
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 7px; padding: 2px 5px; font-size: 11.5px;
+    text-transform: none; letter-spacing: 0; max-width: 46vw; }
+  #comp .items { overflow-y: auto; -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain; }
+  #comp .item { display: flex; gap: 9px; align-items: baseline;
+    padding: 9px 11px; border-bottom: 1px solid var(--line); font-size: 14px; }
+  #comp .item:last-child { border-bottom: 0; }
+  #comp .item .name { font-family: var(--mono); font-size: 13px;
+    color: var(--text); flex: 0 1 auto; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  #comp .item .desc { color: var(--dim); font-size: 12px; flex: 1 1 auto;
+    min-width: 0; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; text-align: right; }
+  #comp .item.sel { background: #23314a; }
+  #comp .item.none { color: var(--dim); font-size: 13px; }
   .toast { position: fixed; left: 50%; transform: translateX(-50%);
     bottom: calc(80px + env(safe-area-inset-bottom)); z-index: 40;
     background: #20262e; border: 1px solid var(--line); border-radius: 10px;
@@ -262,7 +303,13 @@
   </header>
   <div id="log"></div>
   <div id="queueBox" class="queue hidden"></div>
+  <div id="comp" class="hidden"></div>
   <footer>
+    <div id="picks">
+      <button class="pick" id="pickSkill" title="Insert a skill">$</button>
+      <button class="pick" id="pickCmd" title="Insert a command">/</button>
+      <button class="pick" id="pickAt" title="Reference a session">@</button>
+    </div>
     <textarea id="input" rows="1" placeholder="Message…"
       enterkeyhint="enter"></textarea>
     <button class="primary" id="send">Send</button>
@@ -288,6 +335,10 @@
     stickToBottom: null,
     /** Whether the daemon offers a terminal (ORCH_WEB_ALLOW_TERM=1 + node-pty). */
     term: null,
+    /** `$skill` / `/command` / `@[session]` catalog, built by the daemon. */
+    catalog: null,
+    /** Group list + sessions from the last `@` popup. */
+    mentions: null,
   };
 
   const $ = (s) => document.querySelector(s);
@@ -587,7 +638,11 @@
       store.groups = data.groups;
       // Asked once per refresh; a daemon without terminals just says so.
       void termAvailable();
+      // Keep the open session's row current so a mention's group resolves and
+      // the header's state is right even while the transcript stream ticks.
+      if (store.id) store.row = store.rows.find((r) => r.id === store.id) || store.row;
       if (!store.id) renderList();
+      else completion.refresh();
       $("#h1").textContent = "orch";
     } catch (e) {
       if (!store.rows.length) $("#list").textContent = "";
@@ -655,6 +710,7 @@
   function leave() {
     if (!store.id) return;
     dismissSheet();
+    completion.close();
     inFlight.length = 0;
     stopWatch();
     store.id = null;
@@ -950,7 +1006,10 @@
     q.textContent = "";
     if (pending?.length) {
       q.classList.remove("hidden");
-      q.append(el("div", "who", `queued (${pending.length})`));
+      // Say WHY it is waiting. "waiting for a free agent slot" was the only
+      // wording before, shown for every reason -- including a run held by
+      // another process, which no amount of capacity would fix.
+      q.append(el("div", "who", `queued (${pending.length})${queueSuffix(row)}`));
       pending.forEach((text, i) => {
         const item = el("div", "item");
         item.append(el("span", null, text.replace(/\s+/g, " ")));
@@ -974,7 +1033,28 @@
     const send = $("#send");
     const busy = row.state === "working" || row.state === "queued";
     send.textContent = busy ? "Queue" : "Send";
+    send.title = busy ? busyHint(row) : "";
     if (atBottom) log.scrollTop = log.scrollHeight;
+  }
+
+  /**
+   * The reason a queued message has not started, in the user's terms.
+   *
+   * Only `slot` is a capacity problem. `writer` means another live pi holds the
+   * session and will run it when it is done; `running` is this agent's own run
+   * still in flight. Conflating them made an idle session look capacity-blocked.
+   */
+  function queueSuffix(row) {
+    if (row.queueReason === "slot") return " — waiting for a free slot";
+    if (row.queueReason === "writer") return " — another pi is running it";
+    if (row.queueReason === "running") return " — after this run";
+    return "";
+  }
+
+  function busyHint(row) {
+    if (row.queueReason === "slot") return "All agent slots are busy; this will start when one frees";
+    if (row.queueReason === "writer") return "Another pi process is running this session; your message runs after it";
+    return "Working — your message will run after this turn";
   }
 
   // Messages sent but not yet echoed back in the transcript. The server reads
@@ -1007,6 +1087,7 @@
     const box = $("#input");
     const text = box.value.trim();
     if (!text || !store.id) return;
+    completion.close();
     box.value = "";
     box.style.height = "auto";
     // Show it now; reconcileInFlight removes it once the transcript has it.
@@ -1407,6 +1488,21 @@
         icon: "⟳", label: "Refresh",
         run: () => refresh(),
       });
+      // Skills and commands change when the repo, settings.json or the packages
+      // do. The daemon caches the list for five minutes; this re-reads it now.
+      act(items, {
+        icon: "$", label: "Reload skills & commands",
+        sub: store.catalog
+          ? `${(store.catalog.skills || []).length} skills · ` +
+            `${(store.catalog.commands || []).length} commands`
+          : undefined,
+        run: async () => {
+          store.catalog = null;
+          const data = await loadCatalog(true);
+          toast(`Reloaded: ${(data.skills || []).length} skills, ` +
+            `${(data.commands || []).length} commands`, 4000);
+        },
+      });
       if (store.groups.length) {
         act(items, {
           icon: "▤", label: "Groups",
@@ -1548,6 +1644,378 @@
     });
   }
 
+  // ── composer completions ──────────────────────────────────────────
+  //
+  // The TUI opens a fuzzy list for `$skill`, `/command` and `@[session]` and
+  // inserts a token in place, leaving what you typed intact. The phone should
+  // behave the same way, so this is a small autocomplete over the textarea
+  // rather than a picker that replaces the message.
+  //
+  // Inserted tokens are exactly what the TUI inserts, because both are expanded
+  // on the request side by the same extensions:
+  //   $name        inline-skills expands it on the way to the model
+  //   @[id]        session-mention quotes that transcript, same as the TUI
+  //   /skill:name  pi itself expands it, in a background run or a TUI turn
+  // Every other `/command` is an interactive extension command that a `--mode
+  // json` run does not execute, so those are offered only as a warning.
+
+  const COMPLETION_LIMIT = 30;
+
+  /** Fuzzy subsequence match, ranked: prefix beats word start beats scattered. */
+  function fuzzyScore(text, query) {
+    if (!query) return 0;
+    const t = text.toLowerCase();
+    const q = query.toLowerCase();
+    const direct = t.indexOf(q);
+    if (direct === 0) return 1000 - text.length;
+    if (direct > 0) {
+      const boundary = /[\s:._/-]/.test(t[direct - 1]);
+      return (boundary ? 700 : 400) - direct - text.length / 100;
+    }
+    // Subsequence, with a bonus for each character landing on a boundary.
+    let at = 0;
+    let score = 0;
+    for (const ch of q) {
+      const hit = t.indexOf(ch, at);
+      if (hit < 0) return -1;
+      const boundary = hit === 0 || /[\s:._/-]/.test(t[hit - 1]);
+      score += boundary ? 6 : 1;
+      at = hit + 1;
+    }
+    return score - text.length / 100;
+  }
+
+  /** Rank `items` by `query`; `haystacks` maps an item to what is searchable. */
+  function rank(items, query, haystacks) {
+    if (!query) return items.slice();
+    const scored = [];
+    for (const item of items) {
+      let best = -1;
+      for (const hay of haystacks(item)) {
+        const s = fuzzyScore(hay, query);
+        if (s > best) best = s;
+      }
+      if (best >= 0) scored.push({ item, score: best });
+    }
+    scored.sort((a, b) => b.score - a.score);
+    return scored.map((s) => s.item);
+  }
+
+  async function loadCatalog(force = false) {
+    if (store.catalog && !force) return store.catalog;
+    // The daemon builds the catalog in a one-shot child (pi's own discovery),
+    // which takes a few hundred ms on a cold start. Ask again while that is in
+    // flight instead of caching an empty answer.
+    for (let attempt = 0; attempt < 8; attempt++) {
+      try {
+        const data = await api(`/api/catalog${force && !attempt ? "?refresh=1" : ""}`);
+        if (data.loading && !(data.skills || []).length && !(data.commands || []).length) {
+          await new Promise((r) => setTimeout(r, 350));
+          continue;
+        }
+        store.catalog = data;
+        return data;
+      } catch (e) {
+        store.catalog = { skills: [], prompts: [], commands: [], error: e.message };
+        return store.catalog;
+      }
+    }
+    store.catalog = { skills: [], prompts: [], commands: [], error: "still building" };
+    return store.catalog;
+  }
+
+  /**
+   * Group scope for an `@` token, mirroring the TUI's three triggers:
+   *   `@[`   every session, whatever its group
+   *   `@g[`  this session's group, archived hidden
+   *   `@ga[` this session's group, archived included
+   * The popup's dropdown overrides the trigger for the rest of that token.
+   */
+  function mentionScope(trigger) {
+    if (trigger === "@[") return "all";
+    return trigger === "@ga[" ? "group-archived" : "group";
+  }
+
+  /** Sessions for `@[`, scoped to a group; refreshed per popup, not cached. */
+  async function loadMentions(scope) {
+    const params = new URLSearchParams();
+    if (store.id) params.set("from", store.id);
+    if (scope === "all") params.set("group", "all");
+    else if (scope === "group" || scope === "group-archived") {
+      // `self` is explicit: an ungrouped session must get no rows, not every
+      // row. `@ga[` is the only one that wants archived sessions too.
+      params.set("group", "self");
+      if (scope === "group-archived") params.set("archived", "1");
+    } else if (scope) params.set("group", scope);
+    try {
+      const data = await api(`/api/mentions?${params}`);
+      store.mentions = data;
+      return data;
+    } catch (e) {
+      return { mentions: [], groups: store.mentions?.groups || [], error: e.message };
+    }
+  }
+
+  /**
+   * What the caret is looking at: a `$skill`, a `/command`, or an `@[session]`
+   * token being typed. Returns null when the composer is not in one of those
+   * positions, which is what keeps ordinary typing free of a popup.
+   */
+  function completionContext(box) {
+    const before = box.value.slice(0, box.selectionStart);
+
+    // `/command` is a whole-message thing (pi only expands it at the start).
+    // No trailing-whitespace trim: once you type a space the argument has
+    // begun and the command list must get out of the way.
+    const slash = /^\/([\w:-]*)$/.exec(before);
+    if (slash) return { kind: "command", query: slash[1], start: 0, end: before.length };
+
+    // `$skill` anywhere; unknown names like $HOME are simply not matches.
+    const dollar = /(^|[\s([{<"'`])\$([\w.:-]*)$/.exec(before);
+    if (dollar) {
+      const start = before.length - dollar[2].length - 1;
+      return { kind: "skill", query: dollar[2], start, end: before.length };
+    }
+
+    // `@[query` or `@g[query` / `@ga[query`, mirroring the TUI triggers.
+    const at = /(^|[\s([{<"'`])(@(?:ga|g)?\[)([^\]\n]*)$/.exec(before);
+    if (at) {
+      const start = before.length - at[3].length - at[2].length;
+      return {
+        kind: "mention", trigger: at[2], query: at[3],
+        start, end: before.length,
+      };
+    }
+    return null;
+  }
+
+  /** Replace the token under the caret with `text`, then close the popup. */
+  function applyCompletion(box, ctx, text) {
+    const before = box.value.slice(0, ctx.start);
+    const tail = box.value.slice(ctx.end);
+    const needsSpace = !/^[\s\]]/.test(tail);
+    const insert = needsSpace ? `${text} ` : text;
+    box.value = before + insert + tail;
+    const caret = (before + insert).length;
+    box.setSelectionRange(caret, caret);
+    box.dispatchEvent(new Event("input"));
+  }
+
+  const completion = {
+    /** Current rows for the open popup, so ↑/↓/Enter can act without a query. */
+    items: [],
+    index: 0,
+    ctx: null,
+    scope: null,
+    seq: 0,
+    quiet: false,
+
+    close() {
+      const pop = $("#comp");
+      if (pop) { pop.classList.add("hidden"); pop.textContent = ""; }
+      completion.items = [];
+      completion.index = 0;
+      completion.ctx = null;
+      // The group picker is per-popup: a fresh `@[` goes back to its trigger's
+      // scope instead of inheriting the last choice.
+      completion.scope = null;
+    },
+
+    /** Re-run the current query (after the catalog or rows changed). */
+    refresh() {
+      if (completion.ctx && !completion.quiet) void completion.update();
+    },
+
+    async update() {
+      const box = $("#input");
+      const ctx = completionContext(box);
+      if (!ctx) return completion.close();
+      // A dropdown choice belongs to the token it was made for: retyping `@[`
+      // as `@g[` is asking a different question.
+      if (completion.ctx && ctx.kind === "mention" &&
+          completion.ctx.trigger !== ctx.trigger && ctx.query === "") {
+        completion.scope = null;
+      }
+      if (completion.ctx && ctx.kind !== "mention") completion.scope = null;
+      completion.ctx = ctx;
+      completion.seq += 1;
+      const seq = completion.seq;
+
+      let items = [];
+      let title = "";
+      let empty = "";
+      let completedScope = null;
+
+      if (ctx.kind === "skill") {
+        const catalog = await loadCatalog();
+        const skills = catalog.skills || [];
+        const matched = rank(skills, ctx.query, (s) => [s.name, s.description || ""]);
+        items = matched.slice(0, COMPLETION_LIMIT).map((s) => ({
+          name: `$${s.name}`,
+          desc: s.description || "",
+          insert: `$${s.name}`,
+        }));
+        title = "Skills";
+        empty = catalog.error
+          ? "Skill list unavailable"
+          : skills.length ? "No matching skill" : "No skills configured";
+      } else if (ctx.kind === "command") {
+        const catalog = await loadCatalog();
+        const commands = catalog.commands || [];
+        const prompts = catalog.prompts || [];
+        // Ranked together, so an exact name wins over a description substring.
+        const scored = [];
+        for (const c of commands) {
+          const s = Math.max(...[c.name, c.description || ""].map((h) => fuzzyScore(h, ctx.query)));
+          if (s < 0) continue;
+          scored.push({
+            name: `/${c.name}`,
+            desc: c.description || "",
+            // `/skill:name` is expanded by pi itself in any mode. Every other
+            // registered command runs with `ctx.mode === "json"` in a
+            // background child, and pi-kit's handlers all require "tui", so
+            // they are listed for parity but do nothing there.
+            insert: `/${c.name}`,
+            warn: !c.executesInRun,
+            score: s,
+          });
+        }
+        for (const p of prompts) {
+          const s = Math.max(...[p.name, p.description || ""].map((h) => fuzzyScore(h, ctx.query)));
+          if (s < 0) continue;
+          scored.push({
+            name: `/${p.name}`,
+            desc: p.description || p.argumentHint || "prompt template",
+            insert: `/${p.name}`,
+            score: s,
+          });
+        }
+        scored.sort((a, b) => b.score - a.score);
+        items = scored.slice(0, COMPLETION_LIMIT);
+        title = "Commands";
+        empty = catalog.error
+          ? "Command list unavailable"
+          : commands.length || prompts.length ? "No matching command" : "No commands configured";
+      } else {
+        completedScope = completion.scope || mentionScope(ctx.trigger);
+        const data = await loadMentions(completedScope);
+        const mentions = data.mentions || [];
+        const matched = rank(mentions, ctx.query,
+          (m) => [m.label, m.dir, m.groupName || "", m.id]);
+        items = matched.slice(0, COMPLETION_LIMIT).map((m) => ({
+          name: m.label,
+          desc: [m.dir, m.groupName, ago(m.modified)].filter(Boolean).join(" · "),
+          insert: m.value,
+          value: m.value,
+        }));
+        title = "Sessions";
+        // `@g[` on an ungrouped session returns no rows on purpose; say why.
+        empty = data.error
+          ? "Session list unavailable"
+          : mentions.length ? "No matching session"
+          : completedScope.startsWith("group") && !data.fromGroup
+            ? "This session is ungrouped — pick a group or All sessions"
+            : completedScope.startsWith("group")
+              ? "No other sessions in this group"
+              : "No other sessions";
+      }
+
+      if (seq !== completion.seq) return; // a newer keystroke won
+      if (!items.length) {
+        completion.items = [];
+        completion.index = 0;
+        completion.render([], title, empty, ctx, completedScope);
+        return;
+      }
+      completion.items = items;
+      completion.index = 0;
+      // `render` needs the scope the rows were fetched for, so the dropdown
+      // shows the applied filter rather than the trigger that started it.
+      completion.render(items, title, empty, ctx, completedScope);
+    },
+
+    render(items, title, empty, ctx, completedScope) {
+      const pop = $("#comp");
+      if (!pop) return;
+      pop.textContent = "";
+      pop.classList.remove("hidden");
+
+      const head = el("div", "head");
+      head.append(el("span", null, title));
+      const where = el("span", "scope");
+      if (ctx.kind === "mention") {
+        where.textContent = title === "Sessions" ? "@" : "";
+        head.append(where);
+        // Pick the group filter (`@g[` in the TUI) without retyping the token.
+        const sel = el("select");
+        sel.append(new Option("This group", "group"));
+        sel.append(new Option("This group + archived", "group-archived"));
+        sel.append(new Option("All sessions", "all"));
+        const groups = store.mentions?.groups || [];
+        for (const g of groups) sel.append(new Option(g.name, g.id));
+        sel.value = completedScope || mentionScope(ctx.trigger);
+        sel.onchange = async () => {
+          completion.scope = sel.value;
+          await completion.update();
+        };
+        head.append(sel);
+      } else {
+        where.textContent = items.length ? `${items.length} match` : empty;
+        head.append(where);
+      }
+      pop.append(head);
+
+      const list = el("div", "items");
+      if (!items.length) {
+        list.append(el("div", "item none", empty));
+      }
+      const rows = [];
+      items.forEach((item, i) => {
+        const n = el("div", "item" + (i === completion.index ? " sel" : ""));
+        n.append(el("span", "name", item.name));
+        if (item.desc) n.append(el("span", "desc", item.desc));
+        // mousedown, not click: the textarea must not lose the caret and the
+        // whole popup is rebuilt on the next keystroke.
+        n.addEventListener("mousedown", (e) => {
+          e.preventDefault();
+          completion.choose(i);
+        });
+        list.append(n);
+        rows.push(n);
+      });
+      completion.rows = rows;
+      pop.append(list);
+
+      // A failed/slow catalog is worth one line of explanation, not a popup.
+      if (!items.length && ctx.kind !== "mention") {
+        setTimeout(() => { if (completion.ctx === ctx) completion.close(); }, 1400);
+      }
+    },
+
+    move(delta) {
+      if (!completion.items.length) return;
+      const n = completion.items.length;
+      completion.index = (completion.index + delta + n) % n;
+      (completion.rows || []).forEach((n2, i) => {
+        n2.classList.toggle("sel", i === completion.index);
+      });
+      const sel = (completion.rows || [])[completion.index];
+      if (sel && sel.scrollIntoView) sel.scrollIntoView({ block: "nearest" });
+    },
+
+    choose(index = completion.index) {
+      const item = completion.items[index];
+      const ctx = completion.ctx;
+      const box = $("#input");
+      if (!item || !ctx) return;
+      if (item.warn) {
+        toast("Interactive-only command: it will run here but do nothing", 4200);
+      }
+      applyCompletion(box, ctx, item.insert);
+      completion.close();
+    },
+  };
+
   // ── wiring ────────────────────────────────────────────────────────
   $("#back").onclick = close;
   $("#refresh").onclick = refresh;
@@ -1559,11 +2027,58 @@
   // has no reason to be destructive. Cmd/Ctrl+Enter keeps a keyboard send for
   // a desktop, where reaching for the button is the slower path.
   $("#input").addEventListener("keydown", (e) => {
+    // The completion popup owns the navigation keys while it is open, so ↑/↓/Tab
+    // pick an entry instead of moving the caret or leaving the field.
+    if (completion.items.length && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      if (e.key === "ArrowDown") { e.preventDefault(); completion.move(1); return; }
+      if (e.key === "ArrowUp") { e.preventDefault(); completion.move(-1); return; }
+      if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+        e.preventDefault();
+        completion.choose();
+        return;
+      }
+      if (e.key === "Escape") { e.preventDefault(); completion.close(); return; }
+    }
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       submit();
     }
   });
+  // Typing and caret moves keep the popup in step with the token under the
+  // caret. `input` covers deletion and pasting too, so the popup cannot be left
+  // showing a query it was not built from.
+  const refreshCompletion = () => { void completion.update(); };
+  $("#input").addEventListener("input", refreshCompletion);
+  $("#input").addEventListener("click", refreshCompletion);
+  $("#input").addEventListener("keyup", (e) => {
+    if (/^(ArrowLeft|ArrowRight|Home|End)$/.test(e.key)) refreshCompletion();
+  });
+  $("#input").addEventListener("blur", () => {
+    // Delay so a tap on a popup row still lands (rows use mousedown and
+    // preventDefault, but Safari fires blur first on some versions).
+    setTimeout(() => {
+      if (document.activeElement !== $("#input")) completion.close();
+    }, 120);
+  });
+  // iOS keyboards have no useful Tab, so the popup is opened with a button
+  // instead of a key: `$`, `/` and `@` are one tap each on the composer itself.
+  for (const [id, token] of [["pickSkill", "$"], ["pickCmd", "/"], ["pickAt", "@["]]) {
+    const b = $("#" + id);
+    if (!b) continue;
+    b.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      const box = $("#input");
+      // pi only expands a `/command` at the very start of a message, so that
+      // button puts the slash there instead of at the caret.
+      const at = token === "/" ? 0 : box.selectionStart;
+      const end = token === "/" ? at : box.selectionEnd;
+      box.value = box.value.slice(0, at) + token + box.value.slice(end);
+      const caret = at + token.length;
+      box.setSelectionRange(caret, caret);
+      box.focus();
+      box.dispatchEvent(new Event("input"));
+    });
+  }
   // Tapping the transcript dismisses the keyboard, so reading back through a
   // long answer does not leave the composer covering half the screen.
   //
