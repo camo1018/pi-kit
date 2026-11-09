@@ -64,7 +64,7 @@ First connection triggers a macOS firewall prompt for `node` — **Allow**.
 | Send | type, then tap **Send** (or Cmd/Ctrl+Enter); becomes **Queue** while that session is running |
 | Newline | **Enter** in the composer |
 | Dismiss the keyboard | tap anywhere in the transcript |
-| See what's queued | the queue strip above the composer: **now** / **✕** per item |
+| See what's queued | the queue strip above the composer: **now** / **✕** per item, plus why it is waiting (see below) |
 | Start an agent | **＋** in the header (prompt, directory, group, model) |
 | Groups | **☰** → Groups |
 | Insert a skill | `$` — the popup opens as you type (`$graf` → `$grafana`) |
@@ -76,6 +76,23 @@ First connection triggers a macOS firewall prompt for `node` — **Allow**.
 
 Status dots: `●` working · `◆` your turn · `✗` error · `⚠` stalled (run was cut
 off) · `⏸` aborted.
+
+### Why a message queues
+
+The composer says **Queue** instead of **Send** for three different reasons, and
+the queue strip names which one. Only the first is about capacity:
+
+| Queue strip says | Meaning |
+|---|---|
+| `queued (1) — after this run` | This session's own run is still in flight. Normal. |
+| `queued (1) — waiting for a free slot` | All `PI_INBOX_MAX_AGENTS` slots are busy. Rarely what you hit. |
+| `queued (1) — another pi is running it` | A different live pi process holds this session. It runs when that process finishes. |
+
+Rows carry this as `queueReason` (`running` / `slot` / `writer`), so the phone
+never claims "no free agent slot" for something capacity cannot fix. A live
+record whose pid is gone is treated as finished and deleted, not trusted
+because this daemon happened to spawn it — that stale record used to make an
+idle session read as busy for up to five minutes.
 
 ### Composer completions
 

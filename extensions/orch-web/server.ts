@@ -824,11 +824,17 @@ function readLive(): Map<string, LiveRecord> {
 		const full = path.join(LIVE_DIR, f);
 		try {
 			const rec = JSON.parse(fs.readFileSync(full, "utf-8")) as LiveRecord;
-			const ours =
-				rec.pid === process.pid ||
-				rec.bgParent === process.pid ||
-				listAgents().some((a) => a.pid === rec.pid);
-			if (!ours && !pidAlive(rec.pid)) {
+			// A live record is a CLAIM about a pid: "this process is running this
+			// session right now". The claim is over when the pid is gone, no matter
+			// who spawned it. `ours` used to skip the liveness check entirely for
+			// this daemon's own children (`bgParent === process.pid`), so a child
+			// that had already exited kept reporting `working` until the 5-minute
+			// STUCK_AFTER_MS cutoff -- which made an unrelated idle session read as
+			// busy, disabled its Send button into Queue, and blocked its run behind
+			// the cross-process writer gate. Only a pid this daemon is actually
+			// tracking (`listAgents()`) may vouch for a record without being alive.
+			const tracked = listAgents().some((a) => a.pid === rec.pid);
+			if (!tracked && !pidAlive(rec.pid)) {
 				fs.rmSync(full, { force: true });
 				continue;
 			}
@@ -856,6 +862,13 @@ interface Row {
 	cwd: string;
 	status: string;
 	state?: BgAgent["state"];
+	/**
+	 * Why this row's queued work has not started. Only `slot` is a capacity
+	 * problem; `writer` means another live process holds the session, and
+	 * `running` means its own run is simply still in flight. Absent when nothing
+	 * is waiting.
+	 */
+	queueReason?: "running" | "slot" | "writer";
 	live?: boolean;
 	livePid?: number;
 	stuckMin?: number;
@@ -914,6 +927,27 @@ function busyState(a: BgAgent | undefined, live?: LiveRecord) {
 	return undefined;
 }
 
+/**
+ * Why a row's queued message has not started.
+ *
+ * "queued" used to be one word for three unrelated situations, and every
+ * surface reported all of them as "waiting for a free agent slot". Only a full
+ * concurrency budget is that: a run held by another live process is not, and
+ * neither is this agent's own run still being in flight.
+ */
+function queueReasonFor(
+	a: BgAgent | undefined,
+	live?: LiveRecord,
+): Row["queueReason"] {
+	if (live?.state === "working" && !a?.proc) return "writer";
+	if (!a?.pending.length) return undefined;
+	// The daemon's own cap, read once per process.
+	if (a.proc || a.hold) return "running";
+	const running = listAgents().filter((x) => x.proc).length;
+	if (running >= MAX_CONCURRENT) return "slot";
+	return undefined;
+}
+
 export function buildRows(opts: {
 	currentId?: string;
 	withArchived?: boolean;
@@ -953,6 +987,7 @@ export function buildRows(opts: {
 			cwd: h.cwd,
 			status: tail.status,
 			state,
+			queueReason: queueReasonFor(bg, liveRec),
 			live: !!liveRec,
 			livePid: liveRec?.pid,
 			stuckMin: liveRec?.stuckMin,
@@ -987,6 +1022,7 @@ export function buildRows(opts: {
 			cwd: a.cwd,
 			status: "empty",
 			state: busyState(a),
+			queueReason: queueReasonFor(a),
 			live: true,
 			livePid: a.pid,
 			model: a.model ?? a.nextModel,
