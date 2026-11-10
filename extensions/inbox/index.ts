@@ -61,6 +61,12 @@ import {
 } from "./families.ts";
 import { promptAutocomplete } from "../../lib/prompt-autocomplete.ts";
 import {
+	type CacheEntry,
+	type CachedRecord,
+	fromEntry,
+	toEntry,
+} from "./cache-entry.ts";
+import {
 	dirReusable,
 	pruneCacheByPath,
 	sameStamp,
@@ -1574,46 +1580,19 @@ interface ScanPartition {
  * it is validated entry by entry against the file stamps, dropped wholesale if its version or
  * shape is wrong, and never written on a read-only path.
  */
-interface CachedInfo {
-	mtimeMs: number;
-	size: number;
-	info: SessionInfo;
-	/** Running totals, so the next change folds in only the new bytes. */
-	tally: SessionTally;
-}
-const infoCache = new Map<string, CachedInfo>();
+const infoCache = new Map<string, CachedRecord>();
 const INFO_CACHE_PATH = path.join(AGENT_DIR, "inbox-session-cache.json");
-// v2 adds the tally. A v1 file is simply discarded (one cold parse) rather than
-// migrated, since a wrong tally resumes from the wrong offset and corrupts counts.
-const INFO_CACHE_VERSION = 2;
+// v2 added the tally. v3 stops storing three copies of the same text (see
+// cache-entry.ts) and drops resume state for sessions old enough that it cannot
+// pay for itself: 26MB -> ~12MB for 788 sessions here. A v2 file is discarded
+// rather than migrated, and for the same reason a v1 file was: an entry written
+// by a different shape may resume from a wrong offset, and one cold parse is a
+// far better failure than wrong counts.
+const INFO_CACHE_VERSION = 3;
 
 interface InfoCacheFile {
 	version: number;
-	entries: Record<string, {
-		mtimeMs: number;
-		size: number;
-		info: any;
-		tally?: SessionTally;
-	}>;
-}
-
-/** Parse-time `Date` fields, which JSON round-trips as strings. */
-function reviveInfo(raw: any): SessionInfo | undefined {
-	if (!raw || typeof raw !== "object") return undefined;
-	if (typeof raw.path !== "string" || typeof raw.id !== "string") return undefined;
-	const created = new Date(raw.created);
-	const modified = new Date(raw.modified);
-	if (Number.isNaN(created.getTime()) || Number.isNaN(modified.getTime()))
-		return undefined;
-	return {
-		...raw,
-		cwd: typeof raw.cwd === "string" ? raw.cwd : "",
-		created,
-		modified,
-		messageCount: Number(raw.messageCount) || 0,
-		firstMessage: typeof raw.firstMessage === "string" ? raw.firstMessage : "(no messages)",
-		allMessagesText: typeof raw.allMessagesText === "string" ? raw.allMessagesText : "",
-	};
+	entries: Record<string, CacheEntry>;
 }
 
 let infoCacheLoaded = false;
@@ -1631,17 +1610,17 @@ function loadInfoCache(): void {
 	}
 	if (data?.version !== INFO_CACHE_VERSION || !data.entries) return;
 	for (const [key, entry] of Object.entries(data.entries)) {
-		const info = reviveInfo(entry?.info);
-		if (!info) continue;
-		if (typeof entry.mtimeMs !== "number" || typeof entry.size !== "number") continue;
-		// A persisted entry without a tally cannot be resumed from; dropping it just
-		// means one full parse of that file, never a wrong one.
-		if (!entry.tally || typeof entry.tally.offset !== "number") continue;
+		const record = fromEntry(entry);
+		if (!record) continue;
+		// Nothing used to drop these, so an entry for a deleted session outlived
+		// every restart and deleting sessions never shrank the cache. The file is
+		// already gone, so evicting its entry loses nothing.
+		if (!fs.existsSync(key)) continue;
 		infoCache.set(key, {
-			mtimeMs: entry.mtimeMs,
-			size: entry.size,
-			info,
-			tally: entry.tally,
+			mtimeMs: record.mtimeMs,
+			size: record.size,
+			info: record.info,
+			tally: record.tally,
 		});
 	}
 }
@@ -1663,8 +1642,16 @@ function saveInfoCache(force = false): void {
 	infoCacheFlushedAt = Date.now();
 	try {
 		const entries: InfoCacheFile["entries"] = {};
-		for (const [key, { mtimeMs, size, info, tally }] of infoCache)
-			entries[key] = { mtimeMs, size, info, tally };
+		// The cache must describe the filesystem, not the other way round: an entry
+		// whose session file was deleted is dropped rather than resurrected.
+		const now = Date.now();
+		for (const [key, record] of infoCache) {
+			if (!fs.existsSync(key)) {
+				infoCache.delete(key);
+				continue;
+			}
+			entries[key] = toEntry(record, now);
+		}
 		const tmp = `${INFO_CACHE_PATH}.${process.pid}.tmp`;
 		const body: InfoCacheFile = { version: INFO_CACHE_VERSION, entries };
 		fs.mkdirSync(AGENT_DIR, { recursive: true });
