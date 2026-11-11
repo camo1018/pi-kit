@@ -144,9 +144,63 @@ function escaped(text: string): string {
 		.replace(/"/g, "&quot;");
 }
 
+/**
+ * The immutable part of a worker record: what `parents()` and the ownership
+ * checks need, and nothing that `spawn` ever changes afterwards.
+ *
+ * Split out so the directory can be indexed without parsing record bodies.
+ * `spawn` is the only writer and every field here is set at creation, so an
+ * entry can be cached without risking staleness on a field that later moves.
+ */
+export interface WorkerIdentity {
+	id: string;
+	parentId: string;
+	createdAt: number;
+	ownerPid?: number;
+	ownerToken?: string;
+}
+
+/** Bumped only if the on-disk index shape changes; a mismatch forces a rebuild. */
+const INDEX_VERSION = 1;
+
+/** One live record for a session, resolved to a live owning pid. */
+interface LiveEntry {
+	sessionId: string;
+	state: "working" | "idle";
+	pid: number;
+	updated: number;
+}
+
+/**
+ * Every live record naming one session, plus any record we could not attribute.
+ *
+ * Kept as a LIST, not one "freshest" choice: our own record and a foreign one
+ * can name the same session, and collapsing them to the newest lets our own
+ * (usually newer) idle record shadow a foreign `working` one -- which reads as
+ * settled while another process is genuinely running the session.
+ */
+interface LiveSlots {
+	entries: LiveEntry[];
+	/** A record that names its session but cannot be trusted. */
+	error?: string;
+}
+
 /** Independent immutable files prevent sibling note writers losing updates. */
 export class WorkerTeam {
 	readonly root: string;
+	/**
+	 * One-sweep worker index. Only populated inside `batch()`, so a caller
+	 * outside it always reads the directory fresh.
+	 */
+	private snap?: Map<string, Worker[]>;
+	/**
+	 * Live records for this batch, keyed by session id. Also batch-scoped.
+	 * A record that cannot be trusted is kept as `error` against the session it
+	 * names, so only THAT session is refused -- see `liveEntry`.
+	 */
+	private liveSnap?: Map<string, LiveSlots>;
+	/** Bucketed identity index for the current validated stamp. */
+	private buckets?: { key: string; by: Map<string, WorkerIdentity[]> };
 
 	constructor(
 		readonly agentDir: string,
@@ -264,8 +318,10 @@ export class WorkerTeam {
 		// Worker records are never pruned, so they still answer after a reply
 		// clears the arm. Without this, an idle reply dropped `ownerPid` and the
 		// team was owned by nobody until the next spawn.
+		// Identity only: ownership is decided by `ownerPid`/`ownerToken`, which the
+		// index carries, so this needs no record bodies.
 		if (
-			this.workers(id).some((w) =>
+			this.identities(id).some((w) =>
 				isOwnProcess(w.ownerPid, w.ownerToken),
 			)
 		) {
@@ -363,7 +419,7 @@ export class WorkerTeam {
 		const seen: number[] = [];
 		const arm = readWakeArm(this.stateDir, id);
 		if (arm?.ownerPid !== undefined) seen.push(arm.ownerPid);
-		for (const worker of this.workers(id)) {
+		for (const worker of this.identities(id)) {
 			if (worker.ownerPid !== undefined) seen.push(worker.ownerPid);
 		}
 		const saved = this.saved(id)?.owner;
@@ -374,16 +430,186 @@ export class WorkerTeam {
 
 	/** Every parent that currently owns at least one worker record. */
 	parents(): string[] {
-		const seen = new Set<string>();
-		for (const name of names(path.join(this.root, "workers"))) {
+		return [...this.identityBuckets().keys()];
+	}
+
+	/** Worker identities for one parent, derived from the same index. */
+	identities(parentId: string): WorkerIdentity[] {
+		return this.identityBuckets().get(parentId) ?? [];
+	}
+
+	/**
+	 * The bucketed index for the current call sequence.
+	 *
+	 * Memoised on the validated stamp, not just the parsed records: the sweep
+	 * asks once per parent, so re-bucketing on every call made a loop over 35
+	 * teams cost 35 sorts of the same 150 entries.
+	 */
+	private identityBuckets(): Map<string, WorkerIdentity[]> {
+		// A batch observes one moment, so validate once and reuse. Without this
+		// the sweep re-statted and re-listed the directory for every parent.
+		if (this.buckets && this.snap) return this.buckets.by;
+		const dir = path.join(this.root, "workers");
+		let stamp = "missing";
+		let fileNames: string[] = [];
+		try {
+			const st = fs.statSync(dir);
+			stamp = `${st.mtimeMs}:${st.ctimeMs}`;
+			fileNames = fs.readdirSync(dir).filter((n) => n.endsWith(".json"));
+		} catch {
+			// No directory: nothing to index.
+		}
+		const key = `${stamp}|${fileNames.length}`;
+		if (this.buckets?.key === key) return this.buckets.by;
+		const cached = this.readIndex(stamp, fileNames);
+		const entries = cached ?? this.rebuildIndex(fileNames);
+		if (!cached) this.writeIndex(stamp, fileNames, entries);
+		const by = this.bucket(entries);
+		this.buckets = { key, by };
+		return by;
+	}
+
+	/**
+	 * Path of the worker directory's index. A SIBLING of `workers/`, never an
+	 * entry inside it: the index is validated against that directory's stamp, so
+	 * writing the index into the directory would move the stamp it is checking
+	 * and invalidate itself on every write.
+	 */
+	private get indexFile(): string {
+		return path.join(this.root, "workers-index.json");
+	}
+
+	/**
+	 * Read the worker directory ONCE and cache only its identity fields.
+	 *
+	 * `parents()` and the ownership checks need `parentId`, `createdAt`,
+	 * `ownerPid` and `ownerToken` -- all set at creation and never changed. The
+	 * record bodies carry `title`/`cwd`/`extensionPath`, which no sweep reads.
+	 * Reading them anyway meant every sweep parsed every record: 150 files and
+	 * 150 opens per tick, growing linearly for the life of the install.
+	 *
+	 * This is a persistent no-stat read: a validated index costs one stat and one
+	 * parse regardless of record count, instead of a stat per record.
+	 *
+	 * SAFETY. The index is trusted only when BOTH hold:
+	 *
+	 *  1. Its stamp matches `workers/` exactly. `writeJson` creates records with
+	 *     tmp+rename, and create/rename/delete all move a directory's mtime --
+	 *     verified, and unlike an in-place rewrite, which does NOT (that is the
+	 *     trap that made a stamp cache wrong for record BODIES).
+	 *  2. Its file list matches the directory exactly. This is what catches an
+	 *     editing writer that rewrote a record in place: the stamp would not move
+	 *     but the SET of files is unchanged too, so a body edit stays invisible --
+	 *     which is fine, because bodies are not cached here. A create or delete,
+	 *     the cases that DO change identity, cannot hide from the file list.
+	 *
+	 * Anything else falls back to a full rebuild, so a stale or unreadable index
+	 * costs work, never correctness.
+	 */
+	private identityIndex(): Map<string, WorkerIdentity[]> {
+		const dir = path.join(this.root, "workers");
+		let stamp = "missing";
+		let fileNames: string[] = [];
+		try {
+			const st = fs.statSync(dir);
+			stamp = `${st.mtimeMs}:${st.ctimeMs}`;
+			fileNames = fs.readdirSync(dir).filter((n) => n.endsWith(".json"));
+		} catch {
+			// No directory: nothing to index.
+		}
+
+		const cached = this.readIndex(stamp, fileNames);
+		if (cached) return this.bucket(cached);
+
+		const entries = this.rebuildIndex(fileNames);
+		this.writeIndex(stamp, fileNames, entries);
+		return this.bucket(entries);
+	}
+
+	private readIndex(
+		stamp: string,
+		fileNames: string[],
+	): WorkerIdentity[] | undefined {
+		let raw: unknown;
+		try {
+			raw = JSON.parse(fs.readFileSync(this.indexFile, "utf8"));
+		} catch {
+			return undefined;
+		}
+		const index = raw as {
+			v?: number;
+			stamp?: string;
+			files?: string[];
+			records?: WorkerIdentity[];
+		};
+		if (index?.v !== INDEX_VERSION) return undefined;
+		if (index.stamp !== stamp) return undefined;
+		if (!Array.isArray(index.files) || !Array.isArray(index.records)) {
+			return undefined;
+		}
+		// The file names ARE the identity set, so a cheap count comparison catches
+		// a stamp that under-reports. mtime has limited resolution: two mutations
+		// inside one tick can leave the stamp looking unchanged, and then a stale
+		// index would hide a brand-new team from the sweep. Comparing counts is
+		// O(1) versus the sort this used to do, and it closes that window for
+		// create/delete. A same-count swap still needs the stamp, so keep both.
+		if (index.files.length !== fileNames.length) return undefined;
+		if (index.records.length !== fileNames.length) return undefined;
+		return index.records;
+	}
+
+	/** One directory pass, identity fields only. */
+	private rebuildIndex(fileNames: string[]): WorkerIdentity[] {
+		const dir = path.join(this.root, "workers");
+		const out: WorkerIdentity[] = [];
+		for (const name of fileNames) {
 			try {
 				const worker = this.worker(name.slice(0, -5));
-				if (worker) seen.add(worker.parentId);
+				if (!worker) continue;
+				out.push({
+					id: worker.id,
+					parentId: worker.parentId,
+					createdAt: worker.createdAt,
+					ownerPid: worker.ownerPid,
+					ownerToken: worker.ownerToken,
+				});
 			} catch {
-				// A malformed record must not hide every other team.
+				// A malformed record must not hide every other team. Leaving it out
+				// of the index keeps the pre-existing behaviour, where one bad file
+				// was skipped rather than failing the whole directory.
 			}
 		}
-		return [...seen];
+		return out;
+	}
+
+	private writeIndex(
+		stamp: string,
+		fileNames: string[],
+		records: WorkerIdentity[],
+	): void {
+		try {
+			writeJson(this.indexFile, {
+				v: INDEX_VERSION,
+				stamp,
+				files: fileNames,
+				records,
+			});
+		} catch {
+			// A read-only or full disk must not break a read path.
+		}
+	}
+
+	private bucket(entries: WorkerIdentity[]): Map<string, WorkerIdentity[]> {
+		const by = new Map<string, WorkerIdentity[]>();
+		for (const entry of entries) {
+			const list = by.get(entry.parentId) ?? [];
+			list.push(entry);
+			by.set(entry.parentId, list);
+		}
+		for (const list of by.values()) {
+			list.sort((a, b) => a.createdAt - b.createdAt);
+		}
+		return by;
 	}
 
 	/** Path for the inbox-managed per-session sidecar files (`<id>.*`). */
@@ -392,13 +618,66 @@ export class WorkerTeam {
 	}
 
 	workers(id: string): Worker[] {
-		const parentId = this.parent(id);
-		return names(path.join(this.root, "workers"))
-			.map((name) => this.worker(name.slice(0, -5)))
-			.filter(
-				(item): item is Worker => !!item && item.parentId === parentId,
-			)
-			.sort((a, b) => a.createdAt - b.createdAt);
+		return this.byParent().get(this.parent(id)) ?? [];
+	}
+
+	/**
+	 * Read the worker records once for the duration of `fn`.
+	 *
+	 * `workers()` used to readdir the directory and parse EVERY record on every
+	 * call, then discard all but one parent's. The wake sweep is its hot caller
+	 * and asks once per parent, so 150 records across 35 teams cost 5,250 parses
+	 * per sweep -- ~345ms of synchronous work on the TUI event loop, once from
+	 * the 5s supervisor tick and again from each debounced agent event during a
+	 * run. A sweep only needs the directory to be read once.
+	 *
+	 * Deliberately NOT keyed on the directory stamp. Worker records are rewritten
+	 * in place in places (tests and any resaved record), which does not move the
+	 * directory mtime, so a stamp-keyed cache goes stale exactly when a record
+	 * changes. Scoping the reuse to one sweep keeps the read authoritative.
+	 */
+	batch<T>(fn: () => T): T {
+		if (this.snap) return fn();
+		this.snap = this.readByParent();
+		// Live records are small in count (one per running pi) but were re-read
+		// once per worker: 150 workers x 4 records = 600 parses per sweep. Batch
+		// scope is enough because a sweep is meant to observe ONE moment anyway.
+		this.liveSnap = this.readLiveBySession();
+		// A batch is one observation: validate the identity index once for its
+		// duration, then forget it so the next batch sees any intervening write.
+		this.buckets = undefined;
+		try {
+			return fn();
+		} finally {
+			this.snap = undefined;
+			this.liveSnap = undefined;
+			this.buckets = undefined;
+		}
+	}
+
+	/** Worker records bucketed by parent. Reused inside `batch()`. */
+	private byParent(): Map<string, Worker[]> {
+		return this.snap ?? this.readByParent();
+	}
+
+	private readByParent(): Map<string, Worker[]> {
+		const dir = path.join(this.root, "workers");
+		const by = new Map<string, Worker[]>();
+		for (const name of names(dir)) {
+			try {
+				const worker = this.worker(name.slice(0, -5));
+				if (!worker) continue;
+				const list = by.get(worker.parentId) ?? [];
+				list.push(worker);
+				by.set(worker.parentId, list);
+			} catch {
+				// A malformed record must not hide every other team.
+			}
+		}
+		for (const list of by.values()) {
+			list.sort((a, b) => a.createdAt - b.createdAt);
+		}
+		return by;
 	}
 
 	requireWorker(caller: string, target: string): Worker {
@@ -650,74 +929,113 @@ export class WorkerTeam {
 		return worker;
 	}
 
-	private foreground(id: string) {
-		const local = this.runner.get(id);
+	/**
+	 * The freshest live record per session, read once per batch.
+	 *
+	 * Returns a Map when batch-scoped, and reads fresh otherwise. `foreground()`
+	 * consults this for every worker, so without batching a sweep re-read and
+	 * re-parsed the whole live directory once per worker record.
+	 */
+	private liveBySession(): Map<string, LiveSlots> {
+		return this.liveSnap ?? this.readLiveBySession();
+	}
+
+	private readLiveBySession(): Map<string, LiveSlots> {
+		const by = new Map<string, LiveSlots>();
 		const dir = path.join(this.agentDir, "inbox-live");
-		// Several live records can name one session: an orphan left mid-turn by a
-		// closed tab, plus the run that reopened it. `readdirSync` orders by
-		// filename (pid), NOT by time, so returning the first match lets a stale
-		// `idle` record from a replaced pid shadow the live `working` run. That is
-		// a false settle, and it is what woke a team while both its workers were
-		// still running. Trust the freshest heartbeat, as the Inbox does.
-		let freshest:
-			| { state: "working" | "idle"; pid: number; updated: number }
-			| undefined;
 		for (const name of names(dir)) {
-			// One unreadable live record must not make EVERY worker unplaceable.
-			// `readJson` throws on malformed JSON, and this loop runs for each
-			// worker, so a single truncated file from an unrelated session used to
-			// turn the whole team into `unknown` -- the path that produced a false
-			// wake. A file we cannot parse tells us nothing about THIS session, so
-			// skip it; the record for the session we asked about is unlikely to be
-			// the broken one, and if it is, `unknown` is the honest answer anyway.
-			let live: {
-				sessionId?: string;
-				pid?: number;
-				state?: "working" | "idle";
-				updated?: number;
-			} | undefined;
-			try {
-				live = readJson(path.join(dir, name)) as typeof live;
-			} catch {
-				// Unparseable. If the FILE NAME is pids -- and the live-record
-				// convention is `<pid>.json` -- we cannot tell whether it belongs
-				// to the session we are asking about, and assuming it does not is
-				// the unsafe direction: a worker whose own record was caught
-				// mid-write would read as settled and could wake its parent early.
-				// Only a file we can positively attribute elsewhere is skipped.
-				const pid = Number(name.slice(0, -".json".length));
-				if (Number.isSafeInteger(pid) && pid > 0 && pidAlive(pid)) {
-					// Somebody is alive under that pid but the record is corrupt.
-					// Untrustworthy rather than settled.
-					throw new Error("Unreadable live-session record; refusing control");
-				}
-				continue;
+			const slot = this.liveEntry(dir, name);
+			if (!slot) continue;
+			const current = by.get(slot.sessionId) ?? { entries: [] };
+			// A refusal outranks a readable record for the same session: we know
+			// something is wrong with it, and "unknown" is the safe answer.
+			if (slot.error) current.error ??= slot.error;
+			else if (slot.entry) current.entries.push(slot.entry);
+			by.set(slot.sessionId, current);
+		}
+		return by;
+	}
+
+	/**
+	 * Parse one live record and resolve its owning pid.
+	 *
+	 * Returns undefined when the record can be positively attributed elsewhere
+	 * or its owner is gone, and a slot with `error` when it exists but cannot be
+	 * trusted.
+	 */
+	private liveEntry(
+		dir: string,
+		name: string,
+	): { sessionId: string; entry?: LiveEntry; error?: string } | undefined {
+		let live: {
+			sessionId?: string;
+			pid?: number;
+			state?: "working" | "idle";
+			updated?: number;
+		} | undefined;
+		try {
+			live = readJson(path.join(dir, name)) as typeof live;
+		} catch {
+			// Unparseable. If the FILE NAME is a pid -- and the live-record
+			// convention is `<pid>.json` -- we cannot tell which session it
+			// belongs to, and assuming it belongs to none is the unsafe
+			// direction: a worker whose own record was caught mid-write would
+			// read as settled and could wake its parent early. A dead pid's
+			// leftovers say nothing about anyone, so those are skipped.
+			const pid = Number(name.slice(0, -".json".length));
+			if (Number.isSafeInteger(pid) && pid > 0 && pidAlive(pid)) {
+				// Nobody can say WHICH session this belongs to, so no worker can
+				// be ruled out. Throwing refuses control for all of them, which
+				// is the safe direction; the per-session `error` slot below is
+				// only for records that do name their session.
+				throw new Error("Unreadable live-session record; refusing control");
 			}
-			if (live?.sessionId !== id || live.pid === local?.pid) continue;
-			if (!live.pid || !Number.isSafeInteger(live.pid) || live.pid <= 0) {
-				throw new Error(
-					"Invalid live-session record; refusing control",
-				);
-			}
-			try {
-				process.kill(live.pid, 0);
-			} catch (error) {
-				const code = (error as NodeJS.ErrnoException).code;
-				if (code === "ESRCH") continue;
-				if (code !== "EPERM") {
-					throw new Error(
-						"Cannot verify session ownership; use the inbox",
-					);
-				}
-			}
-			const updated = Number(live.updated) || 0;
-			if (!freshest || updated > freshest.updated) {
-				freshest = {
-					state: live.state ?? "working",
-					pid: live.pid,
-					updated,
+			return;
+		}
+		if (!live?.sessionId) return;
+		const sessionId = live.sessionId;
+		if (!live.pid || !Number.isSafeInteger(live.pid) || live.pid <= 0) {
+			return {
+				sessionId,
+				error: "Invalid live-session record; refusing control",
+			};
+		}
+		try {
+			process.kill(live.pid, 0);
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code === "ESRCH") return;
+			if (code !== "EPERM") {
+				return {
+					sessionId,
+					error: "Cannot verify session ownership; use the inbox",
 				};
 			}
+		}
+		return {
+			sessionId,
+			entry: {
+				sessionId,
+				state: live.state ?? "working",
+				pid: live.pid,
+				updated: Number(live.updated) || 0,
+			},
+		};
+	}
+
+	private foreground(id: string) {
+		const local = this.runner.get(id);
+		const slot = this.liveBySession().get(id);
+		if (slot?.error) throw new Error(slot.error);
+		// Our own record is not a foreign writer, but a foreign record for the
+		// same session still is -- so drop ours and consider the rest. Collapsing
+		// to the single freshest record instead let our own (usually newer) idle
+		// record shadow a foreign `working` one and report "settled" while
+		// another process was running the session.
+		let freshest: LiveEntry | undefined;
+		for (const entry of slot?.entries ?? []) {
+			if (entry.pid === local?.pid) continue;
+			if (!freshest || entry.updated > freshest.updated) freshest = entry;
 		}
 		return freshest && { state: freshest.state, pid: freshest.pid };
 	}

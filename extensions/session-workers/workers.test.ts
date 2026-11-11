@@ -260,3 +260,185 @@ test("ids accept custom session ids, but reject paths and dot entries", () => {
 		assert.throws(() => validId(id), /session id/);
 	}
 });
+
+test("a batch reads the worker directory once, and never cache-stales", async (t) => {
+	// `workers()` used to readdir and parse EVERY record per call. The wake
+	// sweep asks once per parent, so this was quadratic: 150 records over 35
+	// teams = 5,250 parses per sweep, ~345ms of synchronous work on the TUI
+	// event loop, paid from the 5s supervisor tick and again from each debounced
+	// agent event during a run. That is the "random lag while typing" report.
+	const s = setup(t);
+	// One worker per team, so a quadratic read is unmistakable: 8 records
+	// and 8 parents means 64 parses for the old code, ~8 for a batch.
+	for (let i = 0; i < 8; i++) await s.spawn(`team-${i}`);
+	const spy = t.mock.method(s.team, "worker");
+
+	const parents = s.team.batch(() => {
+		const seen = s.team.parents();
+		// The sweep shape: ownership, then agents, for every parent.
+		for (const parent of seen) {
+			s.team.ownsWake(parent);
+			s.team.workers(parent);
+		}
+		return seen;
+	});
+	assert.ok(parents.length >= 2, "more than one team, or this proves nothing");
+	const parses = spy.mock.callCount();
+	// 8 parents x 8 records was 64 parses before batching. The INDEX adds a
+	// second pass: one to rebuild it (first read in this test), one to validate
+	// the next read against it. Still constant in the number of TEAMS, which is
+	// the property that matters -- so allow 3 passes, not 64.
+	assert.ok(
+		parses <= 24,
+		`a couple of passes over 8 records, not one per parent; saw ${parses}`,
+	);
+
+	// Outside a batch the read is always fresh. Records are rewritten IN PLACE
+	// in places (pruning and tests both do it), which does not move the
+	// directory mtime, so a stamp-keyed cache -- the timing trick the inbox uses
+	// for worker LINKS -- goes stale exactly when a record changes.
+	spy.mock.resetCalls();
+	const first = parents[0];
+	s.team.workers(first);
+	assert.ok(
+		spy.mock.callCount() >= 8,
+		"an unbatchd call re-reads, so it cannot serve stale data",
+	);
+
+	const worker = s.team.workers(first)[0];
+	const file = join(s.dir, "session-workers", "workers", `${worker.id}.json`);
+	fs.writeFileSync(
+		file,
+		JSON.stringify({
+			...JSON.parse(fs.readFileSync(file, "utf-8")),
+			title: "Renamed",
+		}),
+	);
+	const after = s.team.workers(first).find((w) => w.id === worker.id);
+	assert.equal(after?.title, "Renamed", "an in-place rewrite must be visible");
+});
+
+test("our own live record must not shadow a foreign writer of the same session", async (t) => {
+	// A live record is written by whichever pi holds a session, so two records
+	// can name the same one: ours (usually newer, `idle` because we are not
+	// running it) and a foreign process that IS running it. Reading only the
+	// freshest record lets ours win and reports "settled" while another process
+	// is mid-run -- the false-settle shape that wakes a parent early and spawns
+	// a second writer. The old reader skipped its own pid per record; keep that.
+	const s = setup(t);
+	const worker = await s.spawn();
+	const live = join(s.dir, "inbox-live");
+	fs.mkdirSync(live, { recursive: true });
+	const write = (pid: number, state: string, updated: number) =>
+		fs.writeFileSync(
+			join(live, `${pid}.json`),
+			JSON.stringify({ sessionId: worker.id, pid, state, updated }),
+		);
+
+	// Foreign holder is OLDER; ours is newer and idle.
+	const foreign = process.ppid;
+	write(foreign, "working", Date.now() - 60_000);
+	write(process.pid, "idle", Date.now());
+
+	// Register ourselves as holding a local agent for the worker, which is what
+	// makes our own record a self-record rather than another foreign one.
+	s.agents.set(worker.id, {
+		...(s.agents.get(worker.id) as any),
+		pid: process.pid,
+	});
+	assert.equal(
+		s.team.foregroundDisposition(worker.id),
+		"running",
+		"a foreign working record must win over our own newer idle record",
+	);
+
+	// Remove the foreign claim and ours is the only one left: settled, because a
+	// record written by this process is not a foreign writer.
+	fs.rmSync(join(live, `${foreign}.json`));
+	assert.equal(s.team.foregroundDisposition(worker.id), "settled");
+});
+
+test("the identity index is reused but never serves stale identity", async (t) => {
+	// `parents()` and the ownership checks need only id/parentId/createdAt/
+	// ownerPid/ownerToken, all fixed at creation. Reading them used to mean
+	// parsing every record body: 150 files, 150 opens, per sweep, growing with
+	// the install. The index turns that into one read.
+	//
+	// The risk it introduces is desync, so pin the invalidation on creates and
+	// deletes -- the two things that change identity.
+	const s = setup(t);
+	for (let i = 0; i < 4; i++) await s.spawn(`idx-team-${i}`);
+	const dir = join(s.dir, "session-workers", "workers");
+	const indexFile = join(s.dir, "session-workers", "workers-index.json");
+
+	const first = s.team.parents();
+	assert.ok(first.includes("idx-team-0"));
+	assert.ok(fs.existsSync(indexFile), "the index is written on first read");
+
+	// Warm: reused, not rebuilt. Counted through the public seam rather than by
+	// timing, which would be flaky on a loaded machine.
+	const bodies = t.mock.method(s.team, "worker");
+	s.team.parents();
+	s.team.identities("idx-team-0");
+	s.team.ownsWake("idx-team-0");
+	assert.equal(
+		bodies.mock.callCount(),
+		0,
+		"a warm read must not parse any record body",
+	);
+
+	// A NEW record must appear without any explicit invalidation.
+	fs.writeFileSync(join(dir, "brand-new-worker.json"), JSON.stringify({
+		id: "brand-new-worker",
+		parentId: "brand-new-team",
+		title: "brand-new-worker",
+		cwd: s.dir,
+		extensionPath: "/extensions/session-workers/index.ts",
+		createdAt: Date.now(),
+		wake: true,
+	}));
+	assert.ok(
+		s.team.parents().includes("brand-new-team"),
+		"a created record must not be hidden by a cached index",
+	);
+
+	// A DELETED record must disappear.
+	fs.rmSync(join(dir, "brand-new-worker.json"));
+	assert.ok(
+		!s.team.parents().includes("brand-new-team"),
+		"a deleted record must not linger in the cached index",
+	);
+});
+
+test("a stale stamp cannot hide a new team from the index", async (t) => {
+	// The index is trusted on (mtime, ctime) of the worker directory. Directory
+	// timestamps have finite resolution, so two mutations inside one tick can
+	// leave the stamp looking unchanged -- and a create is exactly the case where
+	// a stale index would hide a brand-new team from the wake sweep, stranding its
+	// fan-out. The record count is O(1) to compare and closes that window.
+	const s = setup(t);
+	await s.spawn("stamp-team");
+	s.team.parents(); // writes the index
+
+	const indexFile = join(s.dir, "session-workers", "workers-index.json");
+	const good = JSON.parse(fs.readFileSync(indexFile, "utf-8"));
+
+	// Forge a stale index: same stamp, same file list, but MISSING a record --
+	// exactly what a same-tick create would produce.
+	const dir = join(s.dir, "session-workers", "workers");
+	const names = fs.readdirSync(dir).filter((n) => n.endsWith(".json"));
+	fs.writeFileSync(indexFile, JSON.stringify({
+		...good,
+		files: names,
+		records: [], // dropped
+	}));
+
+	// Use a SECOND team object: the first one memoises the bucketed index in
+	// memory, so it would answer from that cache and never consult the file.
+	// A fresh object is what a new pi process sees.
+	const fresh = new (s.team.constructor as any)(s.dir, (s.team as any).runner);
+	assert.ok(
+		fresh.parents().includes("stamp-team"),
+		"an index whose records do not match its file list must be rebuilt",
+	);
+});

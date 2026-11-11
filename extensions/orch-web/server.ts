@@ -964,15 +964,20 @@ function queueReasonFor(
 	return queueReason(id);
 }
 
-export function buildRows(opts: {
-	currentId?: string;
-	withArchived?: boolean;
-	/** Include sessions hidden by a manual `hide` override (the Filtered view). */
-	withHidden?: boolean;
-} = {}) {
+/** The shared inputs one row is built from. Read once per list build. */
+interface RowEnv {
+	store: { sessions: Record<string, any> };
+	live: Map<string, any>;
+	groupOf: (id: string) => string | undefined;
+	groupName: (id?: string) => string | undefined;
+	parentOf: Map<string, string>;
+	groups: any;
+	/** Read once per build; projectFamilies needs the same list. */
+	links: WorkerLink[];
+}
+
+function rowEnv(): RowEnv {
 	const store = loadStore();
-	const live = readLive();
-	const links = readWorkerLinks(AGENT_DIR);
 	const groups = (() => {
 		try {
 			return new InboxGroups(AGENT_DIR).load();
@@ -980,11 +985,141 @@ export function buildRows(opts: {
 			return { groups: [], sessions: {} } as any;
 		}
 	})();
-	const groupOf = (id: string): string | undefined => groups.sessions?.[id];
-	const groupName = (id?: string): string | undefined =>
-		id ? groups.groups?.find((g) => g.id === id)?.name : undefined;
+	// Once per build. `buildRows` used to read these once and hand the same list
+	// to both the parent map and `projectFamilies`; splitting the row builders
+	// out must not turn that into a read per caller.
+	const links = readWorkerLinks(AGENT_DIR) as WorkerLink[];
 	const parentOf = new Map<string, string>();
-	for (const link of links as WorkerLink[]) parentOf.set(link.id, link.parentId);
+	for (const link of links) parentOf.set(link.id, link.parentId);
+	return {
+		store: store as RowEnv["store"],
+		live: readLive() as unknown as Map<string, any>,
+		groupOf: (id) => groups.sessions?.[id],
+		groupName: (id) =>
+			id ? groups.groups?.find((g: any) => g.id === id)?.name : undefined,
+		parentOf,
+		groups,
+		links,
+	};
+}
+
+/**
+ * One on-disk session as a row.
+ *
+ * Extracted so a caller that needs exactly one row pays for one row. The
+ * transcript stream used to call `buildRows()` — every session on disk, now
+ * ~800 and 1 GB — on a 1.2s timer, only to `.find()` the session it already
+ * knew the id of. That is the same "fingerprint before the work" mistake the
+ * inbox fixed in the list refresh.
+ */
+function rowFromHeader(h: HeaderInfo, env: RowEnv): Row {
+	const meta = env.store.sessions[h.id] ?? {};
+	const tail = readTail(h.path);
+	const bg = getAgent(h.id);
+	const liveRec = env.live.get(h.id);
+	const groupId = env.groupOf(h.id);
+	return {
+		id: h.id,
+		title: cleanTitle(
+			readName(h.path) || firstUserText(h.path) || "(no messages)",
+		),
+		cwd: h.cwd,
+		status: tail.status,
+		state: busyState(bg, liveRec),
+		// Only rows with work actually waiting get a reason, so the UI can say
+		// "queued behind another process" instead of "waiting for a slot". A row
+		// whose own run is in flight still gets "running" -- that is the label
+		// for messages queued behind the turn you are watching.
+		queueReason:
+			(bg?.pending.length ?? 0) > 0
+				? queueReasonFor(h.id, bg, liveRec)
+				: undefined,
+		live: !!liveRec,
+		livePid: liveRec?.pid,
+		stuckMin: liveRec?.stuckMin,
+		// The agent record is authoritative mid-run; otherwise ask the session
+		// file, which is what pi would restore on the next turn.
+		model: bg?.model ?? bg?.nextModel ?? sessionModel(h.path),
+		updated: bg?.updatedAt ?? h.modified.getTime(),
+		created: h.created.getTime(),
+		pending: bg?.pending.length ?? 0,
+		needsYou: !!bg?.needsYou,
+		pinned: !!meta.pinnedAt,
+		archived: !!meta.archivedAt,
+		hidden: meta.filter === "hide",
+		unread: (meta.unreadAt ?? 0) > (meta.seenAt ?? 0) || !!bg?.needsYou,
+		groupId,
+		groupName: env.groupName(groupId),
+		parentId: env.parentOf.get(h.id),
+		firstPrompt: cleanTitle(firstUserText(h.path)),
+		lastSaid: tail.lastSaid,
+		lastText: tail.lastText,
+	};
+}
+
+/** A session that exists only in the agent registry (a brand-new first run). */
+function rowFromAgent(a: BgAgent, env: RowEnv): Row {
+	const meta = env.store.sessions[a.id] ?? {};
+	const groupId = env.groupOf(a.id);
+	return {
+		id: a.id,
+		title: cleanTitle(a.title),
+		cwd: a.cwd,
+		status: "empty",
+		state: busyState(a),
+		queueReason: a.pending.length > 0 ? queueReasonFor(a.id, a) : undefined,
+		live: true,
+		livePid: a.pid,
+		model: a.model ?? a.nextModel,
+		updated: a.updatedAt,
+		created: a.createdAt,
+		pending: a.pending.length,
+		needsYou: !!a.needsYou,
+		pinned: !!meta.pinnedAt,
+		archived: !!meta.archivedAt,
+		hidden: meta.filter === "hide",
+		unread: !!a.needsYou,
+		groupId,
+		groupName: env.groupName(groupId),
+		parentId: env.parentOf.get(a.id),
+		firstPrompt: cleanTitle(a.title),
+		lastSaid: a.lastText
+			? { role: "assistant", text: a.lastText }
+			: undefined,
+		lastText: a.lastText ?? "",
+	};
+}
+
+/**
+ * One row, without building the other ~800.
+ *
+ * Same projection the list applies (family collapse included), so the caller
+ * sees exactly the row it would have found in `buildRows`. Archived and hidden
+ * are always included: the caller already named the session, and refusing to
+ * describe an archived one would break the phone's archived view.
+ */
+export function buildRow(id: string): Row | undefined {
+	const env = rowEnv();
+	const header = scanHeaders().find((h) => h.id === id);
+	const agent = header ? undefined : getAgent(id);
+	if (!header && !agent) return undefined;
+	const row = header ? rowFromHeader(header, env) : rowFromAgent(agent!, env);
+	// The transcript stream and the send path both include archived + hidden
+	// sessions, so the projection only has to keep this one row.
+	const projected = projectFamilies([row], [row], env.links, {
+		id: (r: Row) => r.id,
+		expanded: readExpanded(),
+	});
+	return projected[0]?.row as Row | undefined;
+}
+
+export function buildRows(opts: {
+	withArchived?: boolean;
+	/** Include sessions hidden by a manual `hide` override (the Filtered view). */
+	withHidden?: boolean;
+} = {}) {
+	const env = rowEnv();
+	const store = env.store;
 
 	const rows: Row[] = [];
 	const seen = new Set<string>();
@@ -994,47 +1129,8 @@ export function buildRows(opts: {
 		// A manual `hide` (the TUI's `x` on a session no rule matched) is a filing
 		// decision, not a status: the phone honours it so both lists match.
 		if (meta.filter === "hide" && !opts.withHidden) continue;
-		const tail = readTail(h.path);
-		const bg = getAgent(h.id);
-		const liveRec = live.get(h.id);
-		const state = busyState(bg, liveRec);
 		seen.add(h.id);
-		rows.push({
-			id: h.id,
-			title: cleanTitle(readName(h.path) || firstUserText(h.path) || "(no messages)"),
-			cwd: h.cwd,
-			status: tail.status,
-			state,
-			// Only rows with work actually waiting get a reason, so the UI can say
-			// "queued behind another process" instead of "waiting for a slot". A row
-			// whose own run is in flight still gets "running" -- that is the label
-			// for messages queued behind the turn you are watching.
-			queueReason:
-				(bg?.pending.length ?? 0) > 0
-					? queueReasonFor(h.id, bg, liveRec)
-					: undefined,
-			live: !!liveRec,
-			livePid: liveRec?.pid,
-			stuckMin: liveRec?.stuckMin,
-			// The agent record is authoritative mid-run; otherwise ask the session
-			// file, which is what pi would restore on the next turn.
-			model: bg?.model ?? bg?.nextModel ?? sessionModel(h.path),
-			updated: bg?.updatedAt ?? h.modified.getTime(),
-			created: h.created.getTime(),
-			pending: bg?.pending.length ?? 0,
-			needsYou: !!bg?.needsYou,
-			pinned: !!meta.pinnedAt,
-			archived: !!meta.archivedAt,
-			hidden: meta.filter === "hide",
-			unread:
-				(meta.unreadAt ?? 0) > (meta.seenAt ?? 0) || !!bg?.needsYou,
-			groupId: groupOf(h.id),
-			groupName: groupName(groupOf(h.id)),
-			parentId: parentOf.get(h.id),
-			firstPrompt: cleanTitle(firstUserText(h.path)),
-			lastSaid: tail.lastSaid,
-			lastText: tail.lastText,
-		});
+		rows.push(rowFromHeader(h, env));
 	}
 	// Sessions queued but not on disk yet (a brand-new agent's first run).
 	for (const a of listAgents()) {
@@ -1042,41 +1138,14 @@ export function buildRows(opts: {
 		const meta = store.sessions[a.id] ?? {};
 		if (meta.archivedAt && !opts.withArchived) continue;
 		if (meta.filter === "hide" && !opts.withHidden) continue;
-		rows.push({
-			id: a.id,
-			title: cleanTitle(a.title),
-			cwd: a.cwd,
-			status: "empty",
-			state: busyState(a),
-			queueReason:
-				a.pending.length > 0 ? queueReasonFor(a.id, a) : undefined,
-			live: true,
-			livePid: a.pid,
-			model: a.model ?? a.nextModel,
-			updated: a.updatedAt,
-			created: a.createdAt,
-			pending: a.pending.length,
-			needsYou: !!a.needsYou,
-			pinned: !!meta.pinnedAt,
-			archived: !!meta.archivedAt,
-			hidden: meta.filter === "hide",
-			unread: !!a.needsYou,
-			groupId: groupOf(a.id),
-			groupName: groupName(groupOf(a.id)),
-			parentId: parentOf.get(a.id),
-			firstPrompt: cleanTitle(a.title),
-			lastSaid: a.lastText
-				? { role: "assistant", text: a.lastText }
-				: undefined,
-			lastText: a.lastText ?? "",
-		});
+		rows.push(rowFromAgent(a, env));
 	}
 	rows.sort((x, y) => y.updated - x.updated);
 	// Collapse delegated workers under the session that spawned them: a fan-out
 	// is otherwise one row per worker (137 children across 34 parents here) and
 	// buries the sessions the person actually started. projectFamilies is the
 	// same projection the TUI inbox draws, so the two views agree.
-	const projected = projectFamilies(rows, rows, links as WorkerLink[], {
+	const projected = projectFamilies(rows, rows, env.links, {
 		id: (row: Row) => row.id,
 		expanded: readExpanded(),
 	});
@@ -1100,13 +1169,19 @@ export function buildRows(opts: {
 	}
 	return {
 		rows: ordered,
-		groups: groups.groups ?? [],
+		groups: env.groups?.groups ?? [],
 		// The TUI persists the All-groups layout; the phone draws the same list,
 		// so it honours the same choice instead of inventing a second one.
-		layout: groups.layout === "flat" ? ("flat" as const) : ("groups" as const),
-		defaultGroupId: groups.defaultGroupId,
+		layout:
+			env.groups?.layout === "flat"
+				? ("flat" as const)
+				: ("groups" as const),
+		defaultGroupId: env.groups?.defaultGroupId,
 		summary: agentsSummary(),
-		capacity: { running: rows.filter((r) => r.state === "working").length, max: MAX_CONCURRENT },
+		capacity: {
+			running: rows.filter((r) => r.state === "working").length,
+			max: MAX_CONCURRENT,
+		},
 		now: Date.now(),
 	};
 }
@@ -1353,7 +1428,51 @@ interface TranscriptMessage {
 	ts?: string;
 }
 
+/**
+ * Memo for `transcript`, keyed on (mtime, size) like the tail/name caches.
+ *
+ * `transcript()` parses the WHOLE session file. The event stream calls it every
+ * 1.2s for the one open session, so an active 4MB session was re-parsed from the
+ * top on every tick purely to redraw a tail that had not changed. Bounded below
+ * so a phone browsing many sessions cannot grow it without limit.
+ */
+const transcriptCache = new Map<
+	string,
+	{ mtimeMs: number; size: number; limit: number; out: TranscriptMessage[] }
+>();
+const TRANSCRIPT_CACHE_MAX = 32;
+
 export function transcript(file: string, limit = 200): TranscriptMessage[] {
+	let stat: fs.Stats | undefined;
+	try {
+		stat = fs.statSync(file);
+	} catch {
+		// An unreadable file falls through to the uncached path, which reports [].
+	}
+	if (stat) {
+		const hit = transcriptCache.get(file);
+		if (
+			hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size &&
+			hit.limit === limit
+		) return hit.out;
+	}
+	const out = readTranscript(file, limit);
+	if (stat) {
+		if (transcriptCache.size >= TRANSCRIPT_CACHE_MAX) {
+			const oldest = transcriptCache.keys().next().value;
+			if (oldest !== undefined) transcriptCache.delete(oldest);
+		}
+		transcriptCache.set(file, {
+			mtimeMs: stat.mtimeMs,
+			size: stat.size,
+			limit,
+			out,
+		});
+	}
+	return out;
+}
+
+function readTranscript(file: string, limit: number): TranscriptMessage[] {
 	let branch: any[] = [];
 	try {
 		branch = SessionManager.open(file).getBranch() as any[];
@@ -1956,8 +2075,7 @@ async function handle(
 }
 
 function doSend(id: string, text: string) {
-	const rows = buildRows({ withArchived: true, withHidden: true }).rows;
-	const row = rows.find((r) => r.id === id);
+	const row = buildRow(id);
 	if (!row) throw new Error("session not found");
 	const file = sessionFileOf(id);
 	// A run in another process is a separate writer; queue through the agent
@@ -2307,12 +2425,11 @@ function streamAgent(res: http.ServerResponse, id: string) {
 		if (closed) return;
 		try {
 			const a = getAgent(id);
-			const rows = buildRows({
-				withArchived: true,
-				withHidden: true,
-				currentId: id,
-			});
-			const row = rows.rows.find((r) => r.id === id);
+			// One row, not every session on disk. This used to call `buildRows()`
+			// -- ~800 sessions, 1 GB -- and `.find()` the id it already had, on a
+			// 1.2s timer. Included archived and hidden because the phone can have
+			// an archived session open.
+			const row = buildRow(id);
 			// A run owned by another process (a TUI, or the parent of this
 			// daemon) has no registry handle here, so its in-flight output comes
 			// from its event file instead. Without this the view sits on an empty
@@ -2320,40 +2437,52 @@ function streamAgent(res: http.ServerResponse, id: string) {
 			const live = a
 				? (a.items?.slice(-40) ?? [])
 				: liveItems(id);
-			const payload = {
-				row,
-				messages: file ? transcript(file, SSE_TRANSCRIPT_LIMIT) : [],
-				pending: a?.pending ?? [],
-				model: a?.model ?? a?.nextModel ?? (file ? sessionModel(file) : undefined),
-				live,
-				// "Now doing": the last tool step. Streaming text is already a live
-				// item, so it would otherwise be printed twice in the same box.
-				activity:
-					a?.activity ??
-					[...live].reverse().find((i) => i.kind === "tool")?.text,
-			};
-			// Change detection. The transcript is capped, so its length pins at the
-			// limit and edits to the newest message are invisible to it: hash the
-			// last message, and count events so a long run cannot look idle.
-			const last = payload.messages.at(-1);
+			// Change detection has to come BEFORE the transcript is built, which
+			// is what the inbox refresh learned the hard way: ~92% of an idle tick
+			// was spent producing data that the fingerprint then discarded. The
+			// transcript is the expensive part here (a whole-file parse), and
+			// nothing it could return changes unless the file or the run moved --
+			// so stat the file, and bail on that plus the cheap live signals.
+			let stamp = "none";
+			if (file) {
+				try {
+					const st = fs.statSync(file);
+					stamp = `${st.mtimeMs}:${st.size}`;
+				} catch {
+					// Not written yet.
+				}
+			}
+			// "Now doing": the last tool step. Streaming text is already a live
+			// item, so it would otherwise be printed twice in the same box.
+			const activity =
+				a?.activity ??
+				[...live].reverse().find((i) => i.kind === "tool")?.text;
+			// The transcript is capped, so its length pins at the limit and edits
+			// to the newest message are invisible to a length-only hash. Include
+			// the file stat AND the event byte count so a long run cannot look
+			// idle, while a genuinely quiet session skips the parse entirely.
 			const key = JSON.stringify([
-				payload.row?.title,
-				payload.messages.length,
-				last?.role,
-				last?.text?.length,
-				last?.text?.slice(-40),
-				last?.tools?.length,
-				last?.final,
-				payload.live.length,
-				payload.live.at(-1) ?? null,
-				payload.activity,
-				payload.pending.length,
-				payload.row?.status,
-				payload.row?.state,
+				row?.title,
+				stamp,
+				live.length,
+				live.at(-1) ?? null,
+				activity,
+				a?.pending.length ?? 0,
+				row?.status,
+				row?.state,
 				eventBytes(id),
 			]);
 			if (key === lastKey) return;
 			lastKey = key;
+			const payload = {
+				row,
+				messages: file ? transcript(file, SSE_TRANSCRIPT_LIMIT) : [],
+				pending: a?.pending ?? [],
+				model:
+					a?.model ?? a?.nextModel ?? (file ? sessionModel(file) : undefined),
+				live,
+				activity,
+			};
 			res.write(`data: ${JSON.stringify(payload)}\n\n`);
 		} catch (e) {
 			res.write(
