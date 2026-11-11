@@ -1150,7 +1150,12 @@ export function buildRows(opts: {
 		expanded: readExpanded(),
 	});
 	const ordered: Row[] = [];
+	// Roots only: projectFamilies already emits an expanded family's children as
+	// their own items, so walking every item AND re-appending `children` drew
+	// each delegated worker twice. The TUI inbox projects the same way and only
+	// iterates roots for exactly this reason.
 	for (const item of projected) {
+		if (item.child) continue;
 		ordered.push({
 			...item.row,
 			child: item.child,

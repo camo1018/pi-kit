@@ -411,6 +411,11 @@ test("delegated workers collapse under the session that spawned them", () => {
 	assert.equal(open[index]?.expanded, true);
 	assert.equal(open[index + 1]?.id, kid, "child sits under its parent");
 	assert.equal(open[index + 1]?.child, true);
+	// Every session appears exactly once. projectFamilies already emits an
+	// expanded family's children as their own items, so a caller that also
+	// walks `item.children` drew the whole group a second time below the parent.
+	const ids = open.map((r) => r.id);
+	assert.equal(new Set(ids).size, ids.length, "no row is drawn twice");
 });
 
 test("log lines cannot carry terminal escapes into `tail -f`", () => {
