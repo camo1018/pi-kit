@@ -144,6 +144,25 @@ function escaped(text: string): string {
 		.replace(/"/g, "&quot;");
 }
 
+/**
+ * The immutable part of a worker record: what `parents()` and the ownership
+ * checks need, and nothing that `spawn` ever changes afterwards.
+ *
+ * Split out so the directory can be indexed without parsing record bodies.
+ * `spawn` is the only writer and every field here is set at creation, so an
+ * entry can be cached without risking staleness on a field that later moves.
+ */
+export interface WorkerIdentity {
+	id: string;
+	parentId: string;
+	createdAt: number;
+	ownerPid?: number;
+	ownerToken?: string;
+}
+
+/** Bumped only if the on-disk index shape changes; a mismatch forces a rebuild. */
+const INDEX_VERSION = 1;
+
 /** One live record for a session, resolved to a live owning pid. */
 interface LiveEntry {
 	sessionId: string;
@@ -180,6 +199,8 @@ export class WorkerTeam {
 	 * names, so only THAT session is refused -- see `liveEntry`.
 	 */
 	private liveSnap?: Map<string, LiveSlots>;
+	/** Bucketed identity index for the current validated stamp. */
+	private buckets?: { key: string; by: Map<string, WorkerIdentity[]> };
 
 	constructor(
 		readonly agentDir: string,
@@ -297,8 +318,10 @@ export class WorkerTeam {
 		// Worker records are never pruned, so they still answer after a reply
 		// clears the arm. Without this, an idle reply dropped `ownerPid` and the
 		// team was owned by nobody until the next spawn.
+		// Identity only: ownership is decided by `ownerPid`/`ownerToken`, which the
+		// index carries, so this needs no record bodies.
 		if (
-			this.workers(id).some((w) =>
+			this.identities(id).some((w) =>
 				isOwnProcess(w.ownerPid, w.ownerToken),
 			)
 		) {
@@ -396,7 +419,7 @@ export class WorkerTeam {
 		const seen: number[] = [];
 		const arm = readWakeArm(this.stateDir, id);
 		if (arm?.ownerPid !== undefined) seen.push(arm.ownerPid);
-		for (const worker of this.workers(id)) {
+		for (const worker of this.identities(id)) {
 			if (worker.ownerPid !== undefined) seen.push(worker.ownerPid);
 		}
 		const saved = this.saved(id)?.owner;
@@ -407,8 +430,188 @@ export class WorkerTeam {
 
 	/** Every parent that currently owns at least one worker record. */
 	parents(): string[] {
-		return [...this.byParent().keys()];
+		return [...this.identityBuckets().keys()];
 	}
+
+	/** Worker identities for one parent, derived from the same index. */
+	identities(parentId: string): WorkerIdentity[] {
+		return this.identityBuckets().get(parentId) ?? [];
+	}
+
+	/**
+	 * The bucketed index for the current call sequence.
+	 *
+	 * Memoised on the validated stamp, not just the parsed records: the sweep
+	 * asks once per parent, so re-bucketing on every call made a loop over 35
+	 * teams cost 35 sorts of the same 150 entries.
+	 */
+	private identityBuckets(): Map<string, WorkerIdentity[]> {
+		// A batch observes one moment, so validate once and reuse. Without this
+		// the sweep re-statted and re-listed the directory for every parent.
+		if (this.buckets && this.snap) return this.buckets.by;
+		const dir = path.join(this.root, "workers");
+		let stamp = "missing";
+		let fileNames: string[] = [];
+		try {
+			const st = fs.statSync(dir);
+			stamp = `${st.mtimeMs}:${st.ctimeMs}`;
+			fileNames = fs.readdirSync(dir).filter((n) => n.endsWith(".json"));
+		} catch {
+			// No directory: nothing to index.
+		}
+		const key = `${stamp}|${fileNames.length}`;
+		if (this.buckets?.key === key) return this.buckets.by;
+		const cached = this.readIndex(stamp, fileNames);
+		const entries = cached ?? this.rebuildIndex(fileNames);
+		if (!cached) this.writeIndex(stamp, fileNames, entries);
+		const by = this.bucket(entries);
+		this.buckets = { key, by };
+		return by;
+	}
+
+	/**
+	 * Path of the worker directory's index. A SIBLING of `workers/`, never an
+	 * entry inside it: the index is validated against that directory's stamp, so
+	 * writing the index into the directory would move the stamp it is checking
+	 * and invalidate itself on every write.
+	 */
+	private get indexFile(): string {
+		return path.join(this.root, "workers-index.json");
+	}
+
+	/**
+	 * Read the worker directory ONCE and cache only its identity fields.
+	 *
+	 * `parents()` and the ownership checks need `parentId`, `createdAt`,
+	 * `ownerPid` and `ownerToken` -- all set at creation and never changed. The
+	 * record bodies carry `title`/`cwd`/`extensionPath`, which no sweep reads.
+	 * Reading them anyway meant every sweep parsed every record: 150 files and
+	 * 150 opens per tick, growing linearly for the life of the install.
+	 *
+	 * This is a persistent no-stat read: a validated index costs one stat and one
+	 * parse regardless of record count, instead of a stat per record.
+	 *
+	 * SAFETY. The index is trusted only when BOTH hold:
+	 *
+	 *  1. Its stamp matches `workers/` exactly. `writeJson` creates records with
+	 *     tmp+rename, and create/rename/delete all move a directory's mtime --
+	 *     verified, and unlike an in-place rewrite, which does NOT (that is the
+	 *     trap that made a stamp cache wrong for record BODIES).
+	 *  2. Its file list matches the directory exactly. This is what catches an
+	 *     editing writer that rewrote a record in place: the stamp would not move
+	 *     but the SET of files is unchanged too, so a body edit stays invisible --
+	 *     which is fine, because bodies are not cached here. A create or delete,
+	 *     the cases that DO change identity, cannot hide from the file list.
+	 *
+	 * Anything else falls back to a full rebuild, so a stale or unreadable index
+	 * costs work, never correctness.
+	 */
+	private identityIndex(): Map<string, WorkerIdentity[]> {
+		const dir = path.join(this.root, "workers");
+		let stamp = "missing";
+		let fileNames: string[] = [];
+		try {
+			const st = fs.statSync(dir);
+			stamp = `${st.mtimeMs}:${st.ctimeMs}`;
+			fileNames = fs.readdirSync(dir).filter((n) => n.endsWith(".json"));
+		} catch {
+			// No directory: nothing to index.
+		}
+
+		const cached = this.readIndex(stamp, fileNames);
+		if (cached) return this.bucket(cached);
+
+		const entries = this.rebuildIndex(fileNames);
+		this.writeIndex(stamp, fileNames, entries);
+		return this.bucket(entries);
+	}
+
+	private readIndex(
+		stamp: string,
+		fileNames: string[],
+	): WorkerIdentity[] | undefined {
+		let raw: unknown;
+		try {
+			raw = JSON.parse(fs.readFileSync(this.indexFile, "utf8"));
+		} catch {
+			return undefined;
+		}
+		const index = raw as {
+			v?: number;
+			stamp?: string;
+			files?: string[];
+			records?: WorkerIdentity[];
+		};
+		if (index?.v !== INDEX_VERSION) return undefined;
+		if (index.stamp !== stamp) return undefined;
+		if (!Array.isArray(index.files) || !Array.isArray(index.records)) {
+			return undefined;
+		}
+		// The file names ARE the identity set, so a cheap count comparison catches
+		// a stamp that under-reports. mtime has limited resolution: two mutations
+		// inside one tick can leave the stamp looking unchanged, and then a stale
+		// index would hide a brand-new team from the sweep. Comparing counts is
+		// O(1) versus the sort this used to do, and it closes that window for
+		// create/delete. A same-count swap still needs the stamp, so keep both.
+		if (index.files.length !== fileNames.length) return undefined;
+		if (index.records.length !== fileNames.length) return undefined;
+		return index.records;
+	}
+
+	/** One directory pass, identity fields only. */
+	private rebuildIndex(fileNames: string[]): WorkerIdentity[] {
+		const dir = path.join(this.root, "workers");
+		const out: WorkerIdentity[] = [];
+		for (const name of fileNames) {
+			try {
+				const worker = this.worker(name.slice(0, -5));
+				if (!worker) continue;
+				out.push({
+					id: worker.id,
+					parentId: worker.parentId,
+					createdAt: worker.createdAt,
+					ownerPid: worker.ownerPid,
+					ownerToken: worker.ownerToken,
+				});
+			} catch {
+				// A malformed record must not hide every other team. Leaving it out
+				// of the index keeps the pre-existing behaviour, where one bad file
+				// was skipped rather than failing the whole directory.
+			}
+		}
+		return out;
+	}
+
+	private writeIndex(
+		stamp: string,
+		fileNames: string[],
+		records: WorkerIdentity[],
+	): void {
+		try {
+			writeJson(this.indexFile, {
+				v: INDEX_VERSION,
+				stamp,
+				files: fileNames,
+				records,
+			});
+		} catch {
+			// A read-only or full disk must not break a read path.
+		}
+	}
+
+	private bucket(entries: WorkerIdentity[]): Map<string, WorkerIdentity[]> {
+		const by = new Map<string, WorkerIdentity[]>();
+		for (const entry of entries) {
+			const list = by.get(entry.parentId) ?? [];
+			list.push(entry);
+			by.set(entry.parentId, list);
+		}
+		for (const list of by.values()) {
+			list.sort((a, b) => a.createdAt - b.createdAt);
+		}
+		return by;
+	}
+
 	/** Path for the inbox-managed per-session sidecar files (`<id>.*`). */
 	get stateDir(): string {
 		return path.join(this.agentDir, "inbox-agents");
@@ -440,11 +643,15 @@ export class WorkerTeam {
 		// once per worker: 150 workers x 4 records = 600 parses per sweep. Batch
 		// scope is enough because a sweep is meant to observe ONE moment anyway.
 		this.liveSnap = this.readLiveBySession();
+		// A batch is one observation: validate the identity index once for its
+		// duration, then forget it so the next batch sees any intervening write.
+		this.buckets = undefined;
 		try {
 			return fn();
 		} finally {
 			this.snap = undefined;
 			this.liveSnap = undefined;
+			this.buckets = undefined;
 		}
 	}
 
