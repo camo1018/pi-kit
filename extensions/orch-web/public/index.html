@@ -20,6 +20,7 @@
     --accent: #6ea8fe;
     --work: #f0b429;
     --you: #4ade80;
+    --unread: #a78bfa;
     --err: #f87171;
     --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
   }
@@ -65,11 +66,20 @@
   .row:active { background: var(--panel); }
   .dot { width: 8px; height: 8px; border-radius: 50%; margin-top: 7px; flex: 0 0 auto;
     background: var(--dim); }
+  /* The rules below all have the same specificity, so WHICH STATE WINS IS
+     SOURCE ORDER. Ordered least to most urgent:
+       your-turn/aborted  -> unread -> working/queued -> error/stalled
+     Unread outranks "your turn" and "aborted" because a green ball reads as
+     "nothing to do", which is the one thing an unread session is not. A live
+     run still wins over unread, since working/queued says it is moving without
+     you. Red stays last: an errored or stalled run is the one state that must
+     not be quietened by "you have not read this yet". */
+  .dot.your-turn { background: var(--you); }
+  .dot.aborted { background: var(--dim); }
+  .dot.unread { background: var(--unread); }
   .dot.working { background: var(--work); animation: pulse 1.6s infinite; }
   .dot.queued { background: var(--work); opacity: .55; }
-  .dot.your-turn { background: var(--you); }
   .dot.error, .dot.stalled { background: var(--err); }
-  .dot.aborted { background: var(--dim); }
   @keyframes pulse { 50% { opacity: .35; } }
   .body { flex: 1; min-width: 0; }
   .title { font-weight: 550; overflow: hidden; text-overflow: ellipsis;
@@ -489,7 +499,10 @@
     if (row.status === "aborted") return "aborted";
     return "";
   };
-  const dotClass = (row) => row.state || row.status || "";
+  const dotClass = (row) =>
+    [row.state || row.status || "", row.unread ? "unread" : ""]
+      .filter(Boolean)
+      .join(" ");
 
   // ── list ──────────────────────────────────────────────────────────
   function renderList() {
@@ -574,7 +587,6 @@
     const body = el("div", "body");
     const title = el("div", "title");
     if (row.pinned) title.append(el("span", "pre", "★ "));
-    if (row.unread) title.append(el("span", "pre", "• "));
     if (row.hidden) title.append(el("span", "pre", "⊘ "));
     // A parent with delegated workers gets a fold chip: tap the chip to open the
     // family, tap the row to open the session. Tapping the row too would make
