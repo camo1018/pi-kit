@@ -23,7 +23,12 @@ fs.mkdirSync(path.join(agentDir, "sessions"), { recursive: true });
 
 const { buildRow, buildRows, eventBytes, firstUserText, lanAddress, liveItems,
 	mentionChoices, modelChoices, readLinesAt, readName, readTail,
-	sanitizeForLog, transcript } = await import("./server.ts");
+	sanitizeForLog, transcript, trimLiveByTranscript } = await import("./server.ts");
+
+/** Where writeSession puts a session, so a test can read the file back. */
+function sessionPathOf(id: string) {
+	return path.join(agentDir, "sessions", "--scratch--", `2026-01-01T00-00-00-000Z_${id}.jsonl`);
+}
 
 function writeSession(opts: {
 	id: string;
@@ -474,6 +479,8 @@ test("no enabledModels means an empty picker, not a crash", () => {
 	assert.equal(modelChoices().source, "none");
 });
 
+test.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
 test("mentions list sessions with the id as the inserted token", async () => {
 	const seen = writeSession({
 		id: "aaaa-1111",
@@ -706,9 +713,9 @@ test("a queued message behind a live foreign run reads as writer, not slot", asy
 	// which sent the reader looking for a capacity problem that did not exist.
 	const id = "llll-5555";
 	writeSession({ id, messages: [user("mirror the change"), assistant("done")] });
-	// A genuinely foreign live pid: the test runner's parent is alive for the
-	// duration of the run, and is not this process's own record.
 	writeLiveRecord({
+		// A genuinely foreign live pid: the test runner's parent is alive for
+		// the duration of the run, and is not this process's own record.
 		pid: process.ppid,
 		sessionId: id,
 		sessionFile: path.join(agentDir, "sessions", "--scratch--", `x_${id}.jsonl`),
@@ -737,7 +744,6 @@ test("a queued message behind a live foreign run reads as writer, not slot", asy
 	registry().agents.delete(id);
 	fs.rmSync(path.join(agentDir, "inbox-live", `${process.ppid}.json`), { force: true });
 });
-
 
 test("the concluding assistant message is flagged final, tool steps are not", () => {
 	const file = writeSession({
@@ -833,10 +839,10 @@ test("our own live record is running, not another pi", async () => {
 
 test("buildRow describes one session exactly as the list would", () => {
 	// The transcript stream needs ONE row and knew its id, yet called
-	// `buildRows()` -- every session on disk -- on a 1.2s timer, then
-	// `.find()`-ed it. Same "fingerprint before the work" mistake the inbox
-	// refresh fixed. `buildRow` must agree with the list projection or the phone
-	// would show a different row than the list it came from.
+	// `buildRows()` -- every session on disk, now ~800 and 1 GB -- on a 1.2s
+	// timer, then `.find()`-ed it. Same "fingerprint before the work" mistake the
+	// inbox refresh fixed. `buildRow` must agree with the list projection or the
+	// phone would show a different row than the list it came from.
 	for (let i = 0; i < 6; i++) {
 		writeSession({
 			id: `b000000${i}-0000-0000-0000-00000000000${i}`,
@@ -900,4 +906,67 @@ test("transcript memoises but never serves a stale tail", () => {
 	);
 });
 
-test.after(() => fs.rmSync(home, { recursive: true, force: true }));
+test("an in-flight step the transcript already shows is not drawn twice", () => {
+	// The phone renders the session file's transcript and, below it, the run's
+	// live items. Both are rebuilt independently each tick, so for one refresh a
+	// tool call can be in the file AND still in the live list.
+	const seen = new Set(["assistant:1794382569462", "tool:call_a"]);
+	const live = [
+		// Already in the file: superseded.
+		{ kind: "tool" as const, text: "bash ls", id: "call_a" },
+		{ kind: "text" as const, text: "done", ts: 1794382569462 },
+		// Still only in flight: must survive, including the same command run a
+		// second time, which identity matching is what protects.
+		{ kind: "tool" as const, text: "bash ls", id: "call_b" },
+		{ kind: "text" as const, text: "thinking out loud" },
+	];
+	assert.deepEqual(
+		trimLiveByTranscript(live, seen).map((i) => i.text),
+		["bash ls", "thinking out loud"],
+	);
+});
+
+test("the trim never hides a step just because its text repeats", () => {
+	// Text matching would swallow a legitimate re-run of the same command.
+	const seen = new Set(["tool:call_a"]);
+	const live = [{ kind: "tool" as const, text: "bash ls", id: "call_b" }];
+	assert.equal(trimLiveByTranscript(live, seen).length, 1);
+});
+
+test("the wire and the session file agree on a message's identity", () => {
+	// The trim compares a wire event against a file entry, so the two sources
+	// must carry the same timestamp field. The entry's own `timestamp` is an ISO
+	// string and is NOT that value -- reading it silently disables the trim.
+	const id = "identity";
+	const ts = 1794382569462;
+	writeSession({
+		id,
+		messages: [
+			{ role: "user", content: "go", timestamp: ts - 1 },
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "done" }],
+				timestamp: ts,
+				stopReason: "stop",
+			},
+		],
+	});
+	const file = sessionPathOf(id);
+	const messages = transcript(file, 200);
+	const assistant = messages.find((m) => m.role === "assistant");
+	assert.equal(assistant?.ts, ts, "the transcript must carry the message timestamp");
+	assert.deepEqual(
+		trimLiveByTranscript([{ kind: "text", text: "done", ts }], transcriptIndexFor(messages)),
+		[],
+	);
+});
+
+/** The transcript's identity keys, mirrored here so the test states the contract. */
+function transcriptIndexFor(messages: { role: string; ts?: number; tools?: { id?: string }[] }[]) {
+	const seen = new Set<string>();
+	for (const m of messages) {
+		if (m.ts !== undefined) seen.add(`${m.role}:${m.ts}`);
+		for (const t of m.tools ?? []) if (t.id) seen.add(`tool:${t.id}`);
+	}
+	return seen;
+}

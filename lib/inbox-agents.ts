@@ -104,7 +104,20 @@ export interface AgentProc {
 	kill(sig?: NodeJS.Signals): void;
 }
 
-export type RunItem = { kind: "prompt" | "tool" | "text" | "error"; text: string };
+export type RunItem = {
+	kind: "prompt" | "tool" | "text" | "error";
+	text: string;
+	/**
+	 * Identity of the thing this item stands for, so a reader that also shows
+	 * the session file can draw a step once instead of twice.
+	 *
+	 * `ts` is the assistant message's own timestamp and `id` the provider's tool
+	 * call id -- both the same values the file entry carries. Text matching is
+	 * never used: the same command legitimately runs twice.
+	 */
+	ts?: number;
+	id?: string;
+};
 const ITEMS_MAX = 60;
 function addItem(a: BgAgent, item: RunItem) {
 	(a.items ??= []).push(item);
@@ -1618,6 +1631,9 @@ function finishRun(a: BgAgent, code: number, signal?: string) {
 		pending: a.pending.length,
 	});
 	const wasSettled = a.settledAt !== undefined;
+	// Same boundary as settleRun: the run is over, so its live items are stale.
+	// A session that went straight to an error or a cancel never settled.
+	a.items = [];
 	a.proc = undefined;
 	// The run's writer slot is free again. Released before any pump can be
 	// triggered below, so the next run of this session can take it.
@@ -1702,7 +1718,11 @@ function handleEvent(a: BgAgent, ev: any, deltaGate: () => boolean) {
 		case "tool_execution_start":
 			a.activity = `${ev.toolName ?? "tool"}${ev.args ? `: ${summarizeArgs(ev.toolName, ev.args)}` : ""}`;
 			logLine(a, `▸ ${a.activity}`);
-			addItem(a, { kind: "tool", text: a.activity });
+			addItem(a, {
+				kind: "tool",
+				text: a.activity,
+				id: typeof ev.toolCallId === "string" ? ev.toolCallId : undefined,
+			});
 			liveToolStart(a, ev);
 			touch(a);
 			break;
@@ -1727,7 +1747,11 @@ function handleEvent(a: BgAgent, ev: any, deltaGate: () => boolean) {
 			}
 			if (ev.isError) {
 				logLine(a, `  ✗ ${ev.toolName ?? "tool"} failed`);
-				addItem(a, { kind: "error", text: `${ev.toolName ?? "tool"} failed` });
+				addItem(a, {
+					kind: "error",
+					text: `${ev.toolName ?? "tool"} failed`,
+					id: typeof ev.toolCallId === "string" ? ev.toolCallId : undefined,
+				});
 			}
 			break;
 		case "message_start":
@@ -1773,7 +1797,11 @@ function handleEvent(a: BgAgent, ev: any, deltaGate: () => boolean) {
 			if (text) {
 				a.lastText = text;
 				logLine(a, `💬 ${text}`);
-				addItem(a, { kind: "text", text });
+				addItem(a, {
+					kind: "text",
+					text,
+					ts: typeof m.timestamp === "number" ? m.timestamp : undefined,
+				});
 			}
 			if (m.stopReason === "error") {
 				a.error = m.errorMessage || "provider error";
@@ -1814,6 +1842,12 @@ function settleRun(a: BgAgent) {
 	if (a.settledAt) return;
 	a.settledAt = Date.now();
 	a.activity = undefined;
+	// The run's items describe work IN FLIGHT. Every finished message is already
+	// in the session file by the time `agent_settled` arrives, so keeping them
+	// made `items` replay the completed run as if it were still happening -- the
+	// phone drew the final answer twice, once from the transcript and again in
+	// its live box below it. Nothing else reads `items`; it is reset in `run()`.
+	a.items = [];
 	if (a.restartAfterInterrupt) {
 		a.state = a.pending.length ? "queued" : "idle";
 	} else if (a.state !== "cancelled" && a.error) {

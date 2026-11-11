@@ -1316,6 +1316,10 @@ const liveCache = new Map<string, { size: number; items: LiveItem[] }>();
 interface LiveItem {
 	kind: "prompt" | "tool" | "text" | "error";
 	text: string;
+	/** The finished message's own timestamp, the key the session file uses too. */
+	ts?: number;
+	/** The provider's tool call id, for the same reason. */
+	id?: string;
 }
 
 /** Size of an agent's event file — a monotonic counter for change detection. */
@@ -1348,9 +1352,9 @@ export function liveItems(id: string): LiveItem[] {
 	const items: LiveItem[] = [];
 	try {
 		const { lines } = readLinesAt(file, { max: LIVE_TAIL_BYTES });
-		const push = (kind: LiveItem["kind"], text: string) => {
+		const push = (kind: LiveItem["kind"], text: string, extra?: Partial<LiveItem>) => {
 			if (!text.trim()) return;
-			items.push({ kind, text });
+			items.push({ kind, text, ...extra });
 			if (items.length > 40) items.shift();
 		};
 		// Deltas since the last tool call: appended to one item so the phone shows
@@ -1379,10 +1383,14 @@ export function liveItems(id: string): LiveItem[] {
 			if (ev.type === "tool_execution_start") {
 				flushText();
 				const arg = summarizeArgs(ev.args);
-				push("tool", `${ev.toolName ?? "tool"}${arg ? ` ${arg}` : ""}`);
+				push("tool", `${ev.toolName ?? "tool"}${arg ? ` ${arg}` : ""}`, {
+					id: typeof ev.toolCallId === "string" ? ev.toolCallId : undefined,
+				});
 			} else if (ev.type === "tool_execution_end" && ev.isError) {
 				flushText();
-				push("error", `${ev.toolName ?? "tool"} failed`);
+				push("error", `${ev.toolName ?? "tool"} failed`, {
+					id: typeof ev.toolCallId === "string" ? ev.toolCallId : undefined,
+				});
 			} else if (
 				ev.type === "message_update" &&
 				ev.assistantMessageEvent?.type === "text_delta"
@@ -1394,6 +1402,12 @@ export function liveItems(id: string): LiveItem[] {
 					if (items.length > 40) items.shift();
 				}
 			} else if (ev.type === "message_end") {
+				// Stamp the finished text with the message's own timestamp, which is
+				// the key the session file uses too. That is what lets the stream
+				// tell "still only in flight" from "already in the transcript".
+				if (textItem && typeof ev.message?.timestamp === "number") {
+					textItem.ts = ev.message.timestamp;
+				}
 				// The message is finalized into the transcript; start clean so the
 				// live box does not repeat what the transcript now shows.
 				flushText(true);
@@ -1407,12 +1421,44 @@ export function liveItems(id: string): LiveItem[] {
 	return items;
 }
 
+/**
+ * Drop the live items the transcript already shows.
+ *
+ * Without this the phone repeats a step for one refresh after it lands: the
+ * stream ticks every 1.2s and both buffers are rebuilt from different sources,
+ * so a tool call can be in the file AND still in the run's in-flight list. The
+ * transcript wins because it is the durable copy; the live box only shows the
+ * tail the file has not caught up with.
+ *
+ * Matched by identity, never by text: the same command legitimately runs twice,
+ * and a text match would silently swallow the second one. Items with no key
+ * (an unparseable or very early event) are kept -- showing a duplicate is a far
+ * smaller error than hiding a step that never appears anywhere else.
+ */
+export function trimLiveByTranscript(
+	live: LiveItem[],
+	seen: Set<string>,
+): LiveItem[] {
+	if (!seen.size) return live;
+	return live.filter((i) => {
+		if (i.ts !== undefined && seen.has(`assistant:${i.ts}`)) return false;
+		if (i.id && seen.has(`tool:${i.id}`)) return false;
+		return true;
+	});
+}
+
 // ───────────────────────────── transcript ─────────────────────────────
 
 interface TranscriptMessage {
 	role: string;
 	text: string;
-	tools?: { name: string; arg?: string; error?: boolean }[];
+	tools?: {
+		name: string;
+		arg?: string;
+		/** The provider's call id, used to tell a live step from the one on disk. */
+		id?: string;
+		error?: boolean;
+	}[];
 	stopped?: "error" | "aborted";
 	error?: string;
 	/**
@@ -1425,7 +1471,12 @@ interface TranscriptMessage {
 	 * another front end, or a historical session all agree.
 	 */
 	final?: boolean;
-	ts?: string;
+	/**
+	 * The message's own provider timestamp (`message.timestamp`), which is what
+	 * the wire events carry too. Used to tell a step the file already shows from
+	 * one still only in flight -- never shown to the client.
+	 */
+	ts?: number;
 }
 
 /**
@@ -1489,7 +1540,7 @@ function readTranscript(file: string, limit: number): TranscriptMessage[] {
 		const m = e.message;
 		if (m?.role === "user") {
 			const text = messageText(m.content).trim();
-			if (text) out.push({ role: "user", text, ts: e.timestamp });
+			if (text) out.push({ role: "user", text, ts: messageTs(m) });
 		} else if (m?.role === "assistant") {
 			const tools: TranscriptMessage["tools"] = [];
 			let said = false;
@@ -1498,7 +1549,11 @@ function readTranscript(file: string, limit: number): TranscriptMessage[] {
 				if (b?.type === "text" && b.text?.trim()) said = true;
 				else if (b?.type === "toolCall") {
 					hasToolCall = true;
-					tools.push({ name: b.name, arg: summarizeArgs(b.arguments) });
+					tools.push({
+						name: b.name,
+						arg: summarizeArgs(b.arguments),
+						id: typeof b.id === "string" ? b.id : undefined,
+					});
 				}
 			}
 			const text = messageText(m.content).trim();
@@ -1518,15 +1573,49 @@ function readTranscript(file: string, limit: number): TranscriptMessage[] {
 							? "aborted"
 							: undefined,
 				error: m.errorMessage,
-				ts: e.timestamp,
+				ts: messageTs(m),
 			});
 		} else if (m?.role === "toolResult" && m.isError) {
 			const first =
 				messageText(m.content).split("\n").find((l: string) => l.trim()) ?? "";
-			out.push({ role: "toolError", text: first.slice(0, 240), ts: e.timestamp });
+			out.push({ role: "toolError", text: first.slice(0, 240), ts: messageTs(m) });
 		}
 	}
 	return out.slice(-limit);
+}
+
+/**
+ * A message's provider timestamp as a number.
+ *
+ * `message.timestamp` is a number on the wire and in the file; the entry's own
+ * `timestamp` is an ISO string and is not the same value. The trim below
+ * compares wire to file, so it must read the message's, not the entry's.
+ */
+function messageTs(m: any): number | undefined {
+	return typeof m?.timestamp === "number" ? m.timestamp : undefined;
+}
+
+/**
+ * The identity keys of the messages a transcript already shows.
+ *
+ * The phone draws two renderings of a run: the session file's transcript, and
+ * the run's in-flight items below it. The same step lands in both -- the file
+ * entry and the wire event carry the SAME provider timestamps and call ids
+ * (checked against a real `.out` and JSONL pair: every in-flight key appeared
+ * in the file). So the transcript owns what it has, and the live box only draws
+ * what the file has not caught up with yet.
+ *
+ * Keys are role-qualified because a wire timestamp is only unique per role.
+ * Both keys exist for every block: `message_end` gives `role:timestamp` for
+ * text, and `tool_execution_start`/`toolCall.id` gives the call id for steps.
+ */
+function transcriptIndex(messages: TranscriptMessage[]): Set<string> {
+	const seen = new Set<string>();
+	for (const m of messages) {
+		if (m.ts !== undefined) seen.add(`${m.role}:${m.ts}`);
+		for (const t of m.tools ?? []) if (t.id) seen.add(`tool:${t.id}`);
+	}
+	return seen;
 }
 
 /** Fallback reader: skip the tool-call graph, just replay message entries in order. */
@@ -2454,9 +2543,19 @@ function streamAgent(res: http.ServerResponse, id: string) {
 			}
 			// "Now doing": the last tool step. Streaming text is already a live
 			// item, so it would otherwise be printed twice in the same box.
-			const activity =
-				a?.activity ??
-				[...live].reverse().find((i) => i.kind === "tool")?.text;
+			//
+			// Gated on the run being live at all. This is derived from the event
+			// file's tail, which outlives the run, so an idle session used to keep
+			// advertising its last command forever ("● bash grep …" under a
+			// finished transcript). The transcript already shows that step; while
+			// nothing is running, "now doing" is a claim about nothing.
+			const busy =
+				row?.state === "working" || row?.state === "queued" ||
+				a?.state === "working" || a?.state === "queued";
+			const lastTool = [...live].reverse().find((i) => i.kind === "tool");
+			const activity = busy
+				? (a?.activity ?? lastTool?.text)
+				: undefined;
 			// The transcript is capped, so its length pins at the limit and edits
 			// to the newest message are invisible to a length-only hash. Include
 			// the file stat AND the event byte count so a long run cannot look
@@ -2474,13 +2573,19 @@ function streamAgent(res: http.ServerResponse, id: string) {
 			]);
 			if (key === lastKey) return;
 			lastKey = key;
+			const messages = file ? transcript(file, SSE_TRANSCRIPT_LIMIT) : [];
 			const payload = {
 				row,
-				messages: file ? transcript(file, SSE_TRANSCRIPT_LIMIT) : [],
+				messages,
 				pending: a?.pending ?? [],
 				model:
 					a?.model ?? a?.nextModel ?? (file ? sessionModel(file) : undefined),
-				live,
+				// The in-flight list is a window on work the file may already hold.
+				// Trim it against the transcript so each step is drawn once, in the
+				// copy that is durable. `activity` is deliberately NOT trimmed: it is
+				// the single "now doing" line, not a repeat of a step, and it is also
+				// what keeps a run looking alive while its only output is a tool call.
+				live: trimLiveByTranscript(live, transcriptIndex(messages)),
 				activity,
 			};
 			res.write(`data: ${JSON.stringify(payload)}\n\n`);

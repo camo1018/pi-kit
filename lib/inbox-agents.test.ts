@@ -915,7 +915,7 @@ test("sessionModel memoises but never serves a stale model", (t) => {
 	}) + line({
 		type: "model_change", id: "a", parentId: null,
 		timestamp: new Date().toISOString(),
-		provider: "example-provider", modelId: "first",
+		provider: "llm-gateway", modelId: "first",
 	}));
 	const first = runner.sessionModel(file);
 	assert.match(first ?? "", /first$/);
@@ -931,7 +931,7 @@ test("sessionModel memoises but never serves a stale model", (t) => {
 	fs.appendFileSync(file, line({
 		type: "model_change", id: "b", parentId: "a",
 		timestamp: new Date().toISOString(),
-		provider: "example-provider", modelId: "second",
+		provider: "llm-gateway", modelId: "second",
 	}));
 	assert.match(
 		runner.sessionModel(file) ?? "",
@@ -949,4 +949,28 @@ test("sessionModel memoises but never serves a stale model", (t) => {
 	// A deleted file must not return the memoised answer.
 	fs.rmSync(file);
 	assert.equal(runner.sessionModel(file), undefined);
+});
+
+test("a settled run drops its in-flight items so the transcript cannot repeat", async (t) => {
+	// The phone renders the session file's transcript AND, below it, the run's
+	// live items. `items` is appended on every `message_end` -- the same moment
+	// that message enters the file -- and nothing ever removed them, so a
+	// finished run kept being reported as "in flight" and the final answer
+	// appeared twice. The boundary is the settle.
+	t.after(() => runner.registry().agents.clear());
+	const a = runner.spawnAgent({
+		id: "settle-items",
+		title: "settle items",
+		cwd: dir,
+		prompt: "go",
+	});
+	a.items = [];
+	runner.applyEvent(a, {
+		type: "message_end",
+		message: { role: "assistant", content: [{ type: "text", text: "done" }] },
+	});
+	assert.deepEqual(a.items.map((i) => i.kind), ["text"], "the run tracks its own output");
+
+	runner.applyEvent(a, { type: "agent_settled" });
+	assert.deepEqual(a.items, [], "a settled run has no in-flight items left");
 });

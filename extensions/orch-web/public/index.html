@@ -351,6 +351,13 @@
     /** "inbox" | "archived" | "all" | "hidden" — the same four tabs the TUI has. */
     view: localStorage.getItem("orch.view") || "inbox",
     /**
+     * Whether tool calls are drawn at all: "hidden" removes every tool line,
+     * "shown" (the default) keeps them. Display-only and per-device, like the
+     * view tab -- the daemon keeps sending them either way, because hiding is a
+     * rendering choice, not a filtering one.
+     */
+    tools: localStorage.getItem("orch.tools") === "hidden" ? "hidden" : "shown",
+    /**
      * "groups" | "flat" — the All-groups list layout, shared with the TUI via
      * the group store. Seeded from the last fetch; null until then so the list
      * never draws the wrong shape for a frame.
@@ -360,6 +367,8 @@
     row: null,
     es: null,
     poll: null,
+    /** The last detail payload, so a display-only change can repaint in place. */
+    last: null,
     /** Whether the transcript is pinned to the newest message (null = not yet known). */
     stickToBottom: null,
     /** Whether the daemon offers a terminal (ORCH_WEB_ALLOW_TERM=1 + node-pty). */
@@ -581,6 +590,22 @@
     refresh();
   }
 
+  /**
+   * Show or hide tool calls everywhere in the transcript.
+   *
+   * Repaints from the payload already on screen rather than waiting for the
+   * stream: a settled session sends no further ticks, and this preference is not
+   * part of the fingerprint that decides when a tick is worth sending.
+   */
+  function setTools(mode) {
+    store.tools = mode;
+    localStorage.setItem("orch.tools", mode);
+    toast(mode === "hidden" ? "Tool calls hidden" : "Tool calls shown");
+    // Nothing else would repaint a settled session: the stream only resends when
+    // its fingerprint moves, and this preference is not part of that fingerprint.
+    if (store.last) renderDetail(store.last);
+  }
+
   function renderRow(row) {
     const n = el("div", row.child ? "row child" : "row");
     n.append(el("div", `dot ${dotClass(row)}`));
@@ -741,6 +766,8 @@
 
   async function open(id) {
     store.id = id;
+    // A previous session's payload must never be repainted onto this one.
+    store.last = null;
     document.body.classList.add("detail-open");
     syncViewport();
     $("#detail").classList.remove("hidden");
@@ -768,6 +795,7 @@
     stopWatch();
     store.id = null;
     store.row = null;
+    store.last = null;
     document.body.classList.remove("detail-open");
     $("#detail").classList.add("hidden");
     $("#list").classList.remove("hidden");
@@ -1000,6 +1028,10 @@
     const { row, messages, pending, model, live, activity } = data;
     if (!row) return;
     store.row = row;
+    // Kept so a display-only change (hiding tool calls) can repaint from the
+    // payload already on screen instead of waiting for the stream to resend a
+    // fingerprint that has not moved.
+    store.last = data;
     $("#h2").textContent = row.title;
     document.title = row.title;
 
@@ -1008,6 +1040,10 @@
       log.scrollHeight - log.scrollTop - log.clientHeight < 80;
     store.stickToBottom = atBottom;
     log.textContent = "";
+
+    // Total hidden / total shown, no per-call collapse: a tool step is already
+    // one line here, so a half-open state would cost more taps than it saves.
+    const showTools = store.tools !== "hidden";
 
     reconcileInFlight(messages);
     for (const m of messages) {
@@ -1022,16 +1058,18 @@
         const box = el("div", m.final ? "msg final" : "msg");
         box.append(el("div", "who", m.final ? "final answer" : "agent"));
         if (m.text) box.append(mdNode(m.text));
-        for (const tool of m.tools || []) {
-          box.append(el("div", "tool",
-            `🔧 ${tool.name}${tool.arg ? " " + tool.arg : ""}`));
+        if (showTools) {
+          for (const tool of m.tools || []) {
+            box.append(el("div", "tool",
+              `🔧 ${tool.name}${tool.arg ? " " + tool.arg : ""}`));
+          }
         }
         if (m.stopped === "error")
           box.append(el("div", "stopped", `✗ ${m.error || "error"}`));
         if (m.stopped === "aborted")
           box.append(el("div", "stopped", "⏸ aborted"));
         log.append(box);
-      } else if (m.role === "toolError") {
+      } else if (m.role === "toolError" && showTools) {
         log.append(el("div", "tool err", `↳ ✗ ${m.text}`));
       }
     }
@@ -1043,18 +1081,23 @@
       log.append(el("div", "live working", "● working — waiting for output…"));
     } else if (live?.length || activity) {
       const box = el("div", "live");
-      if (activity) box.append(el("div", "activity", `● ${activity}`));
+      if (activity && showTools) box.append(el("div", "activity", `● ${activity}`));
       for (const item of live) {
         const kind = item.kind || "text";
         const text = item.text || "";
-        if (kind === "tool")
-          box.append(el("div", "tool", `🔧 ${text}`));
-        else if (kind === "error")
-          box.append(el("div", "tool err", `✗ ${text}`));
-        else if (kind === "text")
+        // Hiding tools must not leave an empty dashed box behind: if every
+        // in-flight item was a tool step, the box has nothing to say.
+        if (kind === "tool" || kind === "error") {
+          if (showTools)
+            box.append(el("div", kind === "tool" ? "tool" : "tool err",
+              `${kind === "tool" ? "🔧" : "✗"} ${text}`));
+        } else if (kind === "text") {
           box.append(mdNode(text));
+        }
       }
-      log.append(box);
+      if (box.childNodes.length) log.append(box);
+      else if (working)
+        log.append(el("div", "live working", "● working — waiting for output…"));
     }
 
     const q = $("#queueBox");
@@ -1592,6 +1635,16 @@
             toast(e.message, 5000);
           }
         },
+      });
+      // Hiding tool calls is a display choice made per device, so it lives in
+      // localStorage rather than the daemon's store: the phone can run lean
+      // while the desktop keeps every step. Same idea as the TUI's ctrl+o
+      // "hidden" state, without the middle collapsed step.
+      act(items, {
+        icon: store.tools === "hidden" ? "🔧" : "·",
+        label: store.tools === "hidden" ? "Show tool calls" : "Hide tool calls",
+        sub: store.tools === "hidden" ? "only replies right now" : "every step is drawn",
+        run: () => setTools(store.tools === "hidden" ? "shown" : "hidden"),
       });
       // A terminal is the one thing the agent list cannot stand in for: an
       // interactive prompt (re-auth, sudo, a TUI). Hidden unless the daemon

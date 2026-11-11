@@ -67,12 +67,27 @@ First connection triggers a macOS firewall prompt for `node` — **Allow**.
 | See what's queued | the queue strip above the composer: **now** / **✕** per item, plus why it is waiting (see below) |
 | Start an agent | **＋** in the header (prompt, directory, group, model) |
 | Groups | **☰** → Groups |
-| List layout (grouped / flat) | **☰** → Flat list / Group by group (the TUI's `s`) |
+| List layout (grouped / flat) | **☰** → Flat list / Group by group |
+| Show / hide tool calls | **☰** → Hide tool calls (remembered per device) |
 | Insert a skill | `$` — the popup opens as you type (`$graf` → `$grafana`) |
 | Insert a command | `/` at the start of the message |
 | Reference another session | `@` — the popup opens on the `@` itself (`@ot` → `@[<session-id>]`) |
 | Terminal | **☰** → Terminal (needs `--term`) |
 | Refresh | automatic; **⟳** forces it |
+
+### Tool calls: shown or hidden
+
+**☰** → **Hide tool calls** removes every tool line from the transcript —
+the `🔧 name path` steps between replies, and the dashed live box's
+`● now doing` line, which is the one you most want gone on a small screen.
+There is no middle state: a call is drawn, or it is not. A tool block here is
+already a one-line summary, so a half-open state would cost more taps than it
+saves.
+
+The choice is remembered per device, and it is display-only: the daemon sends
+tool calls either way and only the browser skips drawing them. A running
+session still shows its reply text streaming, so hiding the steps never makes
+it look stalled.
 
 ### List layout: grouped or flat
 
@@ -207,6 +222,22 @@ Nothing is tracked separately for this: the daemon reads each message's own
 after a reload, on a historical session, and by the TUI's own
 `final-answer-divider` extension. A run that errored or was aborted has no
 final answer to mark.
+
+### The answer is never drawn twice
+
+The phone shows two renderings of a run: the transcript read out of the session
+file, and the dashed live box under it holding whatever the run is doing right
+now. Both are rebuilt independently, every tick, so the same step can briefly
+appear in both.
+
+Two rules keep it to one copy. A step leaves the live box as soon as the
+transcript can show it: the trim matches on the message's own timestamp or the
+tool call's id — the same values the file entry carries — and never on text,
+because the same command legitimately runs twice. And when a run settles its
+live items are dropped altogether, because by then every message is in the file
+the transcript is drawn from.
+
+Hiding tool calls does not change any of this; it only stops the drawing.
 
 ## Managing the daemon
 
