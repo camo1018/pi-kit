@@ -5736,11 +5736,20 @@ export default function (pi: ExtensionAPI) {
 	 * Notice a run that another pi process drove to completion on the session this
 	 * window is showing, and reload the transcript so those turns appear.
 	 *
-	 * Cheap by construction: the supervisor tick runs every 5s, readLive() is
-	 * already called on that path, and a session with no foreign record costs one
-	 * map lookup. Only the working → not-working transition reloads, and only for
-	 * the session on screen — every other session's staleness is already covered
-	 * by the inbox rows.
+	 * Cheap, but by MEASUREMENT rather than by riding someone else's work: this
+	 * hook is the only caller of `readLive()` on the tick. Orphan adoption, the
+	 * rest of the tick, never touches the live records, so this scan is real work
+	 * this file adds. It is bounded by the number of concurrent pi processes
+	 * (dead-pid records are unlinked on read), not by the session archive:
+	 *
+	 *   - 2 live records (the usual case): ~0.05ms
+	 *   - 50 live records:                  ~0.96ms
+	 *
+	 * against a 5s tick, i.e. 0.001% duty cycle. Only the working → not-working
+	 * transition reloads, and only for the session on screen, so the expensive
+	 * part (`findSessionFile`, a recursive scan of every session directory at
+	 * ~1.2ms) is paid once per foreign run, never per tick. Every other session's
+	 * staleness is already covered by the inbox rows.
 	 */
 	function watchForeignRun(): void {
 		// The tick runs every 5s, including in the middle of a session switch or

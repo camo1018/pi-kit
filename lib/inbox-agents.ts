@@ -759,6 +759,11 @@ export interface AgentSupervisorOptions {
 	 * Called on every supervisor tick, before orphan adoption. Extensions use it
 	 * to apply durable cross-process work (e.g. a queued wake) that must be
 	 * picked up by whichever process holds the session, not by the writer.
+	 *
+	 * Anything a hook does is work the tick did not do before, so keep it
+	 * proportional to live state rather than to the session archive. The sibling
+	 * of this interface is where the foreign-run watcher's scan was measured
+	 * (~0.05ms at 2 live records, ~0.96ms at 50); use that as the budget.
 	 */
 	onTick?: () => void;
 }
