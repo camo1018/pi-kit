@@ -972,6 +972,8 @@ interface RowEnv {
 	groupName: (id?: string) => string | undefined;
 	parentOf: Map<string, string>;
 	groups: any;
+	/** Read once per build; projectFamilies needs the same list. */
+	links: WorkerLink[];
 }
 
 function rowEnv(): RowEnv {
@@ -983,10 +985,12 @@ function rowEnv(): RowEnv {
 			return { groups: [], sessions: {} } as any;
 		}
 	})();
+	// Once per build. `buildRows` used to read these once and hand the same list
+	// to both the parent map and `projectFamilies`; splitting the row builders
+	// out must not turn that into a read per caller.
+	const links = readWorkerLinks(AGENT_DIR) as WorkerLink[];
 	const parentOf = new Map<string, string>();
-	for (const link of readWorkerLinks(AGENT_DIR) as WorkerLink[]) {
-		parentOf.set(link.id, link.parentId);
-	}
+	for (const link of links) parentOf.set(link.id, link.parentId);
 	return {
 		store: store as RowEnv["store"],
 		live: readLive() as unknown as Map<string, any>,
@@ -995,6 +999,7 @@ function rowEnv(): RowEnv {
 			id ? groups.groups?.find((g: any) => g.id === id)?.name : undefined,
 		parentOf,
 		groups,
+		links,
 	};
 }
 
@@ -1093,10 +1098,7 @@ function rowFromAgent(a: BgAgent, env: RowEnv): Row {
  * are always included: the caller already named the session, and refusing to
  * describe an archived one would break the phone's archived view.
  */
-export function buildRow(
-	id: string,
-	opts: { currentId?: string } = {},
-): Row | undefined {
+export function buildRow(id: string): Row | undefined {
 	const env = rowEnv();
 	const header = scanHeaders().find((h) => h.id === id);
 	const agent = header ? undefined : getAgent(id);
@@ -1104,8 +1106,7 @@ export function buildRow(
 	const row = header ? rowFromHeader(header, env) : rowFromAgent(agent!, env);
 	// The transcript stream and the send path both include archived + hidden
 	// sessions, so the projection only has to keep this one row.
-	const links = readWorkerLinks(AGENT_DIR) as WorkerLink[];
-	const projected = projectFamilies([row], [row], links, {
+	const projected = projectFamilies([row], [row], env.links, {
 		id: (r: Row) => r.id,
 		expanded: readExpanded(),
 	});
@@ -1113,7 +1114,6 @@ export function buildRow(
 }
 
 export function buildRows(opts: {
-	currentId?: string;
 	withArchived?: boolean;
 	/** Include sessions hidden by a manual `hide` override (the Filtered view). */
 	withHidden?: boolean;
@@ -1145,8 +1145,7 @@ export function buildRows(opts: {
 	// is otherwise one row per worker (137 children across 34 parents here) and
 	// buries the sessions the person actually started. projectFamilies is the
 	// same projection the TUI inbox draws, so the two views agree.
-	const links = readWorkerLinks(AGENT_DIR) as WorkerLink[];
-	const projected = projectFamilies(rows, rows, links, {
+	const projected = projectFamilies(rows, rows, env.links, {
 		id: (row: Row) => row.id,
 		expanded: readExpanded(),
 	});
@@ -2430,7 +2429,7 @@ function streamAgent(res: http.ServerResponse, id: string) {
 			// -- ~800 sessions, 1 GB -- and `.find()` the id it already had, on a
 			// 1.2s timer. Included archived and hidden because the phone can have
 			// an archived session open.
-			const row = buildRow(id, { currentId: id });
+			const row = buildRow(id);
 			// A run owned by another process (a TUI, or the parent of this
 			// daemon) has no registry handle here, so its in-flight output comes
 			// from its event file instead. Without this the view sits on an empty

@@ -152,10 +152,17 @@ interface LiveEntry {
 	updated: number;
 }
 
-/** A session's live slot: a usable record, or why it cannot be trusted. */
-interface LiveSlot {
-	sessionId: string;
-	entry?: LiveEntry;
+/**
+ * Every live record naming one session, plus any record we could not attribute.
+ *
+ * Kept as a LIST, not one "freshest" choice: our own record and a foreign one
+ * can name the same session, and collapsing them to the newest lets our own
+ * (usually newer) idle record shadow a foreign `working` one -- which reads as
+ * settled while another process is genuinely running the session.
+ */
+interface LiveSlots {
+	entries: LiveEntry[];
+	/** A record that names its session but cannot be trusted. */
 	error?: string;
 }
 
@@ -169,10 +176,10 @@ export class WorkerTeam {
 	private snap?: Map<string, Worker[]>;
 	/**
 	 * Live records for this batch, keyed by session id. Also batch-scoped.
-	 * A record that cannot be trusted is kept as `{ error }` against the session
-	 * it names, so only THAT session is refused -- see `liveEntry`.
+	 * A record that cannot be trusted is kept as `error` against the session it
+	 * names, so only THAT session is refused -- see `liveEntry`.
 	 */
-	private liveSnap?: Map<string, { entry?: LiveEntry; error?: string }>;
+	private liveSnap?: Map<string, LiveSlots>;
 
 	constructor(
 		readonly agentDir: string,
@@ -722,27 +729,22 @@ export class WorkerTeam {
 	 * consults this for every worker, so without batching a sweep re-read and
 	 * re-parsed the whole live directory once per worker record.
 	 */
-	private liveBySession(): Map<string, LiveSlot> {
+	private liveBySession(): Map<string, LiveSlots> {
 		return this.liveSnap ?? this.readLiveBySession();
 	}
 
-	private readLiveBySession(): Map<string, LiveSlot> {
-		const by = new Map<string, LiveSlot>();
+	private readLiveBySession(): Map<string, LiveSlots> {
+		const by = new Map<string, LiveSlots>();
 		const dir = path.join(this.agentDir, "inbox-live");
 		for (const name of names(dir)) {
 			const slot = this.liveEntry(dir, name);
 			if (!slot) continue;
+			const current = by.get(slot.sessionId) ?? { entries: [] };
 			// A refusal outranks a readable record for the same session: we know
 			// something is wrong with it, and "unknown" is the safe answer.
-			if (slot.error) {
-				by.set(slot.sessionId, slot);
-				continue;
-			}
-			const previous = by.get(slot.sessionId);
-			if (!previous || (previous.entry &&
-				(slot.entry?.updated ?? 0) > previous.entry.updated)) {
-				by.set(slot.sessionId, slot);
-			}
+			if (slot.error) current.error ??= slot.error;
+			else if (slot.entry) current.entries.push(slot.entry);
+			by.set(slot.sessionId, current);
 		}
 		return by;
 	}
@@ -754,7 +756,10 @@ export class WorkerTeam {
 	 * or its owner is gone, and a slot with `error` when it exists but cannot be
 	 * trusted.
 	 */
-	private liveEntry(dir: string, name: string): LiveSlot | undefined {
+	private liveEntry(
+		dir: string,
+		name: string,
+	): { sessionId: string; entry?: LiveEntry; error?: string } | undefined {
 		let live: {
 			sessionId?: string;
 			pid?: number;
@@ -815,9 +820,17 @@ export class WorkerTeam {
 		const local = this.runner.get(id);
 		const slot = this.liveBySession().get(id);
 		if (slot?.error) throw new Error(slot.error);
-		// A record written by this very process is not a foreign writer.
-		if (!slot?.entry || slot.entry.pid === local?.pid) return undefined;
-		return { state: slot.entry.state, pid: slot.entry.pid };
+		// Our own record is not a foreign writer, but a foreign record for the
+		// same session still is -- so drop ours and consider the rest. Collapsing
+		// to the single freshest record instead let our own (usually newer) idle
+		// record shadow a foreign `working` one and report "settled" while
+		// another process was running the session.
+		let freshest: LiveEntry | undefined;
+		for (const entry of slot?.entries ?? []) {
+			if (entry.pid === local?.pid) continue;
+			if (!freshest || entry.updated > freshest.updated) freshest = entry;
+		}
+		return freshest && { state: freshest.state, pid: freshest.pid };
 	}
 
 	send(caller: string, id: string, text: string): void {
