@@ -72,6 +72,18 @@ export interface BgAgent {
 	runStartedAt?: number;
 	/** Exact pre-prompt checkpoint, captured before launching the child. */
 	runBaseLeafId?: string | null;
+	/**
+	 * Leaf the caller was viewing when it sent the next message.
+	 *
+	 * The spawn is `pi --session <path>` and there is no leaf argument, so a
+	 * child resumes on the file's LAST line. In an attached view that is not
+	 * the branch on screen: `/tree` to an older point and type, and the prompt
+	 * lands on the newest branch instead. `run()` pins this leaf with a
+	 * `pi-kit.tree-position` marker before spawning so the child resumes here.
+	 * Captured at SEND time, not spawn time -- "the branch I was looking at when
+	 * I typed" -- which is also correct for a message that waits in `pending`.
+	 */
+	nextRunLeaf?: string;
 	/** Bytes of the event file consumed so far. */
 	outOffset?: number;
 	createdAt: number;
@@ -456,6 +468,8 @@ interface SavedAgent {
 	runPrompt?: string;
 	runStartedAt?: number;
 	runBaseLeafId?: string | null;
+	/** Leaf the next run must resume on; see `BgAgent.nextRunLeaf`. */
+	nextRunLeaf?: string;
 	createdAt: number;
 	updatedAt: number;
 	runs: number;
@@ -540,6 +554,7 @@ function persist(a: BgAgent) {
 		runPrompt: a.runPrompt,
 		runStartedAt: a.runStartedAt,
 		runBaseLeafId: a.runBaseLeafId,
+		nextRunLeaf: a.nextRunLeaf,
 		createdAt: a.createdAt,
 		updatedAt: a.updatedAt,
 		runs: a.runs,
@@ -961,6 +976,7 @@ function adopt(s: SavedAgent) {
 		a.runPrompt = s.runPrompt;
 		a.runStartedAt = s.runStartedAt;
 		a.runBaseLeafId = s.runBaseLeafId;
+		a.nextRunLeaf = s.nextRunLeaf;
 		a.outOffset = 0; // replay the run so far
 		a.liveRun = newLiveRun();
 		if (s.runPrompt) {
@@ -1376,8 +1392,29 @@ function run(a: BgAgent) {
 	}
 	// Capture before the child can append its prompt or any tool steps.
 	a.runStartedAt = Date.now();
+	const resumeLeaf = a.nextRunLeaf;
+	a.nextRunLeaf = undefined;
 	a.runBaseLeafId = a.sessionFile && fs.existsSync(a.sessionFile)
 		? SessionManager.open(a.sessionFile).getLeafId() : null;
+	// Pin the caller's view before spawning. There is no leaf argument on the
+	// command line, so a child always resumes on the file's LAST line; without
+	// this a `/tree` position is silently discarded and the prompt continues the
+	// newest branch instead. The marker is the same mechanism `tree-position`
+	// uses, and the last line of the file then IS the chosen leaf.
+	if (resumeLeaf && a.sessionFile && fs.existsSync(a.sessionFile)) {
+		try {
+			const sm = SessionManager.open(a.sessionFile);
+			// Only when it would otherwise resume somewhere else: an ordinary
+			// send already lands on the tip and does not need another marker.
+			if (sm.getLeafId() !== resumeLeaf && sm.getEntry(resumeLeaf)) {
+				sm.branch(resumeLeaf);
+				sm.appendCustomEntry("pi-kit.tree-position", {});
+			}
+		} catch {
+			// A marker we could not write is not worth failing the run over; the
+			// child falls back to its normal resume point.
+		}
+	}
 	// Reopen the session by PATH, not by id. `--session-id` is resolved against
 	// the cwd's project directory only, so a run whose cwd differs from where
 	// the session was created does not find it and pi quietly starts a new,
@@ -1907,6 +1944,12 @@ export function spawnAgent(opts: {
 export function sendToAgent(opts: {
 	id: string; cwd: string; sessionFile?: string; title: string;
 	text: string; model?: string; extensionPaths?: string[];
+	/**
+	 * Leaf the sender was viewing. Pins where the child resumes, so a `/tree`
+	 * position survives the delegated spawn instead of the prompt landing on the
+	 * file's newest line. Omit for a background worker with no branch on screen.
+	 */
+	leaf?: string;
 }): BgAgent {
 	let a = getAgent(opts.id);
 	if (!a) {
@@ -1928,6 +1971,7 @@ export function sendToAgent(opts: {
 		registry().agents.set(a.id, a);
 	}
 	a.pending.push(opts.text);
+	if (opts.leaf) a.nextRunLeaf = opts.leaf;
 	if (opts.extensionPaths) a.extensionPaths = opts.extensionPaths;
 	if (opts.model) {
 		a.nextModel = opts.model;

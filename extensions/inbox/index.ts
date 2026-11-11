@@ -117,6 +117,7 @@ import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 import {
 	beforeRun, branchName, selectedHistory, sourceName,
 } from "../../lib/session-branch.ts";
+import { staleAgainstDisk } from "../../lib/session-stale.ts";
 import { writeClone as writeCloneFile } from "../../lib/session-clone.ts";
 import { handleVisitModelInput } from "./visit-models.ts";
 import * as os from "node:os";
@@ -7263,6 +7264,59 @@ export default function (pi: ExtensionAPI) {
 		setReplyTarget(next, ctx);
 	}
 
+	/**
+	 * Reopen this session from disk, keeping the draft in the editor.
+	 *
+	 * Exists because the only other reload path (`refreshCurrent`, behind
+	 * `/orchestrator refresh`) refuses exactly the two cases where this is
+	 * needed: a taken-over session and orchestration being off. A pi process
+	 * holds its transcript and leaf in memory and appends without re-reading, so
+	 * a writer elsewhere leaves it on a stale leaf; the next turn then forks the
+	 * tree from that node instead of appending to the real tip.
+	 *
+	 * The switch is same-file, which `session_before_switch` cancels for a
+	 * taken-over main (it protects the main from re-select aborts). That guard
+	 * honours `takeoverSwitch`, so mark the id for the duration, exactly as the
+	 * takeover-completion path does.
+	 */
+	pi.registerCommand("resync", {
+		description:
+			"Reload this session from disk so the next turn appends to the real tip (keeps your draft)",
+		handler: async (_args, ctx) => {
+			const file = ctx.sessionManager.getSessionFile();
+			if (!file) return ctx.ui.notify("This session isn't saved yet.", "info");
+			// A run in flight owns the file; reopening would yank the transcript out
+			// from under it and the run's next append would still use its own leaf.
+			if (!ctx.isIdle()) {
+				return ctx.ui.notify(
+					"A turn is running: resync when it finishes.",
+					"warning",
+				);
+			}
+			const id = ctx.sessionManager.getSessionId();
+			const before = staleAgainstDisk(ctx.sessionManager, file);
+			const draft = ctx.ui.getEditorText();
+			const ms = modeState();
+			// Let the same-file switch through the taken-over guard.
+			ms.takeoverSwitch = id;
+			try {
+				await ctx.switchSession(file, {
+					withSession: async (c) => {
+						if (draft) c.ui.setEditorText(draft);
+						c.ui.notify(
+							before.stale
+								? "Resynced: the file had entries this window hadn't seen. Your draft is still in the editor."
+								: "Already up to date with the file.",
+							"info",
+						);
+					},
+				});
+			} finally {
+				if (ms.takeoverSwitch === id) ms.takeoverSwitch = undefined;
+			}
+		},
+	});
+
 	// ── Reply routing: when a reply target is set, the next message typed in pi's own editor
 	// goes to that background agent (or starts a new one) instead of the foreground session.
 	// Extension and built-in slash commands run before this hook, so they are never captured.
@@ -7296,12 +7350,15 @@ export default function (pi: ExtensionAPI) {
 				);
 			// The visit's model comes from its own saved/pending choice, never
 			// from the hidden foreground runtime used to host this view.
+			// The visit renders its own branch from disk, so pin the session's
+			// current tip rather than whatever the hidden main is showing.
 			sendToAgent({
 				id: v.id,
 				cwd: v.cwd,
 				sessionFile: v.file,
 				title: v.title,
 				text,
+				leaf: SessionManager.open(v.file).getLeafId() ?? undefined,
 			});
 			showModeWidget(ctx);
 			showLiveStream(ctx); // queued count / running state may have changed
@@ -7365,6 +7422,8 @@ export default function (pi: ExtensionAPI) {
 				title,
 				text,
 				model: currentModel(ctx),
+				// The branch on screen, which `/tree` may have moved off the tip.
+				leaf: ctx.sessionManager.getLeafId() ?? undefined,
 			});
 			modeState().wasRunning.add(id);
 			// No notify() here: in pi that's a permanent chat line, so "Queued" outlived the delivery.
