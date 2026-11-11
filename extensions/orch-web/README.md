@@ -84,8 +84,51 @@ Either one flips it for both, and the phone re-reads it on every refresh.
 Pinned rows sort first in both layouts, matching the TUI's `★ PINNED`
 partition.
 
-Status dots: `●` working · `◆` your turn · `✗` error · `⚠` stalled (run was cut
-off) · `⏸` aborted.
+### The status dot
+
+Each row has one coloured dot on the left, and it is a plain circle rather than
+the TUI's glyphs. It answers a single question: is there anything here for you?
+
+| Dot | Meaning |
+|---|---|
+| yellow, pulsing | Running now — the agent's own record, or another live pi |
+| dim yellow | Queued behind another run (see *Why a message queues*) |
+| green | Finished and waiting on you |
+| purple | Unread — not looked at since it last finished or failed |
+| red | Errored, or the run was cut off partway (process died mid-turn) |
+| grey | Aborted, or no messages yet |
+
+Those states can collide, and the dot rules all have the same CSS specificity,
+so which colour wins is deliberately the order they are written in, least urgent
+to most:
+
+```text
+your-turn / aborted  <  unread  <  working / queued  <  error / stalled
+```
+
+Purple beats green because green reads as "nothing to do", which is the one
+thing an unread session is not. A live run still beats unread, since yellow is
+what tells you it is moving without you. Red stays last: an error is the one
+state that must not be quietened by "you have not read this yet".
+
+Unread means the session finished or failed after you last looked at it. Opening
+it marks it read, and so does the TUI's `v` peek or watching it finish in a
+window you are attached to. **Mark read / unread** toggles it by hand: marking
+unread keeps the purple dot even once the session is genuinely green, until you
+next open it. The two front ends share the same `seenAt` / `unreadAt` in
+`~/.pi/agent/inbox.json`, so reading on the phone clears it on the desktop
+too — unlike the TUI, the phone has no separate `•` beside the title, since
+the dot already occupies that glance slot.
+
+The dot is a glance, not the only signal. The row's meta line spells the same
+state out in words (working, queued, your turn, error, stalled, aborted) next
+to its age, then the group in the flat layout, `archived`, and the model. A row
+with messages queued also gets a `N⏳` pill on the right, and one running right
+now a `●` pill.
+
+Other markers live in the title itself: `★` pinned, `⊘` hidden, and
+`▸ 3` / `▾ 3` on a parent with delegated workers — tap that chip and the
+family folds out without the session opening.
 
 ## Final answer
 
@@ -155,7 +198,7 @@ Every row's `⋯` opens the same set the inbox list has on its keys:
 | Clone | A working agent is cut *before* its active prompt |
 | Move to group | includes "New group…" |
 | Pin / unpin | |
-| Mark read / unread | |
+| Mark read / unread | unread rides the status dot; see above |
 | Archive / unarchive | |
 | Hide / unhide | manual filing; shows under **Hidden** |
 | Cancel run | |
