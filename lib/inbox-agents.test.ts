@@ -829,3 +829,54 @@ test("a live background run keeps its run lock", async () => {
 		fs.rmSync(lock, { force: true });
 	}
 });
+
+test("sessionModel memoises but never serves a stale model", (t) => {
+	// Opening a session parses the WHOLE file, and a session list asks for this
+	// once per row. On a real machine that is 1.0 GB across 799 files: 2,171ms
+	// for one pass. orch-web's SSE tick did it for every row every 1.2s, which
+	// made a 2.2s rebuild on a 1.2s timer and grew the socket backlog without
+	// bound. The memo has to be exact, or a session would report the wrong model.
+	const file = join(dir, "memo.jsonl");
+	const line = (value: unknown) => `${JSON.stringify(value)}\n`;
+	fs.writeFileSync(file, line({
+		// SessionManager.open needs a real header or it yields no branch at all.
+		type: "session", version: 3, id: "memo-session",
+		timestamp: new Date().toISOString(), cwd: dir,
+	}) + line({
+		type: "model_change", id: "a", parentId: null,
+		timestamp: new Date().toISOString(),
+		provider: "llm-gateway", modelId: "first",
+	}));
+	const first = runner.sessionModel(file);
+	assert.match(first ?? "", /first$/);
+
+	// Warm: same answer. Proven by timing rather than by a spy, because the
+	// expensive call lives in another module and mocking it would test the mock.
+	const before = process.hrtime.bigint();
+	assert.equal(runner.sessionModel(file), first);
+	const warmMs = Number(process.hrtime.bigint() - before) / 1e6;
+	assert.ok(warmMs < 5, `a warm read must not re-parse; took ${warmMs}ms`);
+
+	// An append moves (mtime, size), which must invalidate.
+	fs.appendFileSync(file, line({
+		type: "model_change", id: "b", parentId: "a",
+		timestamp: new Date().toISOString(),
+		provider: "llm-gateway", modelId: "second",
+	}));
+	assert.match(
+		runner.sessionModel(file) ?? "",
+		/second$/,
+		"an appended model change must be visible",
+	);
+
+	// A thinking-level change must fold into the same string.
+	fs.appendFileSync(file, line({
+		type: "thinking_level_change", id: "c", parentId: "b",
+		timestamp: new Date().toISOString(), thinkingLevel: "high",
+	}));
+	assert.match(runner.sessionModel(file) ?? "", /second:high$/);
+
+	// A deleted file must not return the memoised answer.
+	fs.rmSync(file);
+	assert.equal(runner.sessionModel(file), undefined);
+});
