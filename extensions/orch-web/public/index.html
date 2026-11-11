@@ -740,7 +740,11 @@
     // Give the phone's back gesture something to pop, so it returns to the
     // list instead of leaving the app.
     if (history.state?.orch !== id) history.pushState({ orch: id }, "", "#" + id);
-    $("#input").focus();
+    // Deliberately do NOT focus the composer on entry: on a phone that pops the
+    // keyboard and covers half the transcript before you have read anything.
+    // The composer takes focus when tapped, which is when you want to type.
+    const focused = document.activeElement;
+    if (focused && focused.id === "input") focused.blur();
   }
 
   /** Hide the overlay and refresh the list. Idempotent; safe to call twice. */
