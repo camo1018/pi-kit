@@ -1992,9 +1992,31 @@ export function branchSettings(branch: any[]): { model?: string; level?: string 
 	return { model, level };
 }
 
+/**
+ * Memo for `sessionModel`, keyed on (mtime, size) like the inbox's parse cache.
+ *
+ * Opening a session parses the WHOLE file, and a session list asks for this
+ * once per row. On a real machine that was 1.0 GB across 799 files: 2,171ms per
+ * call. orch-web's SSE tick called it for every row every 1.2s, which is a
+ * 2.2s rebuild on a 1.2s timer.
+ */
+const sessionModelCache = new Map<
+	string,
+	{ mtimeMs: number; size: number; value?: string }
+>();
+
 /** The model a session will use next: "provider/model:thinking", as pi restores it from the active branch. */
 export function sessionModel(file: string | undefined): string | undefined {
 	if (!file) return undefined;
+	let st: fs.Stats;
+	try {
+		st = fs.statSync(file);
+	} catch {
+		return undefined;
+	}
+	const cached = sessionModelCache.get(file);
+	if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size)
+		return cached.value;
 	let branch: any[];
 	try {
 		branch = SessionManager.open(file).getBranch() as any[];
@@ -2002,7 +2024,9 @@ export function sessionModel(file: string | undefined): string | undefined {
 		return undefined;
 	}
 	const { model, level } = branchSettings(branch);
-	return model ? `${model}${level ? `:${level}` : ""}` : undefined;
+	const value = model ? `${model}${level ? `:${level}` : ""}` : undefined;
+	sessionModelCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, value });
+	return value;
 }
 
 /** Split provider/model[:thinking] without breaking slash/colon model IDs. */
