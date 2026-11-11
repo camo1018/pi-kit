@@ -21,7 +21,7 @@ process.env.HOME = home;
 const agentDir = path.join(home, ".pi", "agent");
 fs.mkdirSync(path.join(agentDir, "sessions"), { recursive: true });
 
-const { buildRows, eventBytes, firstUserText, lanAddress, liveItems,
+const { buildRow, buildRows, eventBytes, firstUserText, lanAddress, liveItems,
 	mentionChoices, modelChoices, readLinesAt, readName, readTail,
 	sanitizeForLog, transcript } = await import("./server.ts");
 
@@ -829,6 +829,75 @@ test("our own live record is running, not another pi", async () => {
 	assert.equal(row.queueReason, "running", "our own run is just this run");
 	registry().agents.delete(id);
 	fs.rmSync(path.join(agentDir, "inbox-live", `${process.pid}.json`), { force: true });
+});
+
+test("buildRow describes one session exactly as the list would", () => {
+	// The transcript stream needs ONE row and knew its id, yet called
+	// `buildRows()` -- every session on disk -- on a 1.2s timer, then
+	// `.find()`-ed it. Same "fingerprint before the work" mistake the inbox
+	// refresh fixed. `buildRow` must agree with the list projection or the phone
+	// would show a different row than the list it came from.
+	for (let i = 0; i < 6; i++) {
+		writeSession({
+			id: `b000000${i}-0000-0000-0000-00000000000${i}`,
+			cwd: `/scratch/dir${i}`,
+			messages: [user(`task ${i}`), assistant(`done ${i}`)],
+		});
+	}
+	const all = buildRows({ withArchived: true, withHidden: true }).rows;
+	assert.ok(all.length >= 6);
+	for (const row of all) {
+		const single = buildRow(row.id);
+		assert.ok(single, `buildRow must find ${row.id}`);
+		// The identifying fields the phone renders.
+		for (const field of [
+			"id", "title", "cwd", "status", "state", "model", "created",
+			"updated", "pinned", "archived", "hidden", "groupId", "groupName",
+			"parentId", "firstPrompt", "lastText",
+		] as const) {
+			assert.deepEqual(
+				single[field],
+				row[field],
+				`${row.id}: ${field} differs from the list`,
+			);
+		}
+	}
+	assert.equal(buildRow("no-such-session"), undefined);
+});
+
+test("transcript memoises but never serves a stale tail", () => {
+	// A whole-file parse per 1.2s tick, purely to redraw a tail that had not
+	// changed. Memoised on (mtime, size); an append must invalidate or the phone
+	// would freeze on an old transcript.
+	const file = writeSession({
+		id: "c0000001-0000-0000-0000-000000000001",
+		messages: [user("first"), assistant("one")],
+	});
+	const initial = transcript(file, 60);
+	assert.ok(initial.length >= 2);
+
+	const warmStart = process.hrtime.bigint();
+	assert.deepEqual(transcript(file, 60), initial, "a warm read is identical");
+	const warmMs = Number(process.hrtime.bigint() - warmStart) / 1e6;
+	assert.ok(warmMs < 5, `a warm read must not re-parse; took ${warmMs}ms`);
+
+	fs.appendFileSync(file, `${JSON.stringify({
+		type: "message",
+		id: "appended",
+		parentId: null,
+		timestamp: new Date().toISOString(),
+		message: {
+			role: "assistant",
+			content: [{ type: "text", text: "appended reply" }],
+			stopReason: "stop",
+		},
+	})}\n`);
+	const after = transcript(file, 60);
+	assert.equal(
+		after.at(-1)?.text,
+		"appended reply",
+		"an append must invalidate the memo",
+	);
 });
 
 test.after(() => fs.rmSync(home, { recursive: true, force: true }));
