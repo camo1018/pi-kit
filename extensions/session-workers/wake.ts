@@ -132,7 +132,10 @@ function teamAgents(
 	team: WorkerTeam,
 	parentId: string,
 ): { id: string; agent?: BgAgent; disposition?: Quiescence }[] | undefined {
-	const workers = team.workers(parentId);
+	// Identities, not full records: this only ever reads `worker.id`. Reading the
+	// bodies made every sweep parse every record for every team, which is what
+	// the identity index exists to avoid.
+	const workers = team.identities(parentId);
 	if (workers.length === 0) return undefined;
 	// A worker missing from this registry is either released after settling or
 	// running in another process. Only the live session records can tell those

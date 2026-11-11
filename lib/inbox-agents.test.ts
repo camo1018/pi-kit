@@ -845,7 +845,7 @@ test("sessionModel memoises but never serves a stale model", (t) => {
 	}) + line({
 		type: "model_change", id: "a", parentId: null,
 		timestamp: new Date().toISOString(),
-		provider: "llm-gateway", modelId: "first",
+		provider: "example-provider", modelId: "first",
 	}));
 	const first = runner.sessionModel(file);
 	assert.match(first ?? "", /first$/);
@@ -861,7 +861,7 @@ test("sessionModel memoises but never serves a stale model", (t) => {
 	fs.appendFileSync(file, line({
 		type: "model_change", id: "b", parentId: "a",
 		timestamp: new Date().toISOString(),
-		provider: "llm-gateway", modelId: "second",
+		provider: "example-provider", modelId: "second",
 	}));
 	assert.match(
 		runner.sessionModel(file) ?? "",

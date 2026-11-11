@@ -284,12 +284,13 @@ test("a batch reads the worker directory once, and never cache-stales", async (t
 	});
 	assert.ok(parents.length >= 2, "more than one team, or this proves nothing");
 	const parses = spy.mock.callCount();
-	// 8 parents x 8 records was 64 parses before batching. Allow a pass or two
-	// of slack for lookups that legitimately re-read one record; the point is
-	// that it is no longer multiplied by the number of teams.
+	// 8 parents x 8 records was 64 parses before batching. The INDEX adds a
+	// second pass: one to rebuild it (first read in this test), one to validate
+	// the next read against it. Still constant in the number of TEAMS, which is
+	// the property that matters -- so allow 3 passes, not 64.
 	assert.ok(
-		parses <= 20,
-		`one pass over 8 records, not one per parent; saw ${parses}`,
+		parses <= 24,
+		`a couple of passes over 8 records, not one per parent; saw ${parses}`,
 	);
 
 	// Outside a batch the read is always fresh. Records are rewritten IN PLACE
@@ -355,4 +356,89 @@ test("our own live record must not shadow a foreign writer of the same session",
 	// record written by this process is not a foreign writer.
 	fs.rmSync(join(live, `${foreign}.json`));
 	assert.equal(s.team.foregroundDisposition(worker.id), "settled");
+});
+
+test("the identity index is reused but never serves stale identity", async (t) => {
+	// `parents()` and the ownership checks need only id/parentId/createdAt/
+	// ownerPid/ownerToken, all fixed at creation. Reading them used to mean
+	// parsing every record body: 150 files, 150 opens, per sweep, growing with
+	// the install. The index turns that into one read.
+	//
+	// The risk it introduces is desync, so pin the invalidation on creates and
+	// deletes -- the two things that change identity.
+	const s = setup(t);
+	for (let i = 0; i < 4; i++) await s.spawn(`idx-team-${i}`);
+	const dir = join(s.dir, "session-workers", "workers");
+	const indexFile = join(s.dir, "session-workers", "workers-index.json");
+
+	const first = s.team.parents();
+	assert.ok(first.includes("idx-team-0"));
+	assert.ok(fs.existsSync(indexFile), "the index is written on first read");
+
+	// Warm: reused, not rebuilt. Counted through the public seam rather than by
+	// timing, which would be flaky on a loaded machine.
+	const bodies = t.mock.method(s.team, "worker");
+	s.team.parents();
+	s.team.identities("idx-team-0");
+	s.team.ownsWake("idx-team-0");
+	assert.equal(
+		bodies.mock.callCount(),
+		0,
+		"a warm read must not parse any record body",
+	);
+
+	// A NEW record must appear without any explicit invalidation.
+	fs.writeFileSync(join(dir, "brand-new-worker.json"), JSON.stringify({
+		id: "brand-new-worker",
+		parentId: "brand-new-team",
+		title: "brand-new-worker",
+		cwd: s.dir,
+		extensionPath: "/extensions/session-workers/index.ts",
+		createdAt: Date.now(),
+		wake: true,
+	}));
+	assert.ok(
+		s.team.parents().includes("brand-new-team"),
+		"a created record must not be hidden by a cached index",
+	);
+
+	// A DELETED record must disappear.
+	fs.rmSync(join(dir, "brand-new-worker.json"));
+	assert.ok(
+		!s.team.parents().includes("brand-new-team"),
+		"a deleted record must not linger in the cached index",
+	);
+});
+
+test("a stale stamp cannot hide a new team from the index", async (t) => {
+	// The index is trusted on (mtime, ctime) of the worker directory. Directory
+	// timestamps have finite resolution, so two mutations inside one tick can
+	// leave the stamp looking unchanged -- and a create is exactly the case where
+	// a stale index would hide a brand-new team from the wake sweep, stranding its
+	// fan-out. The record count is O(1) to compare and closes that window.
+	const s = setup(t);
+	await s.spawn("stamp-team");
+	s.team.parents(); // writes the index
+
+	const indexFile = join(s.dir, "session-workers", "workers-index.json");
+	const good = JSON.parse(fs.readFileSync(indexFile, "utf-8"));
+
+	// Forge a stale index: same stamp, same file list, but MISSING a record --
+	// exactly what a same-tick create would produce.
+	const dir = join(s.dir, "session-workers", "workers");
+	const names = fs.readdirSync(dir).filter((n) => n.endsWith(".json"));
+	fs.writeFileSync(indexFile, JSON.stringify({
+		...good,
+		files: names,
+		records: [], // dropped
+	}));
+
+	// Use a SECOND team object: the first one memoises the bucketed index in
+	// memory, so it would answer from that cache and never consult the file.
+	// A fresh object is what a new pi process sees.
+	const fresh = new (s.team.constructor as any)(s.dir, (s.team as any).runner);
+	assert.ok(
+		fresh.parents().includes("stamp-team"),
+		"an index whose records do not match its file list must be rebuilt",
+	);
 });
