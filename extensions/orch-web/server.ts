@@ -1625,7 +1625,7 @@ export function startOrchWeb(cfg: Config) {
 		if (spawn && termEnabled()) terminalHost();
 	});
 	// Adopts agents whose owner stopped beating and keeps their queues draining.
-	startAgentSupervisor({});
+	startAgentSupervisor({}, "orch-web");
 	// The model catalog names only what each provider supports per model, so the
 	// phone can hide thinking levels that would be rejected. Optional: a failure
 	// just leaves every level on offer.

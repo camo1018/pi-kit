@@ -709,7 +709,10 @@ export class WorkerTeam {
 					onTick: () => sweepWakeRequests(this, caller),
 				}
 			: { onTick: () => sweepWakeRequests(this, caller) };
-		this.runner.supervise(options);
+		// A stable id: one window supervises one team at a time, so a switch to a
+		// new parent replaces this hook. Passing no id would delete the inbox's
+		// foreign-run watcher, which shares the same interval.
+		this.runner.supervise(options, "session-workers:wake");
 	}
 
 	async spawn(opts: {

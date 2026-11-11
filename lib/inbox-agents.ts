@@ -763,22 +763,98 @@ export interface AgentSupervisorOptions {
 	onTick?: () => void;
 }
 
-/** Heartbeat owned runs and adopt orphans; safe across session reloads. */
-export function startAgentSupervisor(options: AgentSupervisorOptions = {}) {
-	if (isAgentChild()) {
-		if (!options.allowBackground || !options.adoptSessionIds) return;
-	}
+/**
+ * The hooks riding the one supervisor interval, keyed by the subsystem that owns
+ * them.
+ *
+ * There is deliberately only ONE interval: it heartbeats every owned run and
+ * adopts orphans, which must happen once, not once per extension. It used to
+ * also hold a single `onTick`, and every caller did `clearInterval(previous)`
+ * before installing its own -- so the last extension to register silently deleted
+ * the others' work. That is what stopped the inbox from ever noticing a run the
+ * phone finished: `session-workers` registers on the same `session_start` and
+ * took the hook away. Hooks are additive now, and an idempotent key per caller
+ * means a re-registration (a session switch, a `/reload`) replaces its own hook
+ * rather than stacking up.
+ */
+const SUPERVISOR_HOOKS_KEY = Symbol.for("pi.inbox.agentSupervisorHooks");
+
+interface SupervisorState {
+	hooks: Map<string, AgentSupervisorOptions>;
+}
+
+function supervisorState(): SupervisorState {
+	const G = globalThis as any;
+	return (G[SUPERVISOR_HOOKS_KEY] ??= { hooks: new Map() });
+}
+
+/**
+ * Heartbeat owned runs, run every subsystem's tick hook, and adopt orphans.
+ *
+ * Safe across session reloads. Callers pass a stable `id` so re-registering from
+ * an extension that is re-instantiated per session replaces its own hook; several
+ * callers coexist on the single interval.
+ */
+export function startAgentSupervisor(
+	options: AgentSupervisorOptions = {},
+	id = "default",
+) {
+	const state = supervisorState();
 	const G = globalThis as any;
 	const key = Symbol.for("pi.inbox.agentSupervisor");
-	if (G[key]) clearInterval(G[key]);
-	const tick = () => {
-		for (const a of listAgents()) if (needsPersist(a)) persist(a);
-		options.onTick?.();
-		adoptOrphans(options.adoptSessionIds);
-	};
-	G[key] = setInterval(tick, OWNER_BEAT_MS);
-	G[key].unref?.();
-	tick();
+	// A background parent may only supervise its own delegated team, so a caller
+	// that does not scope its adoption installs nothing. Drop any hook it left
+	// behind rather than letting a stale one keep adopting.
+	if (
+		isAgentChild() &&
+		!(options.allowBackground && options.adoptSessionIds)
+	) {
+		state.hooks.delete(id);
+		if (state.hooks.size === 0 && G[key]) {
+			clearInterval(G[key]);
+			G[key] = undefined;
+		}
+		return;
+	}
+	state.hooks.set(id, options);
+	if (!G[key]) {
+		G[key] = setInterval(runSupervisorTick, OWNER_BEAT_MS);
+		G[key].unref?.();
+	}
+	runSupervisorTick();
+}
+
+/**
+ * The adoptable set for however many hooks are registered.
+ *
+ * A background parent's hooks are all scoped sets, and adopting the union of them
+ * is exactly what each would have adopted alone. A hook with no set adopts
+ * everything, which only an interactive pi can register.
+ */
+function supervisorAdoptScope(
+	state: SupervisorState,
+): ReadonlySet<string> | undefined {
+	const union = new Set<string>();
+	for (const options of state.hooks.values()) {
+		if (!options.adoptSessionIds) return undefined;
+		for (const id of options.adoptSessionIds) union.add(id);
+	}
+	return union;
+}
+
+function runSupervisorTick(): void {
+	const state = supervisorState();
+	for (const a of listAgents()) if (needsPersist(a)) persist(a);
+	// One failing hook must not cost the others their tick, and adoption (which
+	// keeps queues draining) must never be skipped because a hook threw.
+	for (const options of state.hooks.values()) {
+		try {
+			options.onTick?.();
+		} catch {
+			// best effort: the next tick tries again
+		}
+	}
+	adoptOrphans(supervisorAdoptScope(state));
 }
 
 function adoptOrphans(allowedIds?: ReadonlySet<string>) {

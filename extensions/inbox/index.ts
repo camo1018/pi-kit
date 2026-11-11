@@ -5126,7 +5126,12 @@ export default function (pi: ExtensionAPI) {
 		// session (the phone front end) is only visible as file state, so it needs a periodic look.
 		if (ctx.mode === "tui" && !isAgentChild()) {
 			installForeignRunWatch();
-			startAgentSupervisor({ onTick: () => watchForeignRun() });
+			// Same interval as session-workers' wake sweep, so this needs its own id:
+			// without one it would be replaced by whichever extension registered last.
+			startAgentSupervisor(
+				{ onTick: () => watchForeignRun() },
+				"inbox:foreign-run",
+			);
 		}
 		if (ctx.mode === "tui") {
 			viewing = ctx.sessionManager.getSessionId();

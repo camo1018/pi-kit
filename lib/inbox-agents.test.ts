@@ -175,6 +175,76 @@ test("background supervisors heartbeat teams without adopting ancestors", async 
 	assert.deepEqual(fs.readFileSync(join(root, "unrelated.json")), unrelated);
 });
 
+test("every registered tick hook survives a later supervisor registration", async (t) => {
+	// Regression: one interval held one `onTick`, and every registration did
+	// `clearInterval(previous)` first. `session-workers` registers on the same
+	// `session_start` as the inbox, so `sweepWakeRequests` silently deleted
+	// `watchForeignRun` -- the only thing that reloads an on-screen transcript
+	// after the phone finishes a run. The visible symptom was a Mac window that
+	// stayed stale forever while the phone worked, with no error anywhere.
+	const supervisorKey = Symbol.for("pi.inbox.agentSupervisor");
+	t.after(() => {
+		clearInterval(Reflect.get(globalThis, supervisorKey));
+		Reflect.deleteProperty(globalThis, supervisorKey);
+		Reflect.deleteProperty(
+			globalThis,
+			Symbol.for("pi.inbox.agentSupervisorHooks"),
+		);
+	});
+	const fired: string[] = [];
+	runner.startAgentSupervisor(
+		{ onTick: () => fired.push("inbox:foreign-run") },
+		"inbox:foreign-run",
+	);
+	runner.startAgentSupervisor(
+		{ onTick: () => fired.push("session-workers:wake") },
+		"session-workers:wake",
+	);
+	// Registration ticks immediately, and a tick runs EVERY hook: the second
+	// registration must not evict the first.
+	assert.deepEqual(fired, [
+		"inbox:foreign-run",
+		"inbox:foreign-run",
+		"session-workers:wake",
+	]);
+	fired.length = 0;
+	// Re-registering one subsystem replaces only its own hook, so a session
+	// switch does not stack a second identical hook on the interval.
+	runner.startAgentSupervisor(
+		{ onTick: () => fired.push("session-workers:wake") },
+		"session-workers:wake",
+	);
+	assert.deepEqual(fired, ["inbox:foreign-run", "session-workers:wake"]);
+});
+
+test("one failing tick hook does not starve the others", async (t) => {
+	const supervisorKey = Symbol.for("pi.inbox.agentSupervisor");
+	t.after(() => {
+		clearInterval(Reflect.get(globalThis, supervisorKey));
+		Reflect.deleteProperty(globalThis, supervisorKey);
+		Reflect.deleteProperty(
+			globalThis,
+			Symbol.for("pi.inbox.agentSupervisorHooks"),
+		);
+	});
+	const fired: string[] = [];
+	runner.startAgentSupervisor(
+		{
+			onTick: () => {
+				throw new Error("this subsystem is broken");
+			},
+		},
+		"throws",
+	);
+	runner.startAgentSupervisor(
+		{ onTick: () => fired.push("survivor") },
+		"survivor",
+	);
+	// The throwing hook registered first and still must not prevent the second
+	// (or a later tick) from running: adoption rides the same loop.
+	assert.deepEqual(fired, ["survivor"]);
+});
+
 test("a finished run keeps sidecar state owned by other subsystems", async (t) => {
 	// Regression: metadata cleanup deleted every `AGENTS_DIR/<id>.*`, which is a
 	// namespace shared with session-workers. `<id>.wake` and `<id>.wake-state`
