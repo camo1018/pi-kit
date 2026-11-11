@@ -107,6 +107,23 @@ function readJson(file: string): unknown {
 	}
 }
 
+/**
+ * True for a durable state that precedes a run, i.e. the worker has been
+ * created but its first `run_start` has not happened yet.
+ *
+ * `spawnAgent` writes `"queued"`; `"working"` is written at `run_start` and on
+ * `agent_start`. Both are non-terminal, so a durable record in either state
+ * with no live record means "spawned, not yet observable here" -- which must
+ * block a settle and must never be read as settled. The terminal states
+ * (`idle`, `error`, `cancelled`) are the only ones that may settle.
+ *
+ * Kept as an explicit list rather than `!terminal` so a future state has to be
+ * classified here deliberately instead of defaulting to "settled".
+ */
+function isPreRunState(state: string | undefined): boolean {
+	return state === "queued" || state === "working";
+}
+
 function writeJson(file: string, value: unknown): void {
 	fs.mkdirSync(path.dirname(file), { recursive: true });
 	const tmp = `${file}.${randomUUID()}.tmp`;
@@ -891,12 +908,21 @@ export class WorkerTeam {
 	 * which must never be read as settled.
 	 *
 	 * With no live record, the durable `inbox-agents/<id>.json` record is the
-	 * remaining evidence: `spawn` persists `state: "working"` before the child
+	 * remaining evidence: `spawn` persists a pre-run state before the child
 	 * process exists, and the child writes its live record only once its
-	 * extensions load. A durable `working` with no live record therefore means
-	 * "spawned, not yet running here", which is `unknown`, not settled. Without
-	 * this a foreign sweep calls a just-spawned team finished before its workers
-	 * have started. `status()` already trusts `saved` for `busy`; this agrees.
+	 * extensions load. A durable pre-run state with no live record therefore
+	 * means "spawned, not yet running here", which is `unknown`, not settled.
+	 * Without this a foreign sweep calls a just-spawned team finished before its
+	 * workers have started. `status()` already trusts `saved` for `busy`; this
+	 * agrees.
+	 *
+	 * The spawn-time state is `"queued"`, not `"working"` (see `spawnAgent` in
+	 * lib/inbox-agents.ts: the run only flips to `"working"` at `run_start`).
+	 * Matching only `"working"` here left the entire spawn window reading as
+	 * `settled`, so every `wake: true` fan-out whose sweep tick landed between
+	 * the durable write and the child's first live record woke its parent about
+	 * two seconds after spawn, while the work had barely begun. Any state that
+	 * precedes a run must be treated the same way `"working"` is.
 	 */
 	foregroundDisposition(id: string): "running" | "settled" | "unknown" {
 		let live: { state: "working" | "idle"; pid: number } | undefined;
@@ -907,7 +933,7 @@ export class WorkerTeam {
 		}
 		if (!live) {
 			// Only the durable record can speak for a worker with no live one.
-			if (this.saved(id)?.state === "working") return "unknown";
+			if (isPreRunState(this.saved(id)?.state)) return "unknown";
 			return "settled";
 		}
 		return live.state === "working" ? "running" : "settled";

@@ -367,13 +367,25 @@ function sweepTeams(team: WorkerTeam, callerId: string): boolean {
 						)
 						.map((worker) => worker.id)
 					: [];
+				// Split the two sources deliberately. History (`episodeWorkers`,
+				// `pendingWorkers`, `unregistered`) may contain workers a previous wake
+				// already reported, so it is filtered against `reported` to keep the
+				// count honest.
+				//
+				// `observedIds` must NOT be filtered. Those workers are running right
+				// now; that is this episode's whole evidence. Subtracting them too
+				// erased the current fan-out whenever a worker had run before -- a
+				// follow-up `send`, or any re-run of an already-reported worker --
+				// leaving `episodeWorkers: []` and a wake that reported no workers at
+				// all ("The delegated team has settled", no count). Observed live in
+				// exactly that shape while both workers were still mid-run.
 				const pending = new Set([
 					...(opening ? [] : (arm?.episodeWorkers ?? [])),
 					...(arm?.pendingWorkers ?? []),
-					...observedIds,
 					...unregistered,
 				]);
 				for (const id of pending) if (reported.has(id)) pending.delete(id);
+				for (const id of observedIds) pending.add(id);
 				const fanOut = pending;
 				if (opening) {
 					writeWakeArm(team.stateDir, parentId, {

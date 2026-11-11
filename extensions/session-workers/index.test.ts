@@ -1291,28 +1291,85 @@ test("a stale idle live record does not mask a live run on the same session", as
 });
 
 test("a just-spawned worker with no live record yet is not settled", async (t) => {
-	// `spawn` persists the worker record (state "working") before the child
-	// exists, and the child writes its live record only after extensions load.
-	// A foreign sweep in that gap saw neither agent nor live record and called
-	// the team finished. The durable record must be honoured as "not settled".
+	// `spawn` persists the durable agent record before the child exists, and the
+	// child writes its live record only after extensions load. A foreign sweep
+	// in that gap saw neither agent nor live record and called the team
+	// finished. The durable record must be honoured as "not settled".
+	//
+	// The state written here must be one real `spawnAgent` actually persists.
+	// It is `"queued"` (lib/inbox-agents.ts), NOT `"working"`: the run only
+	// flips to `"working"` at `run_start`. This fixture previously hardcoded
+	// `"working"`, which is why the queue-window wake below shipped green.
 	const s = harness(t, { mode: "json", addParent: true });
 	s.start();
 	const worker = await s.spawn();
-	// Spawned and persisted as "working", but the child has not written a live
-	// record yet. The harness's spawn does not persist, so write the durable
-	// record the real spawnAgent writes.
-	const agentsDir = join(s.team.agentDir, "inbox-agents");
-	mkdirSync(agentsDir, { recursive: true });
-	writeFileSync(
-		join(agentsDir, `${worker.id}.json`),
-		JSON.stringify({ id: worker.id, state: "working", pending: [] }),
-		"utf-8",
-	);
 	s.agents.delete(worker.id);
+	writeSavedRecord(s.team.agentDir, worker.id, { state: "queued" });
 	assert.equal(
 		s.team.foregroundDisposition(worker.id),
 		"unknown",
-		"a booting worker must not read as settled",
+		"a queued worker that has not started yet must not read as settled",
+	);
+});
+
+test("a queued worker must not read as settled", async (t) => {
+	// `spawnAgent` persists `state: "queued"` and only `run_start` moves it to
+	// "working". `foregroundDisposition` used to special-case only "working",
+	// so a freshly spawned worker fell through to "settled" for the whole
+	// window between spawn and the child's first `inbox-live` write -- about two
+	// seconds on a real machine. Every `wake: true` fan-out whose sweep tick
+	// landed in that window woke its parent while the work had not begun.
+	const s = harness(t, { mode: "json", addParent: true });
+	s.start();
+	const worker = await s.spawn();
+	// No registry entry and no live record: exactly the spawn window.
+	s.agents.delete(worker.id);
+	writeSavedRecord(s.team.agentDir, worker.id, { state: "queued" });
+	assert.equal(
+		s.team.foregroundDisposition(worker.id),
+		"unknown",
+		"queued means spawned-but-not-started, which is not settled",
+	);
+});
+
+test("a sweep inside the spawn window does not wake the parent", async (t) => {
+	// End-to-end form of the same defect, with the arm shaped the way a
+	// long-lived parent really leaves it: a previous fan-out already opened and
+	// answered an episode, so `armed` is false but `episode`/`wakeOptIn` remain.
+	//
+	// A parent that has delegated before is the common case, and it is the one
+	// that bit in production -- a brand-new parent has nothing armed, so the
+	// settle branch returns early and the bug is invisible there. Without that
+	// leftover state this test would pass with the defect present, which is the
+	// vacuous shape it used to have.
+	const s = harness(t, { mode: "json", addParent: true });
+	s.start();
+	writeWakeArm(s.team.stateDir, "parent", {
+		armed: true,
+		episode: 3,
+		wakes: 2,
+		wakeOptIn: true,
+		signature: "2",
+	});
+	const first = await s.spawn();
+	const second = await s.spawn();
+	for (const worker of [first, second]) {
+		s.agents.delete(worker.id);
+		writeSavedRecord(s.team.agentDir, worker.id, { state: "queued" });
+	}
+	s.pump();
+	assert.equal(s.pendingWake(), undefined, "no wake inside the spawn window");
+	assert.equal(sendCount(s), 0, "and nothing delivered to the parent");
+	// The arm must not record this episode as settled either: a signature (or a
+	// spent wake) written here is what burns the consecutive-wake budget before
+	// the work even begins.
+	const arm = JSON.parse(armRaw(s) ?? "{}");
+	assert.equal(arm.signature, "2", "the episode is open, not settled");
+	assert.equal(arm.wakes, 2, "no wake budget spent inside the window");
+	assert.deepEqual(
+		[...(arm.pendingWorkers ?? [])].sort(),
+		[first.id, second.id].sort(),
+		"both workers stay owed a wake once they really finish",
 	);
 });
 
@@ -2795,3 +2852,38 @@ test("a wake IS delivered in-process once the child is truly gone", async (t) =>
 });
 
 
+
+test("a follow-up fan-out reusing reported workers still names them", async (t) => {
+	// Observed live: the arm held `episodeWorkers: []` while `.wake-reported`
+	// listed both workers, and the wake said only "The delegated team has
+	// settled" with no count.
+	//
+	// Mechanism: `pending` is built from the episode's workers plus whatever
+	// `spawn` registered, and then every id already in `reported` is subtracted.
+	// On a SECOND fan-out that reuses an already-reported worker (a follow-up
+	// `send`, or a re-armed team), the subtraction can empty the set, so the
+	// episode records nobody. The wake is still owed -- the workers did run --
+	// so the bookkeeping must not lose them.
+	const s = harness(t, { mode: "tui" });
+	s.start();
+
+	// First fan-out runs to completion and is reported.
+	const first = await s.spawn();
+	await arm(s, first.id);
+	await settle(s, first.id);
+	assert.equal(s.sent.length, 1, "the first fan-out wakes once");
+
+	// Second fan-out: the same worker runs again (a follow-up), so it is in
+	// `reported` before this episode opens.
+	await arm(s, first.id);
+	const armAfter = JSON.parse(armRaw(s) ?? "{}");
+	assert.ok(
+		(armAfter.episode ?? 0) >= 2,
+		"a second run opens a new episode",
+	);
+	assert.deepEqual(
+		armAfter.episodeWorkers ?? [],
+		[first.id],
+		"the episode must name the worker that is running, even though it was already reported",
+	);
+});
