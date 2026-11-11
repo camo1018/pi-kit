@@ -84,6 +84,14 @@ There is no middle state: a call is drawn, or it is not. A tool block here is
 already a one-line summary, so a half-open state would cost more taps than it
 saves.
 
+It also folds the steps together. Every step of a turn is its own assistant
+message on the wire, so a run that calls five tools arrives as five messages and
+would otherwise draw five boxes each headed **agent** — a column of labels with
+nothing under them once the tool lines are gone. With tools hidden, the steps of
+a turn share one **agent** heading and are drawn as one block of reply text, and
+a step that did nothing but call a tool is not drawn at all. The turn's **final
+answer** still stands on its own below it.
+
 The choice is remembered per device, and it is display-only: the daemon sends
 tool calls either way and only the browser skips drawing them. A running
 session still shows its reply text streaming, so hiding the steps never makes

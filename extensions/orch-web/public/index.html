@@ -1045,9 +1045,33 @@
     // one line here, so a half-open state would cost more taps than it saves.
     const showTools = store.tools !== "hidden";
 
+    // With the tool lines gone, a step that only called a tool has nothing left
+    // to say -- but each step is its own assistant message, so drawing one box
+    // per message turns a busy run into a column of bare "agent" labels. In
+    // hidden mode the steps of a turn share one box and one label; a step with
+    // no text drops out entirely.
+    let step = null;
+    const flushStep = () => {
+      if (!step) return;
+      const s = step;
+      step = null;
+      // An error or abort is the turn's outcome, so it survives even when the
+      // step said nothing.
+      if (!s.parts.length && !s.stopped) return;
+      const box = el("div", "msg");
+      box.append(el("div", "who", "agent"));
+      for (const part of s.parts) box.append(mdNode(part));
+      if (s.stopped === "error")
+        box.append(el("div", "stopped", `✗ ${s.error || "error"}`));
+      if (s.stopped === "aborted")
+        box.append(el("div", "stopped", "⏸ aborted"));
+      log.append(box);
+    };
+
     reconcileInFlight(messages);
     for (const m of messages) {
       if (m.role === "user") {
+        flushStep();
         const box = el("div", "msg user");
         box.append(el("div", "who", "you"));
         box.append(mdNode(m.text));
@@ -1055,14 +1079,31 @@
       } else if (m.role === "assistant") {
         // The run's conclusion is marked by the server from the message's own
         // stop reason, so a reload or another front end agrees with the TUI.
-        const box = el("div", m.final ? "msg final" : "msg");
-        box.append(el("div", "who", m.final ? "final answer" : "agent"));
-        if (m.text) box.append(mdNode(m.text));
-        if (showTools) {
-          for (const tool of m.tools || []) {
-            box.append(el("div", "tool",
-              `🔧 ${tool.name}${tool.arg ? " " + tool.arg : ""}`));
+        if (m.final) {
+          // The conclusion stands alone: it is text by definition, and it is
+          // what the turn is for, so it does not join the running step box.
+          flushStep();
+          const box = el("div", "msg final");
+          box.append(el("div", "who", "final answer"));
+          if (m.text) box.append(mdNode(m.text));
+          log.append(box);
+          continue;
+        }
+        if (!showTools) {
+          if (!step) step = { parts: [], stopped: null, error: undefined };
+          if (m.text) step.parts.push(m.text);
+          if (m.stopped) {
+            step.stopped = m.stopped;
+            step.error = m.error;
           }
+          continue;
+        }
+        const box = el("div", "msg");
+        box.append(el("div", "who", "agent"));
+        if (m.text) box.append(mdNode(m.text));
+        for (const tool of m.tools || []) {
+          box.append(el("div", "tool",
+            `🔧 ${tool.name}${tool.arg ? " " + tool.arg : ""}`));
         }
         if (m.stopped === "error")
           box.append(el("div", "stopped", `✗ ${m.error || "error"}`));
@@ -1073,6 +1114,7 @@
         log.append(el("div", "tool err", `↳ ✗ ${m.text}`));
       }
     }
+    flushStep();
 
     const working = row.state === "working" || row.state === "queued";
     if (!live?.length && !activity && working) {
