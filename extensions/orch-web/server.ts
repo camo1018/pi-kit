@@ -2552,9 +2552,11 @@ function streamAgent(res: http.ServerResponse, id: string) {
 			const busy =
 				row?.state === "working" || row?.state === "queued" ||
 				a?.state === "working" || a?.state === "queued";
-			const lastTool = [...live].reverse().find((i) => i.kind === "tool");
+			// Only scan when it can be used: this runs every 1.2s per open session,
+			// and an idle session is the common case.
 			const activity = busy
-				? (a?.activity ?? lastTool?.text)
+				? (a?.activity ??
+					[...live].reverse().find((i: LiveItem) => i.kind === "tool")?.text)
 				: undefined;
 			// The transcript is capped, so its length pins at the limit and edits
 			// to the newest message are invisible to a length-only hash. Include
