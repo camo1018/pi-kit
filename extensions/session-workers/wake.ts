@@ -258,6 +258,14 @@ export function registerWakeWorker(
  */
 export function sweepWakeRequests(team: WorkerTeam, callerId: string): boolean {
 	if (process.env.BIGBRAIN_MAINT === "1") return false;
+	// One read of the worker directory for the whole sweep. `workers()` parses
+	// EVERY record per call, so asking once per parent made this quadratic:
+	// 150 records over 35 teams was 5,250 parses and ~345ms of synchronous work
+	// on the TUI event loop -- paid twice over, since `ownsWake` asks again.
+	return team.batch(() => sweepTeams(team, callerId));
+}
+
+function sweepTeams(team: WorkerTeam, callerId: string): boolean {
 	const current = state();
 	let acted = false;
 	const parents = team.parents();

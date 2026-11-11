@@ -144,9 +144,35 @@ function escaped(text: string): string {
 		.replace(/"/g, "&quot;");
 }
 
+/** One live record for a session, resolved to a live owning pid. */
+interface LiveEntry {
+	sessionId: string;
+	state: "working" | "idle";
+	pid: number;
+	updated: number;
+}
+
+/** A session's live slot: a usable record, or why it cannot be trusted. */
+interface LiveSlot {
+	sessionId: string;
+	entry?: LiveEntry;
+	error?: string;
+}
+
 /** Independent immutable files prevent sibling note writers losing updates. */
 export class WorkerTeam {
 	readonly root: string;
+	/**
+	 * One-sweep worker index. Only populated inside `batch()`, so a caller
+	 * outside it always reads the directory fresh.
+	 */
+	private snap?: Map<string, Worker[]>;
+	/**
+	 * Live records for this batch, keyed by session id. Also batch-scoped.
+	 * A record that cannot be trusted is kept as `{ error }` against the session
+	 * it names, so only THAT session is refused -- see `liveEntry`.
+	 */
+	private liveSnap?: Map<string, { entry?: LiveEntry; error?: string }>;
 
 	constructor(
 		readonly agentDir: string,
@@ -374,31 +400,70 @@ export class WorkerTeam {
 
 	/** Every parent that currently owns at least one worker record. */
 	parents(): string[] {
-		const seen = new Set<string>();
-		for (const name of names(path.join(this.root, "workers"))) {
-			try {
-				const worker = this.worker(name.slice(0, -5));
-				if (worker) seen.add(worker.parentId);
-			} catch {
-				// A malformed record must not hide every other team.
-			}
-		}
-		return [...seen];
+		return [...this.byParent().keys()];
 	}
-
 	/** Path for the inbox-managed per-session sidecar files (`<id>.*`). */
 	get stateDir(): string {
 		return path.join(this.agentDir, "inbox-agents");
 	}
 
 	workers(id: string): Worker[] {
-		const parentId = this.parent(id);
-		return names(path.join(this.root, "workers"))
-			.map((name) => this.worker(name.slice(0, -5)))
-			.filter(
-				(item): item is Worker => !!item && item.parentId === parentId,
-			)
-			.sort((a, b) => a.createdAt - b.createdAt);
+		return this.byParent().get(this.parent(id)) ?? [];
+	}
+
+	/**
+	 * Read the worker records once for the duration of `fn`.
+	 *
+	 * `workers()` used to readdir the directory and parse EVERY record on every
+	 * call, then discard all but one parent's. The wake sweep is its hot caller
+	 * and asks once per parent, so 150 records across 35 teams cost 5,250 parses
+	 * per sweep -- ~345ms of synchronous work on the TUI event loop, once from
+	 * the 5s supervisor tick and again from each debounced agent event during a
+	 * run. A sweep only needs the directory to be read once.
+	 *
+	 * Deliberately NOT keyed on the directory stamp. Worker records are rewritten
+	 * in place in places (tests and any resaved record), which does not move the
+	 * directory mtime, so a stamp-keyed cache goes stale exactly when a record
+	 * changes. Scoping the reuse to one sweep keeps the read authoritative.
+	 */
+	batch<T>(fn: () => T): T {
+		if (this.snap) return fn();
+		this.snap = this.readByParent();
+		// Live records are small in count (one per running pi) but were re-read
+		// once per worker: 150 workers x 4 records = 600 parses per sweep. Batch
+		// scope is enough because a sweep is meant to observe ONE moment anyway.
+		this.liveSnap = this.readLiveBySession();
+		try {
+			return fn();
+		} finally {
+			this.snap = undefined;
+			this.liveSnap = undefined;
+		}
+	}
+
+	/** Worker records bucketed by parent. Reused inside `batch()`. */
+	private byParent(): Map<string, Worker[]> {
+		return this.snap ?? this.readByParent();
+	}
+
+	private readByParent(): Map<string, Worker[]> {
+		const dir = path.join(this.root, "workers");
+		const by = new Map<string, Worker[]>();
+		for (const name of names(dir)) {
+			try {
+				const worker = this.worker(name.slice(0, -5));
+				if (!worker) continue;
+				const list = by.get(worker.parentId) ?? [];
+				list.push(worker);
+				by.set(worker.parentId, list);
+			} catch {
+				// A malformed record must not hide every other team.
+			}
+		}
+		for (const list of by.values()) {
+			list.sort((a, b) => a.createdAt - b.createdAt);
+		}
+		return by;
 	}
 
 	requireWorker(caller: string, target: string): Worker {
@@ -650,76 +715,109 @@ export class WorkerTeam {
 		return worker;
 	}
 
-	private foreground(id: string) {
-		const local = this.runner.get(id);
+	/**
+	 * The freshest live record per session, read once per batch.
+	 *
+	 * Returns a Map when batch-scoped, and reads fresh otherwise. `foreground()`
+	 * consults this for every worker, so without batching a sweep re-read and
+	 * re-parsed the whole live directory once per worker record.
+	 */
+	private liveBySession(): Map<string, LiveSlot> {
+		return this.liveSnap ?? this.readLiveBySession();
+	}
+
+	private readLiveBySession(): Map<string, LiveSlot> {
+		const by = new Map<string, LiveSlot>();
 		const dir = path.join(this.agentDir, "inbox-live");
-		// Several live records can name one session: an orphan left mid-turn by a
-		// closed tab, plus the run that reopened it. `readdirSync` orders by
-		// filename (pid), NOT by time, so returning the first match lets a stale
-		// `idle` record from a replaced pid shadow the live `working` run. That is
-		// a false settle, and it is what woke a team while both its workers were
-		// still running. Trust the freshest heartbeat, as the Inbox does.
-		let freshest:
-			| { state: "working" | "idle"; pid: number; updated: number }
-			| undefined;
 		for (const name of names(dir)) {
-			// One unreadable live record must not make EVERY worker unplaceable.
-			// `readJson` throws on malformed JSON, and this loop runs for each
-			// worker, so a single truncated file from an unrelated session used to
-			// turn the whole team into `unknown` -- the path that produced a false
-			// wake. A file we cannot parse tells us nothing about THIS session, so
-			// skip it; the record for the session we asked about is unlikely to be
-			// the broken one, and if it is, `unknown` is the honest answer anyway.
-			let live: {
-				sessionId?: string;
-				pid?: number;
-				state?: "working" | "idle";
-				updated?: number;
-			} | undefined;
-			try {
-				live = readJson(path.join(dir, name)) as typeof live;
-			} catch {
-				// Unparseable. If the FILE NAME is pids -- and the live-record
-				// convention is `<pid>.json` -- we cannot tell whether it belongs
-				// to the session we are asking about, and assuming it does not is
-				// the unsafe direction: a worker whose own record was caught
-				// mid-write would read as settled and could wake its parent early.
-				// Only a file we can positively attribute elsewhere is skipped.
-				const pid = Number(name.slice(0, -".json".length));
-				if (Number.isSafeInteger(pid) && pid > 0 && pidAlive(pid)) {
-					// Somebody is alive under that pid but the record is corrupt.
-					// Untrustworthy rather than settled.
-					throw new Error("Unreadable live-session record; refusing control");
-				}
+			const slot = this.liveEntry(dir, name);
+			if (!slot) continue;
+			// A refusal outranks a readable record for the same session: we know
+			// something is wrong with it, and "unknown" is the safe answer.
+			if (slot.error) {
+				by.set(slot.sessionId, slot);
 				continue;
 			}
-			if (live?.sessionId !== id || live.pid === local?.pid) continue;
-			if (!live.pid || !Number.isSafeInteger(live.pid) || live.pid <= 0) {
-				throw new Error(
-					"Invalid live-session record; refusing control",
-				);
+			const previous = by.get(slot.sessionId);
+			if (!previous || (previous.entry &&
+				(slot.entry?.updated ?? 0) > previous.entry.updated)) {
+				by.set(slot.sessionId, slot);
 			}
-			try {
-				process.kill(live.pid, 0);
-			} catch (error) {
-				const code = (error as NodeJS.ErrnoException).code;
-				if (code === "ESRCH") continue;
-				if (code !== "EPERM") {
-					throw new Error(
-						"Cannot verify session ownership; use the inbox",
-					);
-				}
+		}
+		return by;
+	}
+
+	/**
+	 * Parse one live record and resolve its owning pid.
+	 *
+	 * Returns undefined when the record can be positively attributed elsewhere
+	 * or its owner is gone, and a slot with `error` when it exists but cannot be
+	 * trusted.
+	 */
+	private liveEntry(dir: string, name: string): LiveSlot | undefined {
+		let live: {
+			sessionId?: string;
+			pid?: number;
+			state?: "working" | "idle";
+			updated?: number;
+		} | undefined;
+		try {
+			live = readJson(path.join(dir, name)) as typeof live;
+		} catch {
+			// Unparseable. If the FILE NAME is a pid -- and the live-record
+			// convention is `<pid>.json` -- we cannot tell which session it
+			// belongs to, and assuming it belongs to none is the unsafe
+			// direction: a worker whose own record was caught mid-write would
+			// read as settled and could wake its parent early. A dead pid's
+			// leftovers say nothing about anyone, so those are skipped.
+			const pid = Number(name.slice(0, -".json".length));
+			if (Number.isSafeInteger(pid) && pid > 0 && pidAlive(pid)) {
+				// Nobody can say WHICH session this belongs to, so no worker can
+				// be ruled out. Throwing refuses control for all of them, which
+				// is the safe direction; the per-session `error` slot below is
+				// only for records that do name their session.
+				throw new Error("Unreadable live-session record; refusing control");
 			}
-			const updated = Number(live.updated) || 0;
-			if (!freshest || updated > freshest.updated) {
-				freshest = {
-					state: live.state ?? "working",
-					pid: live.pid,
-					updated,
+			return;
+		}
+		if (!live?.sessionId) return;
+		const sessionId = live.sessionId;
+		if (!live.pid || !Number.isSafeInteger(live.pid) || live.pid <= 0) {
+			return {
+				sessionId,
+				error: "Invalid live-session record; refusing control",
+			};
+		}
+		try {
+			process.kill(live.pid, 0);
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code === "ESRCH") return;
+			if (code !== "EPERM") {
+				return {
+					sessionId,
+					error: "Cannot verify session ownership; use the inbox",
 				};
 			}
 		}
-		return freshest && { state: freshest.state, pid: freshest.pid };
+		return {
+			sessionId,
+			entry: {
+				sessionId,
+				state: live.state ?? "working",
+				pid: live.pid,
+				updated: Number(live.updated) || 0,
+			},
+		};
+	}
+
+	private foreground(id: string) {
+		const local = this.runner.get(id);
+		const slot = this.liveBySession().get(id);
+		if (slot?.error) throw new Error(slot.error);
+		// A record written by this very process is not a foreign writer.
+		if (!slot?.entry || slot.entry.pid === local?.pid) return undefined;
+		return { state: slot.entry.state, pid: slot.entry.pid };
 	}
 
 	send(caller: string, id: string, text: string): void {

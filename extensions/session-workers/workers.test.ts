@@ -260,3 +260,59 @@ test("ids accept custom session ids, but reject paths and dot entries", () => {
 		assert.throws(() => validId(id), /session id/);
 	}
 });
+
+test("a batch reads the worker directory once, and never cache-stales", async (t) => {
+	// `workers()` used to readdir and parse EVERY record per call. The wake
+	// sweep asks once per parent, so this was quadratic: 150 records over 35
+	// teams = 5,250 parses per sweep, ~345ms of synchronous work on the TUI
+	// event loop, paid from the 5s supervisor tick and again from each debounced
+	// agent event during a run. That is the "random lag while typing" report.
+	const s = setup(t);
+	// One worker per team, so a quadratic read is unmistakable: 8 records
+	// and 8 parents means 64 parses for the old code, ~8 for a batch.
+	for (let i = 0; i < 8; i++) await s.spawn(`team-${i}`);
+	const spy = t.mock.method(s.team, "worker");
+
+	const parents = s.team.batch(() => {
+		const seen = s.team.parents();
+		// The sweep shape: ownership, then agents, for every parent.
+		for (const parent of seen) {
+			s.team.ownsWake(parent);
+			s.team.workers(parent);
+		}
+		return seen;
+	});
+	assert.ok(parents.length >= 2, "more than one team, or this proves nothing");
+	const parses = spy.mock.callCount();
+	// 8 parents x 8 records was 64 parses before batching. Allow a pass or two
+	// of slack for lookups that legitimately re-read one record; the point is
+	// that it is no longer multiplied by the number of teams.
+	assert.ok(
+		parses <= 20,
+		`one pass over 8 records, not one per parent; saw ${parses}`,
+	);
+
+	// Outside a batch the read is always fresh. Records are rewritten IN PLACE
+	// in places (pruning and tests both do it), which does not move the
+	// directory mtime, so a stamp-keyed cache -- the timing trick the inbox uses
+	// for worker LINKS -- goes stale exactly when a record changes.
+	spy.mock.resetCalls();
+	const first = parents[0];
+	s.team.workers(first);
+	assert.ok(
+		spy.mock.callCount() >= 8,
+		"an unbatchd call re-reads, so it cannot serve stale data",
+	);
+
+	const worker = s.team.workers(first)[0];
+	const file = join(s.dir, "session-workers", "workers", `${worker.id}.json`);
+	fs.writeFileSync(
+		file,
+		JSON.stringify({
+			...JSON.parse(fs.readFileSync(file, "utf-8")),
+			title: "Renamed",
+		}),
+	);
+	const after = s.team.workers(first).find((w) => w.id === worker.id);
+	assert.equal(after?.title, "Renamed", "an in-place rewrite must be visible");
+});
