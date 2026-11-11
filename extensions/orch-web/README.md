@@ -130,18 +130,6 @@ Other markers live in the title itself: `★` pinned, `⊘` hidden, and
 `▸ 3` / `▾ 3` on a parent with delegated workers — tap that chip and the
 family folds out without the session opening.
 
-## Final answer
-
-The last message of a run — the one the model finished on its own without
-asking for another tool — is drawn as a raised card with an accent edge and a
-`▼ FINAL ANSWER` label, instead of blending into the tool steps above it.
-
-Nothing is tracked separately for this: the daemon reads each message's own
-`stopReason` out of the transcript, so the same message is marked the same way
-after a reload, on a historical session, and by the TUI's own
-`final-answer-divider` extension. A run that errored or was aborted has no
-final answer to mark.
-
 ### Why a message queues
 
 The composer says **Queue** instead of **Send** for three different reasons, and
@@ -207,6 +195,18 @@ Desktop-only: **takeover**, **peek**, and **moving a session's directory**.
 Takeover hands a live session to a terminal window, which a phone has no
 equivalent of; the other two are file-relocation actions that want a
 filesystem picker.
+
+## Final answer
+
+The last message of a run — the one the model finished on its own without
+asking for another tool — is drawn as a raised card with an accent edge and a
+`▼ FINAL ANSWER` label, instead of blending into the tool steps above it.
+
+Nothing is tracked separately for this: the daemon reads each message's own
+`stopReason` out of the transcript, so the same message is marked the same way
+after a reload, on a historical session, and by the TUI's own
+`final-answer-divider` extension. A run that errored or was aborted has no
+final answer to mark.
 
 ## Managing the daemon
 
