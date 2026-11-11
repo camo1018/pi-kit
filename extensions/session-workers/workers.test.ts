@@ -316,3 +316,43 @@ test("a batch reads the worker directory once, and never cache-stales", async (t
 	const after = s.team.workers(first).find((w) => w.id === worker.id);
 	assert.equal(after?.title, "Renamed", "an in-place rewrite must be visible");
 });
+
+test("our own live record must not shadow a foreign writer of the same session", async (t) => {
+	// A live record is written by whichever pi holds a session, so two records
+	// can name the same one: ours (usually newer, `idle` because we are not
+	// running it) and a foreign process that IS running it. Reading only the
+	// freshest record lets ours win and reports "settled" while another process
+	// is mid-run -- the false-settle shape that wakes a parent early and spawns
+	// a second writer. The old reader skipped its own pid per record; keep that.
+	const s = setup(t);
+	const worker = await s.spawn();
+	const live = join(s.dir, "inbox-live");
+	fs.mkdirSync(live, { recursive: true });
+	const write = (pid: number, state: string, updated: number) =>
+		fs.writeFileSync(
+			join(live, `${pid}.json`),
+			JSON.stringify({ sessionId: worker.id, pid, state, updated }),
+		);
+
+	// Foreign holder is OLDER; ours is newer and idle.
+	const foreign = process.ppid;
+	write(foreign, "working", Date.now() - 60_000);
+	write(process.pid, "idle", Date.now());
+
+	// Register ourselves as holding a local agent for the worker, which is what
+	// makes our own record a self-record rather than another foreign one.
+	s.agents.set(worker.id, {
+		...(s.agents.get(worker.id) as any),
+		pid: process.pid,
+	});
+	assert.equal(
+		s.team.foregroundDisposition(worker.id),
+		"running",
+		"a foreign working record must win over our own newer idle record",
+	);
+
+	// Remove the foreign claim and ours is the only one left: settled, because a
+	// record written by this process is not a foreign writer.
+	fs.rmSync(join(live, `${foreign}.json`));
+	assert.equal(s.team.foregroundDisposition(worker.id), "settled");
+});
