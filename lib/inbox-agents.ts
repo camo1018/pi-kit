@@ -1101,6 +1101,30 @@ export function isWriting(
 }
 
 /**
+ * Which of two live records for ONE session better describes it, when a reader
+ * has to collapse several records into one.
+ *
+ * More than one record can name a session: a window holds it open (`idle`)
+ * while the run it is watching holds it too (`working`). The window's record
+ * pulses `updated` every minute; the run's is stamped once at `agent_start`.
+ * Ranking by recency alone therefore picks the idle window and reports the
+ * session idle while it is being worked -- which hides the foreign-run badge
+ * and makes a row fall through to its transcript tail and read as "stalled".
+ *
+ * A `working` claim always wins; recency only breaks ties within a state.
+ * Callers that must not lose a foreign writer entirely should ask
+ * `foreignWorkingFor` over every record instead of collapsing to one.
+ */
+export function freshestLive<
+	T extends { state: string; updated?: number },
+>(a: T, b: T): boolean {
+	const aw = a.state === "working";
+	const bw = b.state === "working";
+	if (aw !== bw) return aw;
+	return (Number(a.updated) || 0) > (Number(b.updated) || 0);
+}
+
+/**
  * True when a background run has outlived the pi that started it, long enough
  * that it is stuck rather than merely waiting to be adopted.
  *

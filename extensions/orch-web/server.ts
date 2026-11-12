@@ -58,6 +58,7 @@ import {
 	getAgent,
 	listAgents,
 	markSeen,
+	freshestLive,
 	isWriting,
 	queueReason,
 	type QueueReason,
@@ -851,7 +852,13 @@ function readLive(): Map<string, LiveRecord> {
 				);
 			}
 			const prev = out.get(rec.sessionId);
-			if (!prev || rec.updated > prev.updated) out.set(rec.sessionId, rec);
+			// A `working` claim wins over an idle one regardless of heartbeat age.
+			// A window holding the session open pulses `updated` every minute, while
+			// the run's record is stamped once, so ranking by recency alone reports
+			// the session idle while another process is actively working it -- the
+			// phone then paints that row from its transcript tail, which mid-tool-call
+			// reads as "stalled".
+			if (!prev || freshestLive(rec, prev)) out.set(rec.sessionId, rec);
 		} catch {
 			// ignore
 		}
