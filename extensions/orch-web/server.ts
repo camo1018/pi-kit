@@ -524,13 +524,20 @@ const NAME_FULL_SCAN_LIMIT = 32 * 1024 * 1024;
 function scanForName(file: string, size: number): string | undefined {
 	// Cheap first: the name is usually set early and renames land near the end.
 	const head = nameOfLines(readLinesAt(file, { offset: 0, max: 64 * 1024 }).lines);
-	const tail = nameOfLines(readLinesAt(file, { max: NAME_CHUNK }).lines);
+	// `offset` is essential: without it this "tail" window is the head, which
+	// both makes an original name beat the rename and hides the last window
+	// from the backwards walk below.
+	const tailAt = Math.max(0, size - NAME_CHUNK);
+	const tail = nameOfLines(
+		readLinesAt(file, { offset: tailAt, max: size - tailAt }).lines,
+	);
 	if (tail) return tail;
 	if (head || size > NAME_FULL_SCAN_LIMIT) return head;
 
 	// Neither end has it. Walk the middle backwards so a rename beats the
-	// original name, stopping as soon as one is found.
-	for (let end = size - NAME_CHUNK; end > 0; end -= NAME_CHUNK) {
+	// original name, stopping as soon as one is found. Start below the tail
+	// window already scanned above so no chunk is read twice.
+	for (let end = tailAt; end > 0; end -= NAME_CHUNK) {
 		const from = Math.max(0, end - NAME_CHUNK);
 		const { lines } = readLinesAt(file, { offset: from, max: end - from });
 		const found = nameOfLines(lines);

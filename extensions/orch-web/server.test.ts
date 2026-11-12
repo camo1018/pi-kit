@@ -325,6 +325,53 @@ test("a rename in the middle of a large session is found", () => {
 	assert.equal(row?.title, "Middle of the file");
 });
 
+test("a rename wins over an earlier name in the head", () => {
+	// The "tail" window used to be read from offset 0, so an early name was
+	// found first and returned as the tail -- the rename never won, and the
+	// phone kept showing the old title after a laptop rename.
+	const id = "a0000013-0000-0000-0000-000000000013";
+	const dir = path.join(agentDir, "sessions", "--scratch--");
+	fs.mkdirSync(dir, { recursive: true });
+	const file = path.join(dir, `2026-01-01T00-00-00-000Z_${id}.jsonl`);
+	const info = (name: string) =>
+		JSON.stringify({
+			type: "session_info",
+			id: name,
+			parentId: null,
+			timestamp: "2026-01-01T00:00:00.000Z",
+			name,
+		});
+	const filler = (tag: string) =>
+		JSON.stringify({
+			type: "message",
+			id: tag,
+			parentId: null,
+			timestamp: "2026-01-01T00:00:00.000Z",
+			message: {
+				role: "user",
+				content: [{ type: "text", text: "x".repeat(600) }],
+			},
+		});
+	const lines = [
+		JSON.stringify({
+			type: "session",
+			version: 3,
+			id,
+			timestamp: "2026-01-01T00:00:00.000Z",
+			cwd: "/scratch",
+		}),
+		info("Original name"),
+	];
+	// The rename sits in the last 256KB window, with history after it so it is
+	// not literally the final entry.
+	for (let i = 0; i < 600; i++) lines.push(filler(`a${i}`));
+	lines.push(info("Renamed later"));
+	for (let i = 0; i < 20; i++) lines.push(filler(`b${i}`));
+	fs.writeFileSync(file, `${lines.join("\n")}\n`);
+
+	assert.equal(readName(file), "Renamed later");
+});
+
 test("a later rename beats an earlier one", () => {
 	const id = "a0000011-0000-0000-0000-000000000011";
 	const dir = path.join(agentDir, "sessions", "--scratch--");
