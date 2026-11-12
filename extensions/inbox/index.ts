@@ -4113,14 +4113,16 @@ interface ModeState {
 	jumpTo?: string;
 	/**
 	 * Last foreign-run state seen per session id: true while another pi process
-	 * is driving that session. Used to notice the transition to "done" so the
-	 * on-screen transcript can be reloaded from disk.
+	 * is driving that session. The edge drives the "running in another pi" badge;
+	 * reloading is left to `/resync`, which the user runs on demand.
 	 */
 	foreignRun?: Map<string, boolean>;
-	/** Sessions already reloaded for the current foreign run, so one run reloads once. */
-	foreignReloaded?: Set<string>;
 }
 const MODE_KEY = Symbol.for("pi.inbox.mode");
+/** The live-record directory watcher, kept on globalThis so /reload cannot stack one. */
+const FOREIGN_WATCHER_KEY = Symbol.for("pi.inbox.foreignWatcher");
+/** Pending debounce timer for the watcher burst. */
+const FOREIGN_WATCH_DEBOUNCE_KEY = Symbol.for("pi.inbox.foreignWatchDebounce");
 /** Agent id whose queue manager currently owns an overlay. */
 const QUEUE_MANAGER_KEY = Symbol.for("pi.inbox.queueManagerOpen");
 /** The TUI the inbox overlay last drew on (lets the inbox trigger a redraw when it closes). */
@@ -4135,7 +4137,6 @@ const modeState = (): ModeState => {
 	s.wasRunning ??= new Set();
 	s.betweenRuns ??= new Set();
 	s.foreignRun ??= new Map();
-	s.foreignReloaded ??= new Set();
 	return s;
 };
 
@@ -5123,16 +5124,17 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		// Interactive windows heartbeat their agents and adopt orphans left by closed/quit windows.
-		// The tick doubles as the foreign-run watcher: a run driven by another pi writing this
-		// session (the phone front end) is only visible as file state, so it needs a periodic look.
+		// A run driven by another pi writing this session (the phone front end) is only
+		// visible as file state, so it is watched on disk rather than delivered as an event.
 		if (ctx.mode === "tui" && !isAgentChild()) {
-			installForeignRunWatch();
-			// Same interval as session-workers' wake sweep, so this needs its own id:
-			// without one it would be replaced by whichever extension registered last.
+			// The watch is the signal; this supervisor registration stays because the
+			// same interval also persists agent records and adopts orphans. Its tick
+			// doubles as a slow fallback when fs.watch is unavailable.
 			startAgentSupervisor(
 				{ onTick: () => watchForeignRun() },
 				"inbox:foreign-run",
 			);
+			installForeignRunWatch();
 		}
 		if (ctx.mode === "tui") {
 			viewing = ctx.sessionManager.getSessionId();
@@ -5234,6 +5236,7 @@ export default function (pi: ExtensionAPI) {
 		// place it is worth paying the synchronous cost, and the session is ending
 		// anyway, so nothing is waiting on the event loop.
 		saveInfoCache(true);
+		closeForeignRunWatch();
 		// Shutdown runs only after switch cancellation checks have passed.
 		// A module-local variable would be lost when extensions are reloaded
 		// for the replacement runtime. Do not persist this as a global default.
@@ -5718,46 +5721,26 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Reload the on-screen transcript when a run driven by another process just
-	 * ended, so a session you were reading on the phone is current when you come
-	 * back to this window. Calls the same reload the attached-session path uses;
-	 * it switches the session out from under the view, which is the cost of
-	 * seeing someone else's turns without pressing anything.
-	 */
-	function reloadAfterForeignRun(id: string): void {
-		const ms = modeState();
-		if (ms.foreignReloaded?.has(id)) return;
-		// Nothing to reload until the session has a file on disk.
-		if (!findSessionFile(id)) return;
-		ms.foreignReloaded?.add(id);
-		scheduleRefresh(id);
-	}
-
-	/**
-	 * Notice a run that another pi process drove to completion on the session this
-	 * window is showing, and reload the transcript so those turns appear.
+	 * Notice a run that another pi process is driving on the session this window
+	 * shows, and put a badge up while it runs.
 	 *
-	 * Cheap, but by MEASUREMENT rather than by riding someone else's work: this
-	 * hook is the only caller of `readLive()` on the tick. Orphan adoption, the
-	 * rest of the tick, never touches the live records, so this scan is real work
-	 * this file adds. It is bounded by the number of concurrent pi processes
-	 * (dead-pid records are unlinked on read), not by the session archive:
+	 * Driven by `fs.watch` on the live-record DIRECTORY, not by the 5s tick. The
+	 * phone's child publishes the exact edge we need: `writeLive` writes
+	 * `state: "working"` on `agent_start` and `idle` on `agent_settled` -- two
+	 * writes per run, so a real notification with no polling and no miss window.
+	 * A tick would need to observe `working` at least once, and a run shorter
+	 * than the interval was invisible to it.
 	 *
-	 *   - 2 live records (the usual case): ~0.05ms
-	 *   - 50 live records:                  ~0.96ms
-	 *
-	 * against a 5s tick, i.e. 0.001% duty cycle. Only the working → not-working
-	 * transition reloads, and only for the session on screen, so the expensive
-	 * part (`findSessionFile`, a recursive scan of every session directory at
-	 * ~1.2ms) is paid once per foreign run, never per tick. Every other session's
-	 * staleness is already covered by the inbox rows.
+	 * The directory (not the single file) is watched because a record can be
+	 * written in place, renamed into place, or removed on read; watching the dir
+	 * and filtering by filename survives all three. macOS delivers several
+	 * events per write, so callbacks are coalesced before the edge is computed.
 	 */
 	function watchForeignRun(): void {
-		// The tick runs every 5s, including in the middle of a session switch or
-		// /reload. A captured ctx throws on any property access once its runtime
-		// has been replaced ("ctx is stale after session replacement"), so read
-		// everything behind a guard and bail cleanly: the next tick gets the new
-		// context, which the session_start handler has already installed.
+		// The callback can fire during a session switch or /reload. A captured ctx
+		// throws on any property access once its runtime is replaced ("ctx is
+		// stale after session replacement"), so everything is read behind a guard
+		// and a stale context just skips this pass.
 		let ui: ExtensionContext;
 		let id: string;
 		try {
@@ -5768,38 +5751,92 @@ export default function (pi: ExtensionAPI) {
 			ui = maybe;
 			id = ui.sessionManager.getSessionId();
 		} catch {
-			return; // stale context mid-switch: nothing to do this tick
+			return; // stale context mid-switch
 		}
 		const ms = modeState();
 		const active = foreignRunActive(id);
 		const was = ms.foreignRun?.get(id) === true;
 		const move = foreignRunMove(was, active);
 		ms.foreignRun?.set(id, active);
+		if (move === "none") return;
 		try {
 			if (move === "started") {
-				// A new foreign run started: allow this run one reload when it ends.
-				ms.foreignReloaded?.delete(id);
 				ui.ui.setStatus(
 					"inbox-foreign",
 					ui.ui.theme.fg("warning", "● running in another pi (phone)"),
 				);
-			} else if (move === "finished") {
+			} else {
+				// Deliberately no reload: moving the view without being asked is worse
+				// than the staleness, and `/resync` reloads on demand (with a report of
+				// whether anything arrived). The badge going away is the cue.
 				ui.ui.setStatus("inbox-foreign", undefined);
-				if (orchestrating() && !isHome(ui)) reloadAfterForeignRun(id);
 			}
 		} catch {
-			// The context went stale between the read and the write. The badge and
-			// the reload are both cosmetic; drop them rather than log every switch.
-			return;
+			// The context went stale between the read and the write; cosmetic only.
 		}
 	}
 
-	/** Seed the watcher's baseline so an already-running foreign run isn't seen as newly started. */
+	/** Debounce: macOS emits a burst per write, and the edge only changes once. */
+	const FOREIGN_WATCH_DEBOUNCE_MS = 100;
+
+	/**
+	 * Start (or restart) the live-record watch. Idempotent: the previous watcher
+	 * and timer are closed first so a session switch or /reload cannot stack them.
+	 *
+	 * Falls back to the supervisor tick when `fs.watch` is unavailable or throws --
+	 * same behaviour as before this existed, just slower to notice.
+	 */
 	function installForeignRunWatch(): void {
 		const ms = modeState();
-		if (ms.foreignRun && ms.foreignRun.size > 0) return;
 		ms.foreignRun ??= new Map();
-		ms.foreignReloaded ??= new Set();
+		// Seed the baseline so a run already in flight is not reported as newly
+		// started, which would put up a badge for something that began earlier.
+		watchForeignRun();
+		const G = globalThis as any;
+		G[FOREIGN_WATCHER_KEY]?.close?.();
+		G[FOREIGN_WATCHER_KEY] = undefined;
+		if (G[FOREIGN_WATCH_DEBOUNCE_KEY]) {
+			clearTimeout(G[FOREIGN_WATCH_DEBOUNCE_KEY]);
+			G[FOREIGN_WATCH_DEBOUNCE_KEY] = undefined;
+		}
+		try {
+			const watcher = fs.watch(LIVE_DIR, (_event, filename) => {
+				if (filename && !String(filename).endsWith(".json")) return;
+				if (G[FOREIGN_WATCH_DEBOUNCE_KEY]) {
+					clearTimeout(G[FOREIGN_WATCH_DEBOUNCE_KEY]);
+				}
+				G[FOREIGN_WATCH_DEBOUNCE_KEY] = setTimeout(() => {
+					G[FOREIGN_WATCH_DEBOUNCE_KEY] = undefined;
+					watchForeignRun();
+				}, FOREIGN_WATCH_DEBOUNCE_MS);
+				G[FOREIGN_WATCH_DEBOUNCE_KEY].unref?.();
+			});
+			watcher.on?.("error", () => {
+				// A failed watch must not take the window down; the tick covers it.
+				try {
+					watcher.close();
+				} catch {
+					// already gone
+				}
+				if (G[FOREIGN_WATCHER_KEY] === watcher) {
+					G[FOREIGN_WATCHER_KEY] = undefined;
+				}
+			});
+			G[FOREIGN_WATCHER_KEY] = watcher;
+		} catch {
+			// fs.watch unavailable: the supervisor tick still calls watchForeignRun.
+		}
+	}
+
+	/** Close the watch on shutdown so a session switch cannot leak one per window. */
+	function closeForeignRunWatch(): void {
+		const G = globalThis as any;
+		G[FOREIGN_WATCHER_KEY]?.close?.();
+		G[FOREIGN_WATCHER_KEY] = undefined;
+		if (G[FOREIGN_WATCH_DEBOUNCE_KEY]) {
+			clearTimeout(G[FOREIGN_WATCH_DEBOUNCE_KEY]);
+			G[FOREIGN_WATCH_DEBOUNCE_KEY] = undefined;
+		}
 	}
 
 	/**
