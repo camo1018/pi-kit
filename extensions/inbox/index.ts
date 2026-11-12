@@ -5124,7 +5124,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		// Interactive windows heartbeat their agents and adopt orphans left by closed/quit windows.
-		// A run driven by another pi writing this session (the phone front end) is only
+		// A run driven by another pi writing this session (an orch-web client) is only
 		// visible as file state, so it is watched on disk rather than delivered as an event.
 		if (ctx.mode === "tui" && !isAgentChild()) {
 			// The watch is the signal; this supervisor registration stays because the
@@ -5709,7 +5709,7 @@ export default function (pi: ExtensionAPI) {
 
 	/**
 	 * True when some other live pi process is currently running this session —
-	 * the phone front end, a background agent, or another window. Asked of the
+	 * an orch-web client, a background agent, or another window. Asked of the
 	 * same live records the rest of the inbox trusts, not of a second liveness
 	 * check: stale "working" records are already aged out on read.
 	 */
@@ -5725,7 +5725,7 @@ export default function (pi: ExtensionAPI) {
 	 * shows, and put a badge up while it runs.
 	 *
 	 * Driven by `fs.watch` on the live-record DIRECTORY, not by the 5s tick. The
-	 * phone's child publishes the exact edge we need: `writeLive` writes
+	 * other process's child publishes the exact edge we need: `writeLive` writes
 	 * `state: "working"` on `agent_start` and `idle` on `agent_settled` -- two
 	 * writes per run, so a real notification with no polling and no miss window.
 	 * A tick would need to observe `working` at least once, and a run shorter
@@ -5763,7 +5763,7 @@ export default function (pi: ExtensionAPI) {
 			if (move === "started") {
 				ui.ui.setStatus(
 					"inbox-foreign",
-					ui.ui.theme.fg("warning", "● running in another pi (phone)"),
+					ui.ui.theme.fg("warning", "● running in another pi (orch-web)"),
 				);
 			} else {
 				// Deliberately no reload: moving the view without being asked is worse
