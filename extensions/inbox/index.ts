@@ -191,6 +191,7 @@ import {
 	sendQueuedMessageNow,
 	sendToAgent,
 	isWriting,
+	liveRecordsFor,
 	LIVE_STALE_MS,
 	sessionModel,
 	spawnAgent,
@@ -4118,6 +4119,33 @@ interface ModeState {
 	 */
 	foreignRun?: Map<string, boolean>;
 }
+/**
+ * Is any of these live records a FOREIGN run of the session?
+ *
+ * Deliberately takes every record for the session, not the single newest one.
+ * `readLive()` collapses to one record per session id and keeps the freshest
+ * `updated`, and a window that just reloaded or opened the session stamps a
+ * fresh `idle` for itself. That local `idle` then outranks a foreign `working`
+ * whose last write is a few seconds older, so the badge would vanish for the
+ * rest of a run the other device is still driving. Any foreign working record
+ * wins over a local idle one.
+ *
+ * A record naming this process, or a child it spawned, is ours and never
+ * foreign. `now` is injected so the staleness rule is testable.
+ */
+export function foreignWorkingFor(
+	records: readonly LiveRecord[],
+	opts: { selfPid: number; now: number },
+): boolean {
+	return records.some(
+		(rec) =>
+			rec.state === "working" &&
+			rec.pid !== opts.selfPid &&
+			rec.bgParent !== opts.selfPid &&
+			isWriting(rec, opts.now),
+	);
+}
+
 const MODE_KEY = Symbol.for("pi.inbox.mode");
 /** The live-record directory watcher, kept on globalThis so /reload cannot stack one. */
 const FOREIGN_WATCHER_KEY = Symbol.for("pi.inbox.foreignWatcher");
@@ -5714,10 +5742,11 @@ export default function (pi: ExtensionAPI) {
 	 * check: stale "working" records are already aged out on read.
 	 */
 	function foreignRunActive(id: string): boolean {
-		const rec = readLive().get(id);
-		if (!rec || rec.state !== "working") return false;
-		if (rec.pid === process.pid || rec.bgParent === process.pid) return false;
-		return !getAgent(id)?.proc;
+		if (getAgent(id)?.proc) return false;
+		return foreignWorkingFor(liveRecordsFor(id), {
+			selfPid: process.pid,
+			now: Date.now(),
+		});
 	}
 
 	/**

@@ -1222,7 +1222,14 @@ export function writerElsewhere(id: string): boolean {
  * Ask `isWriting` for the narrow question; use these directly only when the
  * distinction is what you are displaying.
  */
-function liveRecordsFor(id: string): LiveRecord[] {
+/**
+ * Every live record naming `id`, unfiltered.
+ *
+ * Unlike `readLive()`'s map, this keeps ALL pids: several processes can hold one
+ * session at once (a window that just reloaded writes its own `idle`, which would
+ * otherwise mask a foreign `working`). Callers apply their own rule.
+ */
+export function liveRecordsFor(id: string): LiveRecord[] {
 	// Resolved at call time, not from the module-level AGENTS_DIR: that constant
 	// is captured at import, so a test (or any caller with a redirected agent
 	// dir) would read the wrong directory entirely -- and silently report "no
