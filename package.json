@@ -24,7 +24,8 @@
       "extensions/voice/index.ts",
       "extensions/compat-check/index.ts",
       "extensions/session-mention/index.ts",
-      "extensions/tree-position/index.ts"
+      "extensions/tree-position/index.ts",
+      "extensions/model-picker/index.ts"
     ],
     "skills": [
       "skills"

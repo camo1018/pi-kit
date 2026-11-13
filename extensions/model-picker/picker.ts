@@ -1,0 +1,303 @@
+/**
+ * The model picker component. Kept separate from index.ts so tests can
+ * construct it without installing the editor patch or registering commands.
+ */
+
+import type { Theme } from "@earendil-works/pi-coding-agent";
+import {
+	isKeyRelease,
+	isKeyRepeat,
+	matchesKey,
+	truncateToWidth,
+	wrapTextWithAnsi,
+	type Focusable,
+	type KeybindingsManager,
+	type TUI,
+} from "@earendil-works/pi-tui";
+import type { Model } from "@earendil-works/pi-ai";
+
+/** Digits 1..9 map to rows, so a page never exceeds a single-digit count. */
+const MAX_PAGE = 9;
+
+export interface Entry {
+	model: Model<any>;
+	provider: string;
+	id: string;
+	name: string;
+}
+
+export class ModelPicker implements Focusable {
+	private _focused = false;
+	private entries: Entry[] = [];
+	private filtered: Entry[] = [];
+	private selected = 0;
+	private digitsAsText = false;
+	private query = "";
+	private scope: "scoped" | "all";
+	private error?: string;
+	private busy = false;
+	private disposed = false;
+
+	get focused() {
+		return this._focused;
+	}
+
+	set focused(value: boolean) {
+		this._focused = value;
+	}
+
+	private readonly tui: TUI;
+	private readonly theme: Theme;
+	private readonly kb: KeybindingsManager;
+	private readonly done: (result: Model<any> | undefined) => void;
+	private readonly scopedEntries: Entry[];
+	private readonly allEntries: Entry[];
+	private readonly current: Model<any> | undefined;
+	private readonly commit: (model: Model<any>) => Promise<boolean>;
+
+	constructor(
+		tui: TUI,
+		theme: Theme,
+		kb: KeybindingsManager,
+		done: (result: Model<any> | undefined) => void,
+		scopedEntries: Entry[],
+		allEntries: Entry[],
+		current: Model<any> | undefined,
+		commit: (model: Model<any>) => Promise<boolean>,
+	) {
+		this.tui = tui;
+		this.theme = theme;
+		this.kb = kb;
+		this.done = done;
+		this.scopedEntries = scopedEntries;
+		this.allEntries = allEntries;
+		this.current = current;
+		this.commit = commit;
+		this.scope = scopedEntries.length > 0 ? "scoped" : "all";
+		this.entries = this.scope === "scoped" ? scopedEntries : allEntries;
+		this.filtered = this.entries;
+		const index = this.filtered.findIndex((entry) => this.isCurrent(entry));
+		this.selected = index >= 0 ? index : 0;
+	}
+
+	dispose(): void {
+		this.disposed = true;
+	}
+
+	invalidate(): void {
+		// Stateless render; nothing cached.
+	}
+
+	private isCurrent(entry: Entry): boolean {
+		return this.current?.provider === entry.provider &&
+			this.current?.id === entry.id;
+	}
+
+	private metrics() {
+		const rows = Math.max(1, this.tui.terminal?.rows ?? 30);
+		const compact = rows < 18;
+		// title + filter + digits hint + page footer + help lines
+		const fixed = compact ? 4 : 6;
+		const pageSize = Math.max(1, Math.min(MAX_PAGE, rows - fixed));
+		return { rows, compact, pageSize };
+	}
+
+	private applyFilter(): void {
+		const q = this.query.trim().toLowerCase();
+		this.filtered = !q
+			? this.entries
+			: this.entries.filter((entry) =>
+				`${entry.provider}/${entry.id} ${entry.name}`
+					.toLowerCase()
+					.includes(q));
+		this.selected = Math.max(0,
+			Math.min(this.selected, this.filtered.length - 1));
+	}
+
+	private setScope(scope: "scoped" | "all"): void {
+		if (this.scope === scope) return;
+		this.scope = scope;
+		this.entries = scope === "scoped" ? this.scopedEntries : this.allEntries;
+		this.selected = 0;
+		this.applyFilter();
+	}
+
+	private async choose(entry: Entry | undefined): Promise<void> {
+		if (!entry || this.busy) return;
+		if (this.isCurrent(entry)) {
+			this.done(undefined);
+			return;
+		}
+		this.busy = true;
+		this.error = undefined;
+		this.tui.requestRender();
+		try {
+			const ok = await this.commit(entry.model);
+			if (this.disposed) return;
+			if (!ok) {
+				this.error = `No API key for ${entry.provider}/${entry.id}`;
+				return;
+			}
+			this.done(entry.model);
+		} catch (error) {
+			if (!this.disposed) {
+				this.error = error instanceof Error ? error.message : String(error);
+			}
+		} finally {
+			this.busy = false;
+			if (!this.disposed) this.tui.requestRender();
+		}
+	}
+
+	handleInput(data: string): void {
+		// Scoped listeners run before pi filters key releases; ignore them so a
+		// held digit key cannot select twice.
+		if (this.disposed || isKeyRelease(data)) return;
+		if (this.busy) return;
+
+		const { pageSize } = this.metrics();
+		const page = Math.floor(this.selected / pageSize);
+		const onPage = this.filtered.slice(page * pageSize, (page + 1) * pageSize);
+
+		// Resolve printable input once; digits are shortcuts unless toggled off.
+		const ch = data.length === 1 && data.charCodeAt(0) >= 32
+			? data
+			: undefined;
+		const digit = ch && /^[1-9]$/.test(ch) ? ch : undefined;
+
+		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+			this.done(undefined);
+			return;
+		}
+		if (matchesKey(data, "ctrl+n")) {
+			this.digitsAsText = !this.digitsAsText;
+			this.tui.requestRender();
+			return;
+		}
+		if (this.kb.matches(data, "tui.input.tab")) {
+			if (this.scopedEntries.length > 0) {
+				this.setScope(this.scope === "all" ? "scoped" : "all");
+				this.tui.requestRender();
+			}
+			return;
+		}
+		if (this.kb.matches(data, "tui.select.confirm") ||
+			this.kb.matches(data, "tui.input.submit")) {
+			void this.choose(this.filtered[this.selected]);
+			return;
+		}
+		if (this.kb.matches(data, "tui.select.up") ||
+			matchesKey(data, "up")) {
+			if (isKeyRepeat(data)) return;
+			this.selected = this.selected === 0
+				? Math.max(0, this.filtered.length - 1)
+				: this.selected - 1;
+			this.tui.requestRender();
+			return;
+		}
+		if (this.kb.matches(data, "tui.select.down") ||
+			matchesKey(data, "down")) {
+			if (isKeyRepeat(data)) return;
+			this.selected = this.selected >= this.filtered.length - 1
+				? 0
+				: this.selected + 1;
+			this.tui.requestRender();
+			return;
+		}
+		// Left/right page, matching the group selector.
+		if (matchesKey(data, "left") ||
+			this.kb.matches(data, "tui.select.pageUp")) {
+			this.selected = Math.max(0, this.selected - pageSize);
+			this.tui.requestRender();
+			return;
+		}
+		if (matchesKey(data, "right") ||
+			this.kb.matches(data, "tui.select.pageDown")) {
+			this.selected = Math.min(this.filtered.length - 1,
+				this.selected + pageSize);
+			this.tui.requestRender();
+			return;
+		}
+		if (digit && !this.digitsAsText) {
+			const entry = onPage[Number(digit) - 1];
+			if (entry) void this.choose(entry);
+			return;
+		}
+		if (matchesKey(data, "backspace")) {
+			this.query = this.query.slice(0, -1);
+			this.selected = 0;
+			this.applyFilter();
+			this.tui.requestRender();
+			return;
+		}
+		if (ch) {
+			// Digits reach here only after ctrl+n, so typing "4.1" works.
+			this.query += ch;
+			this.selected = 0;
+			this.applyFilter();
+			this.tui.requestRender();
+		}
+	}
+
+	render(width: number): string[] {
+		const th = this.theme;
+		const { pageSize, compact } = this.metrics();
+		this.selected = Math.max(0,
+			Math.min(this.selected, Math.max(0, this.filtered.length - 1)));
+		const page = Math.floor(this.selected / pageSize);
+		const shown = this.filtered.slice(page * pageSize, (page + 1) * pageSize);
+		const pages = Math.max(1, Math.ceil(this.filtered.length / pageSize));
+
+		const scopeTag = this.scopedEntries.length > 0
+			? th.fg("muted", ` [${this.scope === "scoped"
+				? `${this.scopedEntries.length} scoped`
+				: `${this.allEntries.length} all`}]`)
+			: th.fg("muted", ` [${this.allEntries.length} available]`);
+		const lines = [th.fg("accent", th.bold(`Select model${scopeTag}`))];
+
+		const filterLine = this.query
+			? th.fg("muted", `  filter: ${this.query}`)
+			: this.digitsAsText
+				? th.fg("dim", "  filter: (type to search)")
+				: "";
+		lines.push(filterLine);
+		lines.push(th.fg("dim", this.digitsAsText
+			? "  Digits: text · Ctrl+N for shortcuts"
+			: "  Digits: select 1–9 · Ctrl+N for search"));
+
+		for (let i = 0; i < pageSize; i++) {
+			const entry = shown[i];
+			if (!entry) {
+				lines.push(!this.filtered.length && i === 0
+					? th.fg("muted", "  No matching models")
+					: "");
+				continue;
+			}
+			const index = page * pageSize + i;
+			const isSelected = index === this.selected;
+			const marker = this.isCurrent(entry) ? "✓" : " ";
+			const row = ` ${isSelected ? "▶" : " "} ${i + 1} ${marker} ` +
+				`${entry.id} ${th.fg("muted", `[${entry.provider}]`)}`;
+			lines.push(isSelected ? th.fg("accent", row) : row);
+		}
+
+		lines.push(th.fg("muted", `  Page ${page + 1}/${pages}` +
+			`  ·  ${this.filtered.length} model` +
+			`${this.filtered.length === 1 ? "" : "s"}`));
+
+		if (this.error) {
+			for (const line of wrapTextWithAnsi(this.error, Math.max(1, width - 2))) {
+				lines.push(th.fg("error", `  ${line}`));
+			}
+		} else if (this.busy) {
+			lines.push(th.fg("dim", "  Switching…"));
+		} else if (!compact) {
+			lines.push(th.fg("dim",
+				"  ↑↓ ←→ PgUp PgDn navigate · Enter choose · Esc cancel"));
+			lines.push(th.fg("dim",
+				"  Tab scope · Ctrl+N digits select/search"));
+		}
+
+		return lines.map((line) => truncateToWidth(line, Math.max(1, width)));
+	}
+}
