@@ -66,21 +66,26 @@ function byModified(a: SessionRef, b: SessionRef): number {
 }
 
 /**
- * Destination group of the session being composed, when the current session has
- * no membership of its own.
- *
- * The inbox only writes membership to inbox-groups.json at spawn time, so while
- * you are typing the first prompt of a new background agent the chosen group
- * lives on the inbox's pending reply target (ctrl+g) or its one-off/default
- * pre-pick. Read those globals with the inbox's own precedence; without this,
- * `@g[` always claimed the composing session was ungrouped.
+ * Group a pending inbox action is aimed at, if any. `undefined` means the
+ * pending action is explicitly ungrouped; `null` means nothing is pending.
  */
-function composedGroupId(store: GroupStore): string | undefined {
+function pendingTargetGroup(
+	store: GroupStore,
+	sessionId?: string,
+): string | null | undefined {
 	const global = globalThis as any;
 	const target = global[Symbol.for("pi.inbox.reply-target")];
-	if (target?.kind === "new" && typeof target.groupId === "string") {
-		return target.groupId;
+	// Composing a new agent: its destination is chosen before it exists, so it
+	// is not in inbox-groups.json yet.
+	if (target?.kind === "new") {
+		return typeof target.groupId === "string" ? target.groupId : undefined;
 	}
+	// Replying to an existing agent: the work happens in *its* group, not yours.
+	if (target?.kind === "agent" && typeof target.id === "string") {
+		if (target.id === sessionId) return null;
+		return store.sessions[target.id];
+	}
+	// The one-off pre-pick (F) for the next new agent.
 	const preset = global[Symbol.for("pi.inbox.next-agent-group")];
 	if (preset === "ungrouped") return undefined;
 	if (typeof preset === "string" && preset !== "all") {
@@ -88,9 +93,32 @@ function composedGroupId(store: GroupStore): string | undefined {
 			? preset
 			: store.defaultGroupId;
 	}
+	return null;
+}
+
+/**
+ * The group `@g[` means for the session being typed in.
+ *
+ * Precedence, most specific first: the group the pending inbox action is
+ * aimed at (composing a new agent, or replying to one), the next-agent one-off
+ * pre-pick, this session's own membership, then (orchestrator mode only) the
+ * inbox's current group view. Reading membership first made `@g[` list the
+ * sender's group while composing into a different one, which looks exactly
+ * like "it is picking up other groups".
+ */
+function mentionGroupId(
+	store: GroupStore,
+	sessionId?: string,
+): string | undefined {
+	const pending = pendingTargetGroup(store, sessionId);
+	if (pending !== null) return pending;
+	if (sessionId && store.sessions[sessionId]) {
+		return store.sessions[sessionId];
+	}
 	// Mirrors the inbox's newAgentGroup(): the current group view, else the
 	// default group for the All view. Only when orchestrator mode is on: a plain
 	// foreground session must not borrow a view filter's group.
+	const global = globalThis as any;
 	if (!global[Symbol.for("pi.inbox.mode")]?.on) return undefined;
 	const view = global[Symbol.for("pi.inbox.group-view")] ?? "all";
 	if (view === "ungrouped") return undefined;
@@ -113,6 +141,10 @@ export function clearSessionCache(): void {
 	inflight = undefined;
 	cachedArchivedAt = 0;
 	cachedArchived = undefined;
+	fileIndexAt = 0;
+	fileIndex = undefined;
+	headerIds.clear();
+	nameIndex.clear();
 	groupCache.clear();
 	groupInflight.clear();
 }
@@ -180,24 +212,31 @@ async function listSessions(): Promise<SessionRef[]> {
 }
 
 /**
- * Session files whose name ends in one of `ids`, one pass over the session tree.
- *
- * Pi names files `<timestamp>_<session-id>.jsonl`, so the folder layout plus the
- * filename suffix identifies a session without opening anything. This is the
- * whole point of the group path: `SessionManager.listAll()` reads every line of
- * every session (496 files / 543 MB here) to answer a question the filenames
- * already answer for a group of a few dozen. Unreadable dirs are skipped, and a
- * missing id just isn't found — the caller falls back to the full listing.
+ * Every session file on disk, plus a filename-stem index. A readdir of the
+ * session tree is ~3 ms; pi's `SessionManager.listAll()` is ~2.5 s because it
+ * parses every line of every file. `@g[` therefore never calls it.
  */
-function findSessionFiles(ids: Set<string>): Map<string, string> {
-	const found = new Map<string, string>();
-	if (ids.size === 0) return found;
+let fileIndexAt = 0;
+let fileIndex: { files: string[]; byStem: Map<string, string> } | undefined;
+/**
+ * Session id from a file's header, memoised per path. A path's header line is
+ * written once and never rewritten, so this never goes stale; it only grows.
+ * Only read for files whose name doesn't already end in a wanted id, which is
+ * how a renamed or copied transcript is still found without a full scan.
+ */
+const headerIds = new Map<string, string | null>();
+
+function sessionFiles(): { files: string[]; byStem: Map<string, string> } {
+	const now = Date.now();
+	if (fileIndex && now - fileIndexAt < 1000) return fileIndex;
+	const files: string[] = [];
+	const byStem = new Map<string, string>();
 	const root = path.join(getAgentDir(), "sessions");
 	let dirs: fs.Dirent[];
 	try {
 		dirs = fs.readdirSync(root, { withFileTypes: true });
 	} catch {
-		return found;
+		dirs = [];
 	}
 	for (const dir of dirs) {
 		if (!dir.isDirectory() && !dir.isSymbolicLink()) continue;
@@ -209,14 +248,76 @@ function findSessionFiles(ids: Set<string>): Map<string, string> {
 		}
 		for (const name of names) {
 			if (!name.endsWith(".jsonl")) continue;
-			const stem = name.slice(0, -".jsonl".length);
-			for (const id of ids) {
-				if (stem.endsWith(id) && !found.has(id)) {
-					found.set(id, path.join(root, dir.name, name));
-					break;
-				}
-			}
+			const file = path.join(root, dir.name, name);
+			files.push(file);
+			byStem.set(name.slice(0, -".jsonl".length), file);
 		}
+	}
+	// Drop memo entries for files that no longer exist.
+	if (headerIds.size > files.length * 2) {
+		const live = new Set(files);
+		for (const file of headerIds.keys()) {
+			if (!live.has(file)) headerIds.delete(file);
+		}
+	}
+	fileIndex = { files, byStem };
+	fileIndexAt = now;
+	return fileIndex;
+}
+
+function headerIdOf(file: string): string | null {
+	if (headerIds.has(file)) return headerIds.get(file) ?? null;
+	let id: string | null = null;
+	try {
+		const fd = fs.openSync(file, "r");
+		try {
+			const buf = Buffer.alloc(4096);
+			const read = fs.readSync(fd, buf, 0, buf.length, 0);
+			const first = buf.subarray(0, read).toString("utf8")
+				.split("\n", 1)[0] ?? "";
+			const header = JSON.parse(first);
+			if (header?.type === "session" && typeof header.id === "string") {
+				id = header.id;
+			}
+		} finally {
+			fs.closeSync(fd);
+		}
+	} catch {
+		// Unparsable header: the file simply isn't a session we can name.
+	}
+	headerIds.set(file, id);
+	return id;
+}
+
+/**
+ * Session files for `ids`.
+ *
+ * Pi names files `<timestamp>_<session-id>.jsonl`, so the stem answers the
+ * question without opening anything. Ids the stems don't account for are
+ * matched against header ids instead — a renamed or copied transcript still
+ * resolves. Ids that resolve neither way are gone (a deleted session whose
+ * group membership outlived it) and are reported missing rather than forcing a
+ * full scan of the tree, which is what made `@g[` take seconds.
+ */
+function findSessionFiles(ids: Set<string>): Map<string, string> {
+	const found = new Map<string, string>();
+	if (ids.size === 0) return found;
+	const { files, byStem } = sessionFiles();
+	const claimed = new Set<string>();
+	for (const id of ids) {
+		for (const [stem, file] of byStem) {
+			if (!stem.endsWith(id)) continue;
+			found.set(id, file);
+			claimed.add(file);
+			break;
+		}
+	}
+	if (found.size === ids.size) return found;
+	for (const file of files) {
+		if (claimed.has(file)) continue;
+		const headerId = headerIdOf(file);
+		if (!headerId || !ids.has(headerId) || found.has(headerId)) continue;
+		found.set(headerId, file);
 	}
 	return found;
 }
@@ -238,15 +339,23 @@ function refFromFile(file: string, id: string): SessionRef | undefined {
 			fs.closeSync(fd);
 		}
 		const firstLine = head.split("\n", 1)[0] ?? "";
-		const header = JSON.parse(firstLine);
-		if (header?.type !== "session") return undefined;
+		let header: any;
+		try {
+			header = JSON.parse(firstLine);
+		} catch {
+			// A file that matched by name but has an unreadable header is still a
+			// session; show it with what the filename and mtime tell us.
+			header = undefined;
+		}
 		const name = sessionNameFromFile(file);
 		const info = {
 			path: file,
 			id,
-			cwd: typeof header.cwd === "string" ? header.cwd : "",
+			cwd: typeof header?.cwd === "string" ? header.cwd : "",
 			name,
-			created: new Date(header.timestamp),
+			created: header?.timestamp
+				? new Date(header.timestamp)
+				: stat.mtime,
 			modified: stat.mtime,
 			messageCount: 1, // a real, readable session; 0 would hide it
 			firstMessage: "",
@@ -262,16 +371,61 @@ function shortDir(cwd: string): string {
 	return cwd.split("/").filter(Boolean).pop() ?? cwd;
 }
 
-/** Last session_info name in the file, read backwards a chunk at a time. */
+/**
+ * Last session_info name in the file, read backwards a chunk at a time.
+ *
+ * A name can be anywhere in a multi-MB transcript, so a cold read walks the
+ * whole file: 139 members cost 153 MB and ~850 ms. The result is memoised
+ * against the file's size and mtime; because sessions are append-only, an
+ * append only re-reads the bytes past the previous size.
+ */
+interface NameEntry {
+	size: number;
+	mtimeMs: number;
+	name: string | undefined;
+}
+const nameIndex = new Map<string, NameEntry>();
+
 function sessionNameFromFile(file: string): string | undefined {
+	let size: number;
+	let mtimeMs: number;
+	try {
+		const stat = fs.statSync(file);
+		size = stat.size;
+		mtimeMs = stat.mtimeMs;
+	} catch {
+		return undefined;
+	}
+	const known = nameIndex.get(file);
+	if (known && known.size === size && known.mtimeMs === mtimeMs) {
+		return known.name;
+	}
+	let name: string | undefined;
+	if (known && known.size <= size) {
+		// Append-only: the old name is still the last one unless the newly
+		// appended bytes carry a newer one, so only that tail is scanned.
+		name = scanNameFrom(file, known.size) ?? known.name;
+	} else {
+		// New file, or one that shrank or was rewritten: no safe resume point.
+		name = scanNameFrom(file, 0);
+	}
+	nameIndex.set(file, { size, mtimeMs, name });
+	return name;
+}
+
+/** Last session_info name in the bytes from `from` to EOF, read backwards. */
+function scanNameFrom(
+	file: string,
+	from: number,
+): string | undefined {
 	try {
 		const size = fs.statSync(file).size;
 		let fd: number | undefined;
 		try {
 			fd = fs.openSync(file, "r");
 			let pos = size;
-			while (pos > 0) {
-				const len = Math.min(64 * 1024, pos);
+			while (pos > from) {
+				const len = Math.min(64 * 1024, pos - from);
 				pos -= len;
 				const buf = Buffer.alloc(len);
 				fs.readSync(fd, buf, 0, len, pos);
@@ -300,21 +454,11 @@ function sessionNameFromFile(file: string): string | undefined {
 }
 
 /**
- * The full listing, narrowed to `memberIds`. Used when filename resolution can't
- * account for every member, so the picker still shows exactly the group.
- */
-async function listSessionsIn(
-	memberIds: Set<string>,
-): Promise<SessionRef[]> {
-	return (await listSessions()).filter((ref) =>
-		memberIds.has(ref.info.id),
-	);
-}
-
-/**
- * Members of one group, resolved from filenames instead of pi's full scan.
- * Falls back to the full listing when any member id has no file (a renamed or
- * copied session), so the picker is never silently missing a session.
+ * Members of one group, resolved from filenames and cached. Never falls back to
+ * pi's full scan: a member whose file is gone (deleted session, stale group
+ * membership) is skipped, not worth seconds per keystroke. A file that exists
+ * but won't parse still gets a row from its header — a real session we can't
+ * fully describe is better than a picker that silently drops it.
  */
 async function listGroupSessions(
 	groupId: string,
@@ -328,22 +472,14 @@ async function listGroupSessions(
 	const work = (async () => {
 		try {
 			const files = findSessionFiles(memberIds);
-			if (files.size !== memberIds.size) {
-				return await listSessionsIn(memberIds);
-			}
 			const refs: SessionRef[] = [];
 			for (const [id, file] of files) {
 				const ref = refFromFile(file, id);
 				if (ref) refs.push(ref);
 			}
-			// A file that exists but doesn't parse is a real session we can't
-			// describe; the full listing has its own tolerant parser.
-			if (refs.length !== files.size) {
-				return await listSessionsIn(memberIds);
-			}
 			return refs.sort(byModified);
 		} catch {
-			return await listSessionsIn(memberIds);
+			return [];
 		} finally {
 			groupInflight.delete(groupId);
 		}
@@ -618,12 +754,10 @@ export default function (pi: ExtensionAPI): void {
 							const groupsStore = new InboxGroups(
 								getAgentDir(),
 							).load();
-							currentGroupId =
-								groupsStore.sessions[currentSessionId];
-							if (!currentGroupId) {
-								// A new agent's group is picked before it exists.
-								currentGroupId = composedGroupId(groupsStore);
-							}
+							currentGroupId = mentionGroupId(
+								groupsStore,
+								currentSessionId,
+							);
 							if (currentGroupId) {
 								const grp = groupsStore.groups.find(
 									(g) => g.id === currentGroupId,

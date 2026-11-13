@@ -8,16 +8,21 @@ Reference other Pi sessions from a prompt with `@[...]` (or sessions in your cur
   renamed titles cannot redirect the mention. Plain `@` file completion is
   untouched.
 - Typing `@g[` restricts the autocomplete suggestions specifically to other
-  saved sessions that belong to the current session's inbox group, **excluding
-  sessions the Inbox has archived**. Typing `@ga[` uses the same group filter
-  but **includes archived sessions too**.
+  saved sessions that belong to the relevant inbox group, **excluding sessions
+  the Inbox has archived**. Typing `@ga[` uses the same group filter but
+  **includes archived sessions too**.
 - The group path resolves members from filenames (`<timestamp>_<session-id>.jsonl`)
   and reads only each member's header line and its last `session_info` entry, so
-  it never runs pi's full scan. On a 496-file / 543 MB session tree that is
-  ~5–70 ms per group instead of ~1.3 s for every cold keystroke. `@[` still uses
-  `SessionManager.listAll()`, since it spans every project. If a member has no
-  file — or a file that won't parse — the lookup falls back to the full scan and
-  filters, so the picker never silently drops a session.
+  it never runs pi's full scan. Cold is ~250 ms for a 139-member group and ~0 ms
+  per follow-up keystroke (1 s cache), versus ~2.5 s per keystroke for
+  `SessionManager.listAll()` on an 834-file / 1 GB tree. `@[` still uses
+  `SessionManager.listAll()`, since it spans every project.
+- A member whose file is gone (a deleted session whose group membership
+  outlived it) is skipped. It is *not* worth seconds per keystroke to chase, and
+  the alternative — a full scan on every keystroke — is what made `@g[` feel
+  broken. A member whose file was renamed or copied is still found: the filename
+  stem answers the common case, and unmatched ids are matched against header ids
+  (one 4 KB read per candidate, memoised per path).
 - Archive state comes from `~/.pi/agent/inbox.json` (`sessions[id].archivedAt`),
   re-read at most once per second. Only the Inbox writes that file; if it is
   missing or unreadable, nothing counts as archived.
@@ -27,11 +32,14 @@ Reference other Pi sessions from a prompt with `@[...]` (or sessions in your cur
   When every sibling in the group is archived, the `@g[` placeholder points at
   `@ga[`.
   Selecting a suggestion inserts the standard `@[id]` token.
-- A session that is still being composed (no membership on disk yet) resolves
-  its group the same way the Inbox starts the agent: the pending new-agent reply
-  target (`ctrl+g`), then the `F` one-off pre-pick, then — only in orchestrator
-  mode — the current group view and the default group. Without this, `@g[` in a
-  brand-new session always claimed there was no group.
+- The group `@g[` means is resolved from the action you are taking, most
+  specific first: the pending inbox target (composing a new agent's chosen
+  group, or the group of the agent you are replying to), then the `F` one-off
+  pre-pick, then the current session's own membership, then — only in
+  orchestrator mode — the current group view and the default group. Reading the
+  session's own membership first meant that composing or replying across groups
+  listed the *sender's* siblings, which reads as "it is picking up other
+  groups".
 - On each model request, every recognized `@[id]` token expands in Pi's
   in-flight context clone. The referenced active-branch transcript is placed
   in a `<skill>`-shaped block and the token becomes a readable `«title»`
@@ -55,8 +63,8 @@ Reference other Pi sessions from a prompt with `@[...]` (or sessions in your cur
 | `lib/inbox-agents.ts` → `transcriptMarkdown()` | rendering another session's branch | the inbox extension's transcript format changes; the extension still loads, mention blocks then render a `_Could not read session_` body |
 | `SessionManager.listAll()` / `.open()` / `SessionInfo` (public API) | listing sessions, resolving ids, reading branches | public API surface change in pi core |
 | `~/.pi/agent/inbox.json` (`sessions[id].archivedAt`) | deciding which group siblings `@g[` hides | the Inbox moves archive state to another file; `@g[` then shows archived sessions again (`@ga[` is unaffected) |
-| Pi's session-file naming (`<timestamp>_<id>.jsonl`) and folder layout | resolving a whole group without pi's full scan | the format changes; the group lookup finds no files and silently falls back to the slower full scan (still correct) |
-| Inbox globals `pi.inbox.reply-target`, `pi.inbox.next-agent-group`, `pi.inbox.group-view`, `pi.inbox.mode` | resolving the group of a session that is still being composed | the Inbox renames those keys or stops tracking a pending new-agent group; `@g[` in a brand-new session then reports no group until the agent spawns |
+| Pi's session-file naming (`<timestamp>_<id>.jsonl`) and folder layout | resolving a whole group without pi's full scan | the format changes; the filename stem no longer matches, but header-id matching still finds every member (correct, just slower on a cold cache) |
+| Inbox globals `pi.inbox.reply-target`, `pi.inbox.next-agent-group`, `pi.inbox.group-view`, `pi.inbox.mode` | resolving which group `@g[` means | the Inbox renames those keys; `@g[` then falls back to the session's own membership and stops following the agent you are replying to |
 
 No private components or prototypes are patched. Request-time expansion uses
 Pi's documented `context` event, and autocomplete uses

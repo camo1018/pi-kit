@@ -174,9 +174,19 @@ test("@g[ filters specifically for other sessions in the same group", async () =
 			},
 		}),
 	);
+	fs.writeFileSync(
+		path.join(tmpDir, "inbox.json"),
+		JSON.stringify({ version: 1, sessions: {} }),
+	);
+	writeSession(tmpDir, "--tmp-project--", "session-in-group", {
+		name: "group sibling title",
+		mtime: new Date(2026, 0, 2),
+	});
+	writeSession(tmpDir, "--tmp-project--", "session-id", {
+		name: "a different group",
+		mtime: new Date(2026, 0, 3),
+	});
 
-	const originalListAll = SessionManager.listAll;
-	(SessionManager as any).listAll = async () => [info, infoInGroup];
 	const handlers = new Map<string, (...args: any[]) => any>();
 	const pi = {
 		on(event: string, handler: (...args: any[]) => any) {
@@ -226,7 +236,6 @@ test("@g[ filters specifically for other sessions in the same group", async () =
 		);
 		assert.deepEqual(applied.lines, ["look at @[session-in-group] "]);
 	} finally {
-		(SessionManager as any).listAll = originalListAll;
 		process.env.PI_CODING_AGENT_DIR = originalAgentDir;
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}
@@ -267,6 +276,14 @@ function groupFixture(tmpDir: string) {
 			sessions: { "session-archived": { archivedAt: 1 } },
 		}),
 	);
+	writeSession(tmpDir, "--tmp-project--", "session-in-group", {
+		name: "group sibling title",
+		mtime: new Date(2026, 0, 2),
+	});
+	writeSession(tmpDir, "--tmp-project--", "session-archived", {
+		name: "archived sibling title",
+		mtime: new Date(2026, 0, 3),
+	});
 }
 
 test("@g[ hides archived siblings; @ga[ includes them", async () => {
@@ -276,9 +293,6 @@ test("@g[ hides archived siblings; @ga[ includes them", async () => {
 	process.env.PI_CODING_AGENT_DIR = tmpDir;
 	groupFixture(tmpDir);
 
-	const originalListAll = SessionManager.listAll;
-	(SessionManager as any).listAll = async () =>
-		[infoInGroup, infoArchived];
 	const handlers = new Map<string, (...args: any[]) => any>();
 	const pi = {
 		on(event: string, handler: (...args: any[]) => any) {
@@ -332,7 +346,6 @@ test("@g[ hides archived siblings; @ga[ includes them", async () => {
 		);
 		assert.deepEqual(applied.lines, ["read @[session-archived] "]);
 	} finally {
-		(SessionManager as any).listAll = originalListAll;
 		process.env.PI_CODING_AGENT_DIR = originalAgentDir;
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}
@@ -344,9 +357,23 @@ test("@g[ placeholder points at @ga[ when only archived siblings exist", async (
 	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 	process.env.PI_CODING_AGENT_DIR = tmpDir;
 	groupFixture(tmpDir);
-
-	const originalListAll = SessionManager.listAll;
-	(SessionManager as any).listAll = async () => [infoArchived];
+	// Only the archived member is left in the group.
+	fs.writeFileSync(
+		path.join(tmpDir, "inbox-groups.json"),
+		JSON.stringify({
+			version: 1,
+			groups: [{
+				id: "grp-1",
+				name: "Feature Team",
+				templateEnabled: false,
+				template: "",
+			}],
+			sessions: {
+				"current-session": "grp-1",
+				"session-archived": "grp-1",
+			},
+		}),
+	);
 	const handlers = new Map<string, (...args: any[]) => any>();
 	const pi = {
 		on(event: string, handler: (...args: any[]) => any) {
@@ -381,7 +408,6 @@ test("@g[ placeholder points at @ga[ when only archived siblings exist", async (
 		assert.equal(active.items[0].value, "");
 		assert.match(active.items[0].description, /@ga\[/);
 	} finally {
-		(SessionManager as any).listAll = originalListAll;
 		process.env.PI_CODING_AGENT_DIR = originalAgentDir;
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}
@@ -414,8 +440,21 @@ async function composeFixture(
 		path.join(tmpDir, "inbox.json"),
 		JSON.stringify({ version: 1, sessions: {} }),
 	);
+	writeSession(tmpDir, "--tmp-project--", "session-in-group", {
+		name: "group sibling title",
+		mtime: new Date(2026, 0, 2),
+	});
+	return setInboxGlobals(globals);
+}
+
+/**
+ * Install the inbox's pending-action globals for the duration of a test.
+ * Symbol keys are the inbox's own; Object.entries would skip them.
+ */
+function setInboxGlobals(
+	globals: Record<string | symbol, unknown>,
+): () => void {
 	const saved = new Map<string | symbol, unknown>();
-	// Symbol keys are the inbox's globals; Object.entries would skip them.
 	for (const key of Reflect.ownKeys(globals)) {
 		saved.set(key, (globalThis as any)[key]);
 		(globalThis as any)[key] = globals[key as keyof typeof globals];
@@ -470,8 +509,6 @@ test("@g[ uses the pending new-agent group while composing", async () => {
 			groupId: "grp-1",
 		},
 	});
-	const originalListAll = SessionManager.listAll;
-	(SessionManager as any).listAll = async () => [infoInGroup];
 	try {
 		const suggestions = await suggestionsFor(
 			"@g[",
@@ -482,7 +519,6 @@ test("@g[ uses the pending new-agent group while composing", async () => {
 			["@[session-in-group]"],
 		);
 	} finally {
-		(SessionManager as any).listAll = originalListAll;
 		restore();
 		process.env.PI_CODING_AGENT_DIR = originalAgentDir;
 		fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -497,8 +533,6 @@ test("@g[ falls back to the one-off pre-pick (F) while composing", async () => {
 	const restore = await composeFixture(tmpDir, {
 		[Symbol.for("pi.inbox.next-agent-group")]: "grp-1",
 	});
-	const originalListAll = SessionManager.listAll;
-	(SessionManager as any).listAll = async () => [infoInGroup];
 	try {
 		const suggestions = await suggestionsFor("@g[", "brand-new-composer");
 		assert.deepEqual(
@@ -506,7 +540,110 @@ test("@g[ falls back to the one-off pre-pick (F) while composing", async () => {
 			["@[session-in-group]"],
 		);
 	} finally {
-		(SessionManager as any).listAll = originalListAll;
+		restore();
+		process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("@g[ follows the agent you are replying to, not your own group", async () => {
+	clearSessionCache();
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mention-test-"));
+	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = tmpDir;
+	fs.writeFileSync(
+		path.join(tmpDir, "inbox-groups.json"),
+		JSON.stringify({
+			version: 1,
+			groups: [
+				{ id: "grp-1", name: "Feature Team", templateEnabled: false, template: "" },
+				{ id: "grp-2", name: "Other Team", templateEnabled: false, template: "" },
+			],
+			sessions: {
+				"current-session": "grp-1",
+				"sibling-here": "grp-1",
+				"sibling-there": "grp-2",
+				"target-agent": "grp-2",
+			},
+		}),
+	);
+	fs.writeFileSync(
+		path.join(tmpDir, "inbox.json"),
+		JSON.stringify({ version: 1, sessions: {} }),
+	);
+	writeSession(tmpDir, "--tmp-project--", "sibling-here", {
+		name: "sibling in my group",
+	});
+	writeSession(tmpDir, "--tmp-project--", "sibling-there", {
+		name: "sibling in the target's group",
+	});
+	// Replying to an agent in grp-2: the work lands in grp-2, so @g[ must list
+	// grp-2's siblings rather than the sender's own grp-1.
+	const restore = setInboxGlobals({
+		[Symbol.for("pi.inbox.reply-target")]: {
+			kind: "agent",
+			id: "target-agent",
+			title: "target",
+			cwd: "/tmp/project",
+		},
+	});
+	try {
+		const suggestions = await suggestionsFor("@g[", "current-session");
+		assert.deepEqual(
+			suggestions.items.map((item: any) => item.value),
+			["@[sibling-there]"],
+		);
+	} finally {
+		restore();
+		process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("@g[ follows a composed new-agent group over the sender's own", async () => {
+	clearSessionCache();
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mention-test-"));
+	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = tmpDir;
+	fs.writeFileSync(
+		path.join(tmpDir, "inbox-groups.json"),
+		JSON.stringify({
+			version: 1,
+			groups: [
+				{ id: "grp-1", name: "Feature Team", templateEnabled: false, template: "" },
+				{ id: "grp-2", name: "Other Team", templateEnabled: false, template: "" },
+			],
+			sessions: {
+				"current-session": "grp-1",
+				"sibling-here": "grp-1",
+				"sibling-there": "grp-2",
+			},
+		}),
+	);
+	fs.writeFileSync(
+		path.join(tmpDir, "inbox.json"),
+		JSON.stringify({ version: 1, sessions: {} }),
+	);
+	writeSession(tmpDir, "--tmp-project--", "sibling-here", {
+		name: "sibling in my group",
+	});
+	writeSession(tmpDir, "--tmp-project--", "sibling-there", {
+		name: "sibling in the composed group",
+	});
+	const restore = setInboxGlobals({
+		[Symbol.for("pi.inbox.reply-target")]: {
+			kind: "new",
+			cwd: "/tmp/project",
+			groupId: "grp-2",
+		},
+	});
+	try {
+		const suggestions = await suggestionsFor("@g[", "current-session");
+		assert.deepEqual(
+			suggestions.items.map((item: any) => item.value),
+			["@[sibling-there]"],
+		);
+	} finally {
 		restore();
 		process.env.PI_CODING_AGENT_DIR = originalAgentDir;
 		fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -522,14 +659,11 @@ test("a composed 'ungrouped' pre-pick still beats the current view", async () =>
 		[Symbol.for("pi.inbox.next-agent-group")]: "ungrouped",
 		[Symbol.for("pi.inbox.group-view")]: "grp-1",
 	});
-	const originalListAll = SessionManager.listAll;
-	(SessionManager as any).listAll = async () => [infoInGroup];
 	try {
 		const suggestions = await suggestionsFor("@g[", "brand-new-composer");
 		assert.equal(suggestions.items.length, 1);
 		assert.equal(suggestions.items[0].value, "");
 	} finally {
-		(SessionManager as any).listAll = originalListAll;
 		restore();
 		process.env.PI_CODING_AGENT_DIR = originalAgentDir;
 		fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -546,14 +680,11 @@ test("@g[ does not borrow a view filter's group outside the orchestrator", async
 	const restore = await composeFixture(tmpDir, {
 		[Symbol.for("pi.inbox.group-view")]: "grp-1",
 	});
-	const originalListAll = SessionManager.listAll;
-	(SessionManager as any).listAll = async () => [infoInGroup];
 	try {
 		const suggestions = await suggestionsFor("@g[", "plain-session");
 		assert.equal(suggestions.items.length, 1);
 		assert.equal(suggestions.items[0].value, "");
 	} finally {
-		(SessionManager as any).listAll = originalListAll;
 		restore();
 		process.env.PI_CODING_AGENT_DIR = originalAgentDir;
 		fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -690,7 +821,7 @@ test("@g[ resolves members from filenames, without listAll()", async () => {
 	}
 });
 
-test("@g[ falls back to the full scan when a member has no file", async () => {
+test("@g[ skips a member whose file is gone instead of full-scanning", async () => {
 	clearSessionCache();
 	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mention-test-"));
 	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -720,24 +851,76 @@ test("@g[ falls back to the full scan when a member has no file", async () => {
 	writeSession(tmpDir, "--tmp-project--", "member-named", {
 		name: "a named sibling",
 	});
-	// member-missing deliberately has no file on disk: the listing must still
-	// show the members it can see, via the full-scan fallback.
+	// member-missing has no file on disk: a deleted session whose group
+	// membership outlived it. It must be skipped, not paid for with a full
+	// scan of every session (which is seconds per keystroke on a real tree).
+	let listed = 0;
 	const originalListAll = SessionManager.listAll;
-	(SessionManager as any).listAll = async () =>
-		[
-			{
-				...infoInGroup,
-				id: "member-missing",
-				name: "only the full scan can see this",
-			},
-		] as SessionInfo[];
+	(SessionManager as any).listAll = async () => {
+		listed++;
+		return [] as SessionInfo[];
+	};
 
 	try {
 		const suggestions = await suggestionsFor("@g[", "current-session");
 		assert.deepEqual(
 			suggestions.items.map((item: any) => item.value),
-			["@[member-missing]"],
+			["@[member-named]"],
 		);
+		assert.equal(listed, 0, "a missing member must not trigger a full scan");
+	} finally {
+		(SessionManager as any).listAll = originalListAll;
+		process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("@g[ finds a member whose transcript file was renamed", async () => {
+	clearSessionCache();
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mention-test-"));
+	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = tmpDir;
+
+	fs.writeFileSync(
+		path.join(tmpDir, "inbox-groups.json"),
+		JSON.stringify({
+			version: 1,
+			groups: [{
+				id: "grp-1",
+				name: "Feature Team",
+				templateEnabled: false,
+				template: "",
+			}],
+			sessions: {
+				"current-session": "grp-1",
+				"member-renamed": "grp-1",
+			},
+		}),
+	);
+	fs.writeFileSync(
+		path.join(tmpDir, "inbox.json"),
+		JSON.stringify({ version: 1, sessions: {} }),
+	);
+	// The file name no longer ends in the id, but its header still carries it.
+	const file = writeSession(tmpDir, "--tmp-project--", "member-renamed", {
+		name: "a renamed sibling",
+	});
+	const renamed = file.replace("2026-01-01T00-00-00-000Z_", "");
+	assert.notEqual(renamed, file);
+	fs.renameSync(file, renamed);
+
+	const originalListAll = SessionManager.listAll;
+	(SessionManager as any).listAll = async () => {
+		throw new Error("a renamed member must not force a full scan");
+	};
+
+	try {
+		const suggestions = await suggestionsFor("@g[", "current-session");
+		assert.deepEqual(
+			suggestions.items.map((item: any) => item.value),
+			["@[member-renamed]"],
+		);
+		assert.equal(suggestions.items[0].label, "a renamed sibling");
 	} finally {
 		(SessionManager as any).listAll = originalListAll;
 		process.env.PI_CODING_AGENT_DIR = originalAgentDir;
