@@ -92,6 +92,7 @@ For a cloned install, `git pull` is equivalent to `pi update --extension`.
 | `click-copy/` | Click a fenced block in fullscreen TUI to copy it exactly; requires `md-fence-render`. [docs](extensions/click-copy/README.md) |
 | `snippet-copy/` | Copy fenced blocks by number or language with `/cc <number-or-language>` or `ctrl+shift+y`; works independently of click-to-copy. [docs](extensions/snippet-copy/README.md) |
 | `tool-output-hide/` | Add a hidden state for noisy tool output. ⚠️ [internals](extensions/tool-output-hide/README.md) |
+| `model-picker/` | Digits select a model and arrows navigate in the model selector (`ctrl+l`, `/models`); `ctrl+n` toggles digits to search text. ⚠️ [internals](extensions/model-picker/README.md) |
 | `thinking-block-hide/` | Add a fully hidden state for thinking blocks (`ctrl+t`, `/thinking-blocks`). ⚠️ [internals](extensions/thinking-block-hide/README.md) |
 | `final-answer-divider/` | Visual divider before the final answer |
 | `tree-position/` | Remember `/tree` navigation: resumes a session at your tree position (plus editor draft) instead of the latest branch |
