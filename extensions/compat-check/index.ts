@@ -21,6 +21,7 @@ import * as path from "node:path";
 import { registerLoadedExtension, finalizeLoadPass, getLoadedExtensions } from "../../lib/loaded-extensions.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import * as agent from "@earendil-works/pi-coding-agent";
+import * as ai from "@earendil-works/pi-ai";
 import * as tui from "@earendil-works/pi-tui";
 
 type Ctx = ExtensionContext;
@@ -39,6 +40,7 @@ interface Probe {
 }
 
 const A = agent as any;
+const AI = ai as any;
 const T = tui as any;
 
 /** Look up a method anywhere on a class's prototype chain. */
@@ -340,6 +342,28 @@ const PROBES: Probe[] = [
 		id: "set-model-api",
 		check: (_c, pi) =>
 			need(typeof pi.setModel === "function", "pi.setModel is gone (choosing a model would be a no-op)"),
+	},
+	{
+		ext: "model-picker",
+		id: "set-thinking-level-api",
+		check: (_c, pi) =>
+			need(
+				typeof pi.setThinkingLevel === "function" &&
+					typeof pi.getThinkingLevel === "function",
+				"pi.setThinkingLevel/getThinkingLevel is gone " +
+					"(the picker can apply a model but not its effort)",
+			),
+	},
+	{
+		ext: "model-picker",
+		id: "thinking-levels-api",
+		check: () =>
+			need(
+				typeof AI.getSupportedThinkingLevels === "function" &&
+					typeof AI.clampThinkingLevel === "function",
+				"pi-ai getSupportedThinkingLevels/clampThinkingLevel is gone " +
+					"(the picker cannot tell which efforts a model supports)",
+			),
 	},
 	{
 		ext: "model-picker",

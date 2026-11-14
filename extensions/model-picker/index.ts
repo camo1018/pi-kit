@@ -7,10 +7,16 @@
  *
  *   ↑ ↓ / ← → / PgUp PgDn   navigate (left/right = page)
  *   1–9                     select the row with that number
+ *   shift+tab               cycle the reasoning effort up
+ *   shift+ctrl+tab          cycle the effort back down
  *   ctrl+n                  toggle digits between select and search text
  *   enter                   choose
  *   esc / ctrl+c            cancel
  *   tab                     toggle all / scoped (same as built-in)
+ *
+ * The effort is part of the same choice: pi re-derives the thinking level from
+ * settings whenever a model changes, so picking a model and an effort together
+ * here is the only way to mean both.
  *
  * Digits-as-select is the default because the intended use is a handful of
  * models from `enabledModels`; ctrl+n restores typing digits into the filter
@@ -77,13 +83,25 @@ function installPatch(): void {
 async function openPicker(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
 	const picked = await openModelPicker(ctx, {
 		// setModel lives on the extension API, not on ctx.
-		commit: (model) => pi.setModel(model),
-		// ctrl+s saves the startup default, like the stock selector.
-		onPersist: (model) =>
-			settingsFor(ctx).setDefaultModelAndProvider(model.provider, model.id),
+		commit: async (model, effort) => {
+			if (!(await pi.setModel(model))) return false;
+			// setModel re-derives the level from settings, so apply the level
+			// chosen in the same dialog after it, not before.
+			pi.setThinkingLevel(effort);
+			return true;
+		},
+		// ctrl+s saves the startup defaults, like the stock selectors do.
+		onPersist: (model, effort) => {
+			const settings = settingsFor(ctx);
+			settings.setDefaultModelAndProvider(model.provider, model.id);
+			settings.setDefaultThinkingLevel(effort);
+		},
 	});
 	if (picked) {
-		ctx.ui.notify(`Model: ${picked.provider}/${picked.id}`, "info");
+		ctx.ui.notify(
+			`Model: ${picked.provider}/${picked.id} · effort ${pi.getThinkingLevel()}`,
+			"info",
+		);
 	}
 }
 

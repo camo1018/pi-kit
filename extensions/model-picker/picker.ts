@@ -3,6 +3,7 @@
  * construct it without installing the editor patch or registering commands.
  */
 
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import {
 	isKeyRelease,
@@ -14,16 +15,26 @@ import {
 	type KeybindingsManager,
 	type TUI,
 } from "@earendil-works/pi-tui";
-import type { Model } from "@earendil-works/pi-ai";
+import {
+	clampThinkingLevel,
+	getSupportedThinkingLevels,
+	type Model,
+	type ModelThinkingLevel,
+} from "@earendil-works/pi-ai";
 
 /** Digits 1..9 map to rows, so a page never exceeds a single-digit count. */
 const MAX_PAGE = 9;
+
+/** Used when neither the caller nor the session says which effort to start on. */
+const DEFAULT_EFFORT: ThinkingLevel = "medium";
 
 export interface Entry {
 	model: Model<any>;
 	provider: string;
 	id: string;
 	name: string;
+	/** Effort pinned in `enabledModels` (`provider/model:high`), if any. */
+	pinnedEffort?: ThinkingLevel;
 }
 
 /**
@@ -43,7 +54,12 @@ export function entriesFor(ctx: ExtensionContext): {
 		id: model.id,
 		name: model.name,
 	});
-	const scoped = (ctx.scopedModels ?? []).map((s) => toEntry(s.model));
+	const scoped = (ctx.scopedModels ?? []).map((s) => ({
+		...toEntry(s.model),
+		// `enabledModels` may pin an effort per model; keeping it lets the picker
+		// start on the level that model normally runs at.
+		pinnedEffort: s.thinkingLevel as ThinkingLevel | undefined,
+	}));
 	const all = ctx.modelRegistry.getAvailable()
 		.map(toEntry)
 		.sort((a, b) => {
@@ -57,16 +73,27 @@ export interface ModelPickerOptions {
 	/** Resolve with the current model instead of `undefined` when picked. */
 	allowCurrent?: boolean;
 	/** `ctrl+s`: save the choice as the startup default, then resolve. */
-	onPersist?: (model: Model<any>) => void;
+	onPersist?: (model: Model<any>, effort: ThinkingLevel) => void;
 	/** Prefill the filter, e.g. from `/model <search>`. */
 	initialQuery?: string;
+	/** Effort to start on; clamped per model as the cursor moves. */
+	effort?: ThinkingLevel;
 }
 
 export interface OpenModelPickerOptions extends ModelPickerOptions {
 	/** Highlight and compare against this model instead of `ctx.model`. */
 	current?: Model<any>;
-	/** Apply the choice. Resolving false keeps the picker open. */
-	commit: (model: Model<any>) => Promise<boolean>;
+	/**
+	 * Apply the choice and its effort. Resolving false keeps the picker open.
+	 * The effort is always supplied and already clamped to the model, so a
+	 * caller that changes model and effort together does not re-derive it.
+	 */
+	commit: (model: Model<any>, effort: ThinkingLevel) => Promise<boolean>;
+}
+
+/** Same provider and id, ignoring any per-model extras. */
+function sameModel(a: Model<any> | undefined, b: Model<any> | undefined) {
+	return !!a && !!b && a.provider === b.provider && a.id === b.id;
 }
 
 /**
@@ -83,6 +110,11 @@ export function openModelPicker(
 		return Promise.resolve(undefined);
 	}
 	const { scoped, all } = entriesFor(ctx);
+	const current = options.current ?? ctx.model;
+	// Precedence: an explicit level, then one pinned for this model in
+	// `enabledModels`, then whatever this session is already running.
+	const pinned = scoped.find((entry) => sameModel(entry.model, current))
+		?.pinnedEffort;
 	return ctx.ui.custom<Model<any> | undefined>(
 		(tui, theme, keybindings, done) =>
 			new ModelPicker(
@@ -92,9 +124,12 @@ export function openModelPicker(
 				done,
 				scoped,
 				all,
-				options.current ?? ctx.model,
+				current,
 				options.commit,
-				options,
+				{
+					...options,
+					effort: options.effort ?? pinned ?? ctx.thinkingLevel,
+				},
 			),
 		{ overlay: true },
 	);
@@ -111,6 +146,12 @@ export class ModelPicker implements Focusable {
 	private error?: string;
 	private busy = false;
 	private disposed = false;
+	/**
+	 * The effort that will be applied with the chosen model. Clamped per row as
+	 * the cursor moves, so a model that cannot reason shows `off` rather than a
+	 * level that would silently degrade on commit.
+	 */
+	private effort: ThinkingLevel = DEFAULT_EFFORT;
 
 	get focused() {
 		return this._focused;
@@ -127,9 +168,15 @@ export class ModelPicker implements Focusable {
 	private readonly scopedEntries: Entry[];
 	private readonly allEntries: Entry[];
 	private readonly current: Model<any> | undefined;
-	private readonly commit: (model: Model<any>) => Promise<boolean>;
+	private readonly commit: (
+		model: Model<any>,
+		effort: ThinkingLevel,
+	) => Promise<boolean>;
 	private readonly allowCurrent: boolean;
-	private readonly onPersist?: (model: Model<any>) => void;
+	private readonly onPersist?: (
+		model: Model<any>,
+		effort: ThinkingLevel,
+	) => void;
 
 	constructor(
 		tui: TUI,
@@ -139,7 +186,7 @@ export class ModelPicker implements Focusable {
 		scopedEntries: Entry[],
 		allEntries: Entry[],
 		current: Model<any> | undefined,
-		commit: (model: Model<any>) => Promise<boolean>,
+		commit: (model: Model<any>, effort: ThinkingLevel) => Promise<boolean>,
 		options: ModelPickerOptions = {},
 	) {
 		this.tui = tui;
@@ -165,6 +212,7 @@ export class ModelPicker implements Focusable {
 			this.applyFilter();
 			this.selected = 0;
 		}
+		this.effort = options.effort ?? DEFAULT_EFFORT;
 	}
 
 	dispose(): void {
@@ -180,11 +228,44 @@ export class ModelPicker implements Focusable {
 			this.current?.id === entry.id;
 	}
 
+	/** Levels the highlighted model supports (just `off` if it cannot reason). */
+	private levelsFor(entry: Entry | undefined): ThinkingLevel[] {
+		return entry ? getSupportedThinkingLevels(entry.model) : [DEFAULT_EFFORT];
+	}
+
+	/**
+	 * `level` brought into the range the row supports. This is a *display and
+	 * commit* clamp, not a stored one: the desired level is remembered, so
+	 * stepping through a weaker model on the way back to a capable one does not
+	 * quietly cost you `max`.
+	 */
+	private effortFor(
+		entry: Entry | undefined,
+		level: ThinkingLevel = this.effort,
+	): ThinkingLevel {
+		return entry
+			? clampThinkingLevel(entry.model, level as ModelThinkingLevel)
+			: level;
+	}
+
+	/** Move the effort one supported level up or down for the highlighted row. */
+	private cycleEffort(delta: 1 | -1): void {
+		const row = this.filtered[this.selected];
+		const levels = this.levelsFor(row);
+		if (levels.length <= 1) return;
+		const index = levels.indexOf(this.effortFor(row));
+		const from = index >= 0 ? index : 0;
+		const next = levels[
+			Math.max(0, Math.min(levels.length - 1, from + delta))
+		];
+		if (next && next !== this.effort) this.effort = next;
+	}
+
 	private metrics() {
 		const rows = Math.max(1, this.tui.terminal?.rows ?? 30);
 		const compact = rows < 18;
-		// title + filter + digits hint + page footer + help lines
-		const fixed = compact ? 4 : 6;
+		// title + filter + digits hint + effort + page footer + help lines
+		const fixed = compact ? 5 : 7;
 		const pageSize = Math.max(1, Math.min(MAX_PAGE, rows - fixed));
 		return { rows, compact, pageSize };
 	}
@@ -226,14 +307,15 @@ export class ModelPicker implements Focusable {
 		this.busy = true;
 		this.error = undefined;
 		this.tui.requestRender();
+		const effort = this.effortFor(entry);
 		try {
-			const ok = await this.commit(entry.model);
+			const ok = await this.commit(entry.model, effort);
 			if (this.disposed) return;
 			if (!ok) {
 				this.error = `No API key for ${entry.provider}/${entry.id}`;
 				return;
 			}
-			if (persist) this.onPersist?.(entry.model);
+			if (persist) this.onPersist?.(entry.model, effort);
 			this.done(entry.model);
 		} catch (error) {
 			if (!this.disposed) {
@@ -285,6 +367,23 @@ export class ModelPicker implements Focusable {
 		if (this.onPersist && (this.kb.matches(data, "app.models.save") ||
 			matchesKey(data, "ctrl+s"))) {
 			void this.choose(this.filtered[this.selected], true);
+			return;
+		}
+		// Effort is part of the same choice, so it is set here rather than in a
+		// second dialog. Shift+Tab is `app.thinking.cycle`; the reverse has no
+		// binding of its own, so accept both modifier orders.
+		if (this.kb.matches(data, "app.thinking.cycle") ||
+			matchesKey(data, "shift+tab")) {
+			if (isKeyRepeat(data)) return;
+			this.cycleEffort(1);
+			this.tui.requestRender();
+			return;
+		}
+		if (matchesKey(data, "shift+ctrl+tab") ||
+			matchesKey(data, "ctrl+shift+tab")) {
+			if (isKeyRepeat(data)) return;
+			this.cycleEffort(-1);
+			this.tui.requestRender();
 			return;
 		}
 		if (this.kb.matches(data, "tui.select.up") ||
@@ -366,6 +465,18 @@ export class ModelPicker implements Focusable {
 			? "  Digits: text · Ctrl+N for shortcuts"
 			: "  Digits: select 1–9 · Ctrl+N for search"));
 
+		// Show the effort the highlighted row would take, so a model with a
+		// narrow level map advertises that before it is chosen.
+		const highlighted = this.filtered[this.selected];
+		const levels = this.levelsFor(highlighted);
+		const effort = this.effortFor(highlighted);
+		const effortHint = levels.length > 1
+			? "  ·  Shift+Tab cycle"
+			: "  ·  no reasoning";
+		lines.push(th.fg("muted", "  Effort: ") +
+			th.fg(levels.length > 1 ? "accent" : "dim", effort) +
+			th.fg("dim", effortHint));
+
 		for (let i = 0; i < pageSize; i++) {
 			const entry = shown[i];
 			if (!entry) {
@@ -396,8 +507,9 @@ export class ModelPicker implements Focusable {
 			lines.push(th.fg("dim",
 				"  ↑↓ ←→ PgUp PgDn navigate · Enter choose · Esc cancel"));
 			lines.push(th.fg("dim",
-				`  Tab scope · Ctrl+N digits select/search` +
-				(this.onPersist ? " · Ctrl+S set as default" : "")));
+				`  Tab scope · Shift+Tab effort` +
+				(this.onPersist ? " · Ctrl+S set as default" : "") +
+				" · Ctrl+N digits select/search"));
 		}
 
 		return lines.map((line) => truncateToWidth(line, Math.max(1, width)));

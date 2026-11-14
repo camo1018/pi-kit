@@ -5445,6 +5445,10 @@ export default function (pi: ExtensionAPI) {
 		if ((ctx.scopedModels ?? []).length === 0 &&
 			ctx.modelRegistry.getAvailable().length === 0) return current;
 		const reference = parseAgentModel(current);
+		// The picker returns only the model, so the effort it chose rides along
+		// through the commit callback (it starts on the window's level, or the
+		// one pinned for this model in enabledModels).
+		let chosen: { model: Model<Api>; effort: ThinkingLevel } | undefined;
 		const selected = await openModelPicker(ctx, {
 			current: reference && ctx.modelRegistry.find(
 				reference.provider,
@@ -5452,24 +5456,16 @@ export default function (pi: ExtensionAPI) {
 			),
 			// Drafts may legitimately run the window's current model.
 			allowCurrent: true,
-			commit: async () => true,
+			// Start on the level this draft already carries rather than whatever
+			// the window happens to be running.
+			effort: reference?.thinkingLevel ?? ctx.thinkingLevel,
+			commit: async (model, effort) => {
+				chosen = { model, effort };
+				return true;
+			},
 		});
-		if (!selected) return undefined;
-		// Keep the window's effort unless enabledModels pins one for this model,
-		// so `N` means "different model, same thinking" unless asked otherwise.
-		let level = (ctx.scopedModels ?? []).find(
-			(s: any) => s.model.provider === selected.provider &&
-				s.model.id === selected.id,
-		)?.thinkingLevel;
-		if (!level) {
-			level = ctx.thinkingLevel;
-			try {
-				level ??= pi.getThinkingLevel();
-			} catch {
-				// not available in this context
-			}
-		}
-		return `${selected.provider}/${selected.id}${level ? `:${level}` : ""}`;
+		if (!selected || !chosen) return undefined;
+		return `${selected.provider}/${selected.id}:${chosen.effort}`;
 	}
 
 	/** Confirm draft choices even when Pi suppresses model_select. */
@@ -5527,6 +5523,9 @@ export default function (pi: ExtensionAPI) {
 			// This kit's digit-select picker, not pi's stock component: the reply
 			// draft's model is chosen the same way it is anywhere else.
 			let selected: Model<Api> | undefined;
+			// The reply widget records the level too, so it must come from the
+			// dialog rather than whatever the transport happens to return.
+			let chosenEffort: ThinkingLevel | undefined;
 			const choices = registry.getAvailable();
 			if (search) {
 				const exact = choices.filter((m) =>
@@ -5541,12 +5540,19 @@ export default function (pi: ExtensionAPI) {
 					// Keeping the draft on the window's current model is valid.
 					allowCurrent: true,
 					initialQuery: search,
-					commit: async () => true,
-					onPersist: (model) =>
+					// Start on the level this reply draft is already using.
+					effort: reference?.thinkingLevel ?? ctx.thinkingLevel,
+					commit: async (model, effort) => {
+						chosenEffort = effort;
+						return true;
+					},
+					onPersist: (model, effort) => {
 						settings.setDefaultModelAndProvider(
 							model.provider,
 							model.id,
-						),
+						);
+						settings.setDefaultThinkingLevel(effort);
+					},
 				});
 			}
 			if (!selected || !active()) return;
@@ -5564,7 +5570,7 @@ export default function (pi: ExtensionAPI) {
 			// emits no event, but must still replace a different draft choice.
 			draft.model = withLevel(
 				`${selected.provider}/${selected.id}`,
-				p.getThinkingLevel(),
+				chosenEffort ?? p.getThinkingLevel(),
 			);
 			const live = (G.__piInboxAgentsCtx as ExtensionContext) ?? ctx;
 			showReplyWidget(live);

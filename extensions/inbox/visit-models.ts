@@ -171,15 +171,18 @@ export function handleVisitModelInput(
 			current: model,
 			allowCurrent: true,
 			initialQuery: search,
+			effort: currentLevel,
 			// The picker closes on any confirmed row; `apply` reports its own
 			// refusal (navigation changed under it) instead of the picker
 			// blaming the model.
-			commit: (next) => {
-				apply(next);
+			commit: (next, level) => {
+				apply(next, level);
 				return Promise.resolve(true);
 			},
-			onPersist: (next) =>
-				settings.setDefaultModelAndProvider(next.provider, next.id),
+			onPersist: (next, level) => {
+				settings.setDefaultModelAndProvider(next.provider, next.id);
+				settings.setDefaultThinkingLevel(level);
+			},
 		});
 	}
 }

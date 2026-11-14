@@ -7,6 +7,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Theme } from "@earendil-works/pi-coding-agent";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { getKeybindings, type TUI } from "@earendil-works/pi-tui";
 import type { Model } from "@earendil-works/pi-ai";
 import { ModelPicker } from "./picker.ts";
@@ -24,8 +25,22 @@ const theme = new Proxy({} as Theme, {
 	},
 });
 
-function model(provider: string, id: string): Model<any> {
-	return { provider, id, name: `${id} display` } as unknown as Model<any>;
+function model(
+	provider: string,
+	id: string,
+	options: { reasoning?: boolean; maxLevel?: boolean } = {},
+): Model<any> {
+	// `getSupportedThinkingLevels` hides xhigh/max unless the model's thinking
+	// level map names them, and returns just ["off"] for a non-reasoning model.
+	return {
+		provider,
+		id,
+		name: `${id} display`,
+		reasoning: options.reasoning ?? true,
+		...(options.maxLevel
+			? { thinkingLevelMap: { xhigh: "xhigh", max: "max" } }
+			: {}),
+	} as unknown as Model<any>;
 }
 
 const MODELS = [
@@ -43,7 +58,8 @@ function picker(options: {
 	pickerOptions?: {
 		allowCurrent?: boolean;
 		initialQuery?: string;
-		onPersist?: (m: Model<any>) => void;
+		effort?: ThinkingLevel;
+		onPersist?: (m: Model<any>, effort: ThinkingLevel) => void;
 	};
 } = {}) {
 	const scoped = (options.scoped ?? MODELS).map((m) => ({
@@ -53,6 +69,7 @@ function picker(options: {
 		model: m, provider: m.provider, id: m.id, name: m.name,
 	}));
 	const committed: Model<any>[] = [];
+	const efforts: ThinkingLevel[] = [];
 	let result: Model<any> | undefined | "waiting" = "waiting";
 	const ui = new ModelPicker(
 		{ terminal: { rows: options.rows ?? 30 }, requestRender() {} } as unknown as TUI,
@@ -62,13 +79,20 @@ function picker(options: {
 		scoped,
 		all,
 		options.current ?? MODELS[0],
-		async (m) => {
+		async (m, effort) => {
 			committed.push(m);
+			efforts.push(effort);
 			return options.commit ? options.commit(m) : true;
 		},
 		options.pickerOptions,
 	);
-	return { ui, result: () => result, committed, render: () => ui.render(120).join("\n") };
+	return {
+		ui,
+		result: () => result,
+		committed,
+		efforts,
+		render: () => ui.render(120).join("\n"),
+	};
 }
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -171,18 +195,97 @@ test("allowCurrent resolves with the current model", async () => {
 });
 
 test("Ctrl+S saves the choice as the startup default", async () => {
-	const persisted: Model<any>[] = [];
+	const persisted: [Model<any>, ThinkingLevel][] = [];
 	const f = picker({
 		current: MODELS[0],
-		pickerOptions: { allowCurrent: true, onPersist: (m) => persisted.push(m) },
+		pickerOptions: {
+			allowCurrent: true,
+			onPersist: (m, effort) => persisted.push([m, effort]),
+		},
 	});
 	assert.match(f.render(), /Ctrl\+S set as default/);
 	f.ui.handleInput("\x1b[B"); // down to row 2
 	f.ui.handleInput("\x1b[B"); // down to row 3
 	f.ui.handleInput("\x13"); // ctrl+s
 	await tick();
-	assert.deepEqual(persisted, [MODELS[2]]);
+	assert.deepEqual(persisted, [[MODELS[2], "medium"]]);
 	assert.equal(f.result(), MODELS[2]);
+});
+
+test("the effort is committed together with the model", async () => {
+	const f = picker({ pickerOptions: { effort: "high" } });
+	assert.match(f.render(), /Effort: high/);
+	f.ui.handleInput("2");
+	await tick();
+	assert.deepEqual(f.committed, [MODELS[1]]);
+	assert.deepEqual(f.efforts, ["high"]);
+});
+
+test("Shift+Tab cycles effort up and stays put at the top", () => {
+	const f = picker({ pickerOptions: { effort: "low" } });
+	// getKeybindings() carries pi's default shift+tab for app.thinking.cycle.
+	f.ui.handleInput("\x1b[Z");
+	assert.match(f.render(), /Effort: medium/);
+	f.ui.handleInput("\x1b[Z");
+	assert.match(f.render(), /Effort: high/);
+	// `max` is only advertised when the model's map names it.
+	f.ui.handleInput("\x1b[Z");
+	assert.match(f.render(), /Effort: high/);
+});
+
+test("moving onto a model without reasoning drops the effort to off", () => {
+	const plain = model("example-provider", "plain", { reasoning: false });
+	const f = picker({
+		scoped: [model("example-provider", "thinker"), plain],
+		pickerOptions: { effort: "high" },
+	});
+	assert.match(f.render(), /Effort: high/);
+	f.ui.handleInput("\x1b[B"); // down onto the non-reasoning row
+	assert.match(f.render(), /Effort: off {2}· {2}no reasoning/);
+	// A level it cannot do must not be what gets committed.
+	f.ui.handleInput("\r");
+	return tick().then(() => assert.deepEqual(f.efforts, ["off"]));
+});
+
+test("stepping through a weaker model does not cost the chosen level", () => {
+	const plain = model("example-provider", "plain", { reasoning: false });
+	const thinker = model("example-provider", "thinker");
+	const f = picker({
+		scoped: [thinker, plain, model("example-provider", "other")],
+		pickerOptions: { effort: "high" },
+	});
+	f.ui.handleInput("\x1b[B"); // onto the non-reasoning row
+	assert.match(f.render(), /Effort: off/);
+	f.ui.handleInput("\x1b[A"); // back up to the capable row
+	// The clamp is for display and commit only; "high" was never forgotten.
+	assert.match(f.render(), /Effort: high/);
+});
+
+test("an unsupported level is clamped to the model's own range", async () => {
+	const f = picker({
+		scoped: [model("example-provider", "basic")],
+		pickerOptions: { effort: "max" },
+	});
+	// `max` needs an explicit mapping, so a plain reasoning model tops out at
+	// `high` — the picker shows that rather than an impossible level.
+	assert.match(f.render(), /Effort: high/);
+	f.ui.handleInput("1");
+	await tick();
+	assert.deepEqual(f.efforts, ["high"]);
+});
+
+test("a model whose map names max can actually reach it", () => {
+	const f = picker({
+		scoped: [model("example-provider", "deep", { maxLevel: true })],
+		pickerOptions: { effort: "high" },
+	});
+	f.ui.handleInput("\x1b[Z"); // high -> xhigh
+	assert.match(f.render(), /Effort: xhigh/);
+	f.ui.handleInput("\x1b[Z"); // xhigh -> max
+	assert.match(f.render(), /Effort: max/);
+	// Already at the top: cycling wraps nowhere.
+	f.ui.handleInput("\x1b[Z");
+	assert.match(f.render(), /Effort: max/);
 });
 
 test("a prefilled search filters before the rows are picked", async () => {

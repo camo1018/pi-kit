@@ -18,8 +18,31 @@ stock selector as an escape hatch.
 | `enter` | Choose the highlighted model |
 | `tab` | Toggle `scoped` ⇄ `all` (same as the built-in selector) |
 | `ctrl+n` | Toggle digits between **select** and **search text** |
-| `ctrl+s` | Choose and save as the startup default (when the caller allows it) |
+| `ctrl+s` | Choose and save as the startup default (model *and* effort, when the caller allows it) |
+| `shift+tab` | Cycle the reasoning effort up (`app.thinking.cycle`) |
+| `shift+ctrl+tab` | Cycle the effort back down |
 | `esc`, `ctrl+c` | Cancel |
+
+## Effort travels with the model
+
+The picker sets the thinking level in the same dialog, because choosing a model
+in pi otherwise silently re-derives the level from settings. The `Effort:` line
+follows the highlighted row: it is clamped to that model's
+`getSupportedThinkingLevels()`, so
+
+- a model that cannot reason shows `off · no reasoning` and commits `off`,
+  rather than claiming a level it will quietly downgrade;
+- a model whose `thinkingLevelMap` does not name `xhigh`/`max` tops out lower
+  and the line says so;
+- `shift+tab` steps one *supported* level at a time, so the key never appears to
+  do nothing on a model with gaps in its map.
+
+The level starts from, in order: an explicit `effort` option, the level pinned
+for that model in `enabledModels` (`provider/model:high`), then the level this
+session is already running. Whatever is showing when you confirm is what gets
+applied — `pi.setModel()` first, then `pi.setThinkingLevel()`, since `setModel`
+rewrites the level itself. `ctrl+s` persists both with
+`setDefaultModelAndProvider()` and `setDefaultThinkingLevel()`.
 
 ## Row order is stable
 
@@ -82,9 +105,11 @@ node --experimental-strip-types --test extensions/model-picker/picker.test.ts
 | `CustomEditor` dispatching app keys via its `actionHandlers` map | `custom-editor-action-handlers` | telling an interactive editor apart from a picker that also handles `ctrl+l` | the shape changes; the divert either never fires or fires on the wrong editor |
 | `CustomEditor.prototype.onAction` | `editor-on-action` | interactive mode registering `app.model.select`, which is what the guard looks for | registration moves elsewhere; every editor then looks unwired and the divert never fires |
 | `ctx.ui.custom()` / overlay | `custom-ui-overlay` | opening the picker | the API is removed; the picker cannot open |
-| `ctx.scopedModels` | `scoped-models-context` | the `scoped` scope | it stops being an array; the picker cannot tell scoped from all |
+| `ctx.scopedModels` | `scoped-models-context` | the `scoped` scope, and the effort pinned per model | it stops being an array; the picker cannot tell scoped from all |
 | `ctx.modelRegistry.getAvailable()` | `model-registry-available` | the `all` scope | it is removed; only scoped models would be listable |
 | `pi.setModel()` | `set-model-api` | applying a choice | it is removed; choosing becomes a no-op |
+| `pi.setThinkingLevel()` | `set-thinking-level-api` | applying the effort with the model | it is removed; the effort choice is dropped, the model still switches |
+| `getSupportedThinkingLevels()` / `clampThinkingLevel()` | `thinking-levels-api` | the `Effort:` line and its clamping | either is removed; the picker cannot tell which levels a model supports |
 | `SettingsManager.prototype.setDefaultModelAndProvider` | `settings-manager-default` | `ctrl+s` saving the startup default | it is renamed or removed; `ctrl+s` stops saving (the pick itself still applies) |
 | The extension's own patch | `patch-installed` | confirming hooks actually installed | the extension loads but its patch silently did not run |
 
