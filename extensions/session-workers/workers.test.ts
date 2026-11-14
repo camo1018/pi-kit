@@ -442,3 +442,105 @@ test("a stale stamp cannot hide a new team from the index", async (t) => {
 		"an index whose records do not match its file list must be rebuilt",
 	);
 });
+
+test("a live idle record does not settle a worker whose run is still starting", async (t) => {
+	// The real spawn sequence has a ~1.2s window that no fixture modelled:
+	//   +175ms  child creates its session file
+	//  +1200ms  session_start writes inbox-live/<pid>.json with state "idle"
+	//           (extensions/inbox/index.ts: writeLive(ctx, "idle"))
+	//  +2450ms  agent_start rewrites it as "working"
+	// Between those two writes the live record exists and says "idle" while the
+	// durable record still says the run is coming. `foregroundDisposition`
+	// gated its durable check on `!live`, so it skipped the check exactly when
+	// the live record was present-and-idle and reported "settled".
+	//
+	// Measured from two incidents: the wake fired +1,260ms and +1,628ms after
+	// spawn, while agent_start landed at +2,445ms and +2,456ms.
+	const s = setup(t);
+	const worker = await s.spawn();
+	// This process does not hold the worker: the sweep that woke the parent was
+	// a different one, which is why the registry path could not answer.
+	s.agents.delete(worker.id);
+	// Durable record: the background runner still owes a run.
+	const savedFile = join(s.dir, "inbox-agents", `${worker.id}.json`);
+	fs.mkdirSync(join(s.dir, "inbox-agents"), { recursive: true });
+	fs.writeFileSync(savedFile, JSON.stringify({ state: "working", pid: 123 }));
+	// Live record from session_start, before agent_start: present, and "idle".
+	const live = join(s.dir, "inbox-live");
+	fs.mkdirSync(live, { recursive: true });
+	const liveFile = join(live, `${process.ppid}.json`);
+	fs.writeFileSync(
+		liveFile,
+		JSON.stringify({
+			sessionId: worker.id,
+			pid: process.ppid,
+			state: "idle",
+			updated: Date.now(),
+		}),
+	);
+	assert.equal(
+		s.team.foregroundDisposition(worker.id),
+		"unknown",
+		"session_start's idle record must not settle a run agent_start has not begun",
+	);
+
+	// The same shape for "queued": spawnAgent's state before run_start.
+	fs.writeFileSync(savedFile, JSON.stringify({ state: "queued" }));
+	assert.equal(
+		s.team.foregroundDisposition(worker.id),
+		"unknown",
+		"a queued durable record outranks a between-turns idle live record",
+	);
+
+	// Once agent_start lands, the live record is decisive again.
+	fs.writeFileSync(
+		liveFile,
+		JSON.stringify({
+			sessionId: worker.id,
+			pid: process.ppid,
+			state: "working",
+			updated: Date.now(),
+		}),
+	);
+	assert.equal(
+		s.team.foregroundDisposition(worker.id),
+		"running",
+		"a live working claim is always running",
+	);
+
+	// And with no durable run owed, an idle live record does settle.
+	fs.writeFileSync(
+		liveFile,
+		JSON.stringify({
+			sessionId: worker.id,
+			pid: process.ppid,
+			state: "idle",
+			updated: Date.now(),
+		}),
+	);
+	fs.writeFileSync(savedFile, JSON.stringify({ state: "idle", pending: [] }));
+	assert.equal(
+		s.team.foregroundDisposition(worker.id),
+		"settled",
+		"a genuinely finished worker still settles",
+	);
+});
+
+test("a trace row's writer pid cannot be clobbered by the caller's fields", () => {
+	// `trace()` used to spread `fields` AFTER stamping `pid: process.pid`, so a
+	// caller passing a `pid` field replaced the writer's identity. `deliverWake`
+	// did exactly that with `pid: held?.pid`, which is how one process's rows
+	// were read as another's and two consecutive rows in the same millisecond
+	// looked like two evaluators disagreeing. A trace whose writer is ambiguous
+	// is worse than no trace.
+	const writerPid = process.pid as number;
+	const fields = { parentId: "p1", owns: true, busy: false, heldPid: 23634 };
+	// Same construction order as trace.ts: fields first, writer-stamped keys last.
+	const row = { ...fields, pid: writerPid, at: "t", event: "wake_deliver_eval" };
+	assert.equal(row.pid, writerPid, "the writer's pid must survive");
+	assert.equal(
+		row.heldPid,
+		23634,
+		"the registry's pid is kept under its own key",
+	);
+});

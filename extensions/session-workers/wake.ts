@@ -459,6 +459,24 @@ function sweepTeams(team: WorkerTeam, callerId: string): boolean {
 			// episode named nobody, report nobody rather than inventing a count.
 			const recorded = new Set(arm.episodeWorkers ?? []);
 			const episodeAgents = agents.filter(({ id }) => recorded.has(id));
+			// Record the settle DECISION, not just the delivery. `wake_deliver_eval`
+			// only fires inside deliverWake, so an early settle was invisible in the
+			// trace: the request existed and was later deferred, which reads as
+			// correct behaviour from the delivery side alone. This row carries the
+			// tri-state per worker and the instant the episode closed, which is what
+			// distinguishes "settled because the work finished" from "settled
+			// because an evaluator could not see the work".
+			trace("wake_settle", {
+				parentId,
+				episode: arm.episode,
+				workers: episodeAgents.map(({ id, agent, disposition }) => ({
+					id,
+					inRegistry: !!agent,
+					disposition: agent
+						? quiescence(agent)
+						: (disposition ?? "unknown"),
+				})),
+			});
 			if (!readWakeRequest(team.stateDir, parentId)) {
 				writeWakeRequest(team.stateDir, {
 					parentId,
@@ -684,7 +702,10 @@ function deliverWake(
 		owns,
 		busy,
 		inRegistry: !!held,
-		pid: held?.pid,
+		// NOT `pid`: that key is reserved for the process that WRITES the trace row,
+		// which trace() stamps last so a caller cannot overwrite it. Naming this
+		// `heldPid` keeps both facts: who evaluated, and which pid the registry held.
+		heldPid: held?.pid,
 		nonce: request.nonce,
 	});
 	if (owns && busy) {

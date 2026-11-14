@@ -57,10 +57,16 @@ export function trace(
 		fs.appendFileSync(
 			file,
 			`${JSON.stringify({
-				at: new Date().toISOString(),
-				pid: process.pid,
-				event,
 				...fields,
+				// Written LAST, deliberately. Spreading fields after `pid` let a
+				// caller's `pid` field silently REPLACE the writer's, which is how
+				// one process's rows were attributed to another and why consecutive
+				// rows in the same millisecond appeared to come from different
+				// processes. A trace whose writer is ambiguous is worse than no
+				// trace: it invites confident wrong conclusions.
+				pid: process.pid,
+				at: new Date().toISOString(),
+				event,
 			})}\n`,
 			"utf-8",
 		);

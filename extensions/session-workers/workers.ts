@@ -923,6 +923,21 @@ export class WorkerTeam {
 	 * the durable write and the child's first live record woke its parent about
 	 * two seconds after spawn, while the work had barely begun. Any state that
 	 * precedes a run must be treated the same way `"working"` is.
+	 *
+	 * The live record does NOT outrank the durable one for this question, and
+	 * gating the durable check on `!live` was the second half of the same bug.
+	 * A spawned child writes `inbox-live/<pid>.json` with `state: "idle"` on
+	 * `session_start` (extensions/inbox/index.ts) and only rewrites it to
+	 * `"working"` at `agent_start` -- a real gap of ~1.2s while extensions and
+	 * MCP servers load. During that gap `live` exists and says `"idle"`, so the
+	 * `!live` branch was skipped and a `"working"` durable record was ignored.
+	 * Measured from two incidents: the wake landed +1,260ms and +1,628ms after
+	 * spawn, while `agent_start` came at +2,445ms and +2,456ms.
+	 *
+	 * So a live `"working"` is decisive, but a live `"idle"` is only decisive
+	 * when nothing more authoritative says a run is still coming or in flight.
+	 * `"unknown"` is the withheld verdict: it keeps an episode open rather than
+	 * settling it, so the next sweep re-checks instead of waking the parent.
 	 */
 	foregroundDisposition(id: string): "running" | "settled" | "unknown" {
 		let live: { state: "working" | "idle"; pid: number } | undefined;
@@ -931,12 +946,12 @@ export class WorkerTeam {
 		} catch {
 			return "unknown";
 		}
-		if (!live) {
-			// Only the durable record can speak for a worker with no live one.
-			if (isPreRunState(this.saved(id)?.state)) return "unknown";
-			return "settled";
-		}
-		return live.state === "working" ? "running" : "settled";
+		// A live claim to be working outranks everything: someone is mid-run.
+		if (live?.state === "working") return "running";
+		// A durable pre-run state means the background runner still owes a run,
+		// whatever a between-turns live record happens to say.
+		if (isPreRunState(this.saved(id)?.state)) return "unknown";
+		return "settled";
 	}
 
 	private controllable(caller: string, id: string): Worker {
