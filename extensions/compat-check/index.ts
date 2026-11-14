@@ -28,6 +28,12 @@ interface Probe {
 	/** Extension directory under extensions/ (README lives there). */
 	ext: string;
 	id: string;
+	/**
+	 * Only meaningful in the interactive TUI. A probe whose patch installs
+	 * exclusively under `ctx.mode === "tui"` reports a false failure in rpc /
+	 * json / print runs, where nothing was expected to be patched.
+	 */
+	tuiOnly?: boolean;
 	/** Returns true when OK, or a string describing what's wrong. */
 	check: (ctx: Ctx, pi: ExtensionAPI) => true | string;
 }
@@ -347,6 +353,7 @@ const PROBES: Probe[] = [
 	{
 		ext: "inbox",
 		id: "footer-patch-installed",
+		tuiOnly: true,
 		check: () =>
 			need(
 				(globalThis as any)[
@@ -520,8 +527,10 @@ interface Result {
 	probe: Probe;
 	ok: boolean;
 	detail?: string;
-	/** Probe skipped: its extension is not loaded (selective install). */
+	/** Probe skipped: it could not be meaningful here. */
 	skipped?: boolean;
+	/** Why it was skipped, shown in the /compat report. */
+	skipReason?: "not-loaded" | "not-tui";
 }
 
 function runProbes(ctx: Ctx, pi: ExtensionAPI): Result[] {
@@ -531,7 +540,13 @@ function runProbes(ctx: Ctx, pi: ExtensionAPI): Result[] {
 	return PROBES.map((probe) => {
 		// Extensions excluded by a selective install (install.sh --extensions,
 		// pi config) are not loaded and cannot be broken; skip their probes.
-		if (!loaded.has(probe.ext)) return { probe, ok: true, skipped: true };
+		if (!loaded.has(probe.ext)) {
+			return { probe, ok: true, skipped: true, skipReason: "not-loaded" };
+		}
+		// An interactive-only patch cannot have run in rpc/json/print mode.
+		if (probe.tuiOnly && ctx.mode !== "tui") {
+			return { probe, ok: true, skipped: true, skipReason: "not-tui" };
+		}
 		try {
 			const r = probe.check(ctx, pi);
 			return r === true ? { probe, ok: true } : { probe, ok: false, detail: r };
@@ -567,12 +582,19 @@ function report(results: Result[], all: boolean): string {
 		const bad = rs.filter((r) => !r.ok);
 		if (!all && !bad.length) continue;
 		if (all && rs.every((r) => r.skipped)) {
-			lines.push(`· ${ext}  (not loaded — selective install; probes skipped)`);
+			const reason = rs[0]?.skipReason === "not-tui"
+				? "interactive-only probes; not applicable in this mode"
+				: "not loaded — selective install; probes skipped";
+			lines.push(`· ${ext}  (${reason})`);
 			continue;
 		}
 		lines.push(`${bad.length ? "✗" : "✓"} ${ext}${bad.length ? `  → ${path.join(EXT_DIR, ext, "README.md")}` : ""}`);
 		for (const r of all ? rs : bad)
-			lines.push(`    ${r.skipped ? "·" : r.ok ? "✓" : "✗"} ${r.probe.id}${r.detail ? `: ${r.detail}` : ""}`);
+			lines.push(
+				`    ${r.skipped ? "·" : r.ok ? "✓" : "✗"} ${r.probe.id}` +
+					`${r.skipReason === "not-tui" ? " (interactive only)" : ""}` +
+					`${r.detail ? `: ${r.detail}` : ""}`,
+			);
 	}
 	return lines.join("\n");
 }
