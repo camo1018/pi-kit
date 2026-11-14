@@ -265,6 +265,74 @@ const PROBES: Probe[] = [
 			),
 	},
 
+	// ── model-picker ──────────────────────────────
+	{
+		ext: "model-picker",
+		id: "custom-editor-handle-input",
+		check: () =>
+			need(
+				hasMethod(A.CustomEditor, "handleInput"),
+				"CustomEditor.handleInput is missing (ctrl+l falls back to the stock selector)",
+			),
+	},
+	{
+		ext: "model-picker",
+		id: "custom-editor-action-handlers",
+		check: () =>
+			need(
+				classSource(A.CustomEditor).includes("actionHandlers"),
+				"CustomEditor no longer dispatches via actionHandlers (the ctrl+l divert cannot find its editor)",
+			),
+	},
+	{
+		ext: "model-picker",
+		id: "editor-on-action",
+		check: () =>
+			need(
+				typeof A.CustomEditor?.prototype?.onAction === "function",
+				"CustomEditor.prototype.onAction is gone (interactive mode cannot register app.model.select, so every editor looks unwired)",
+			),
+	},
+	{
+		ext: "model-picker",
+		id: "scoped-models-context",
+		check: (c) =>
+			need(
+				!c.hasUI || Array.isArray(c.scopedModels),
+				"ctx.scopedModels is no longer an array (the picker cannot tell scoped from all)",
+			),
+	},
+	{
+		ext: "model-picker",
+		id: "model-registry-available",
+		check: (c) =>
+			need(
+				typeof c.modelRegistry?.getAvailable === "function",
+				"ctx.modelRegistry.getAvailable() is gone (the all scope cannot list models)",
+			),
+	},
+	{
+		ext: "model-picker",
+		id: "custom-ui-overlay",
+		check: (c) =>
+			need(!c.hasUI || typeof c.ui.custom === "function", "ctx.ui.custom is gone (the picker cannot open)"),
+	},
+	{
+		ext: "model-picker",
+		id: "set-model-api",
+		check: (_c, pi) =>
+			need(typeof pi.setModel === "function", "pi.setModel is gone (choosing a model would be a no-op)"),
+	},
+	{
+		ext: "model-picker",
+		id: "patch-installed",
+		check: () =>
+			need(
+				(globalThis as any)[Symbol.for("pi.ext.model-picker")]?.patched === true,
+				"extension loaded but its prototype patch was not installed",
+			),
+	},
+
 	// ── inbox ────────────────────────────────────────────────────────
 	{
 		ext: "inbox",

@@ -59,3 +59,22 @@ untouched. The behavior is pinned by a test against a real `CustomEditor`.
 ```sh
 node --experimental-strip-types --test extensions/model-picker/picker.test.ts
 ```
+
+## Internal dependencies (brittleness matrix)
+
+`compat-check` probes these ids; a failure names the probe and points here.
+
+| Dependency | Probe id | Used for | Breaks if |
+| --- | --- | --- | --- |
+| `CustomEditor.prototype.handleInput` | `custom-editor-handle-input` | diverting `ctrl+l` to this picker | the method is renamed or removed; `ctrl+l` silently reverts to the stock selector (harmless, just loses digits) |
+| `CustomEditor` dispatching app keys via its `actionHandlers` map | `custom-editor-action-handlers` | telling an interactive editor apart from a picker that also handles `ctrl+l` | the shape changes; the divert either never fires or fires on the wrong editor |
+| `CustomEditor.prototype.onAction` | `editor-on-action` | interactive mode registering `app.model.select`, which is what the guard looks for | registration moves elsewhere; every editor then looks unwired and the divert never fires |
+| `ctx.ui.custom()` / overlay | `custom-ui-overlay` | opening the picker | the API is removed; the picker cannot open |
+| `ctx.scopedModels` | `scoped-models-context` | the `scoped` scope | it stops being an array; the picker cannot tell scoped from all |
+| `ctx.modelRegistry.getAvailable()` | `model-registry-available` | the `all` scope | it is removed; only scoped models would be listable |
+| `pi.setModel()` | `set-model-api` | applying a choice | it is removed; choosing becomes a no-op |
+| The extension's own patch | `patch-installed` | confirming hooks actually installed | the extension loads but its patch silently did not run |
+
+The `actionHandlers` shape is also probed for `tool-output-hide` and
+`thinking-block-hide`, which wrap the same method, so a change there fails all
+three at once rather than one.
