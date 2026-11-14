@@ -34,18 +34,18 @@ test("shortenDir keeps the last segments", () => {
 test("group leads, session name follows, dir and branch go right", () => {
 	const line = composeFooterLine(
 		{
-			group: "GSI Data Platform",
-			name: "EC Feedback Follow-up PRs",
-			dir: "~/Code/worktrees/tas-tools-ui/notes-hide-machine/tickets",
-			branch: "ppark/feat/notes-hide-machine",
+			group: "Payments Platform",
+			name: "Settlement Retry Follow-up PRs",
+			dir: "~/Code/worktrees/example-service/retry-worker/tickets",
+			branch: "alex/feat/retry-worker",
 		},
 		200,
 		plain,
 	);
 	assert.ok(line);
-	assert.ok(line.startsWith("GSI Data Platform • EC Feedback Follow-up PRs"));
-	assert.ok(line.endsWith("(ppark/feat/notes-hide-machine)"));
-	assert.ok(line.includes("…/notes-hide-machine/tickets"));
+	assert.ok(line.startsWith("Payments Platform • Settlement Retry Follow-up PRs"));
+	assert.ok(line.endsWith("(alex/feat/retry-worker)"));
+	assert.ok(line.includes("…/retry-worker/tickets"));
 	assert.equal(visibleWidth(line!), 200);
 });
 
@@ -53,7 +53,7 @@ test("narrow widths drop the branch, then the directory, never the group", () =>
 	const parts = {
 		group: "G",
 		name: "Title",
-		dir: "~/Code/worktrees/tas-tools-ui/notes-hide-machine/tickets",
+		dir: "~/Code/worktrees/example-service/retry-worker/tickets",
 		branch: "branch-name",
 	};
 	let sawBranch = false;

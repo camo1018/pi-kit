@@ -249,7 +249,7 @@ The footer's first line leads with the session's group, then its name, while
 the directory and git branch move to the right-hand side of the window:
 
 ```text
-GSI Data Platform • EC Feedback Follow-up PRs      ~/…/notes-hide-machine/tickets (ppark/feat/notes-hide-machine)
+Payments Platform • Settlement Retry Follow-up PRs                    …/retry-worker/tickets (alex/feat/retry-worker)
 ```
 
 Ungrouped sessions drop the group and lead with the name. Paths are
