@@ -221,16 +221,32 @@ test("the effort is committed together with the model", async () => {
 	assert.deepEqual(f.efforts, ["high"]);
 });
 
-test("Shift+Tab cycles effort up and stays put at the top", () => {
+test("Shift+Tab cycles effort and wraps back around to off", () => {
 	const f = picker({ pickerOptions: { effort: "low" } });
 	// getKeybindings() carries pi's default shift+tab for app.thinking.cycle.
 	f.ui.handleInput("\x1b[Z");
 	assert.match(f.render(), /Effort: medium/);
 	f.ui.handleInput("\x1b[Z");
 	assert.match(f.render(), /Effort: high/);
-	// `max` is only advertised when the model's map names it.
+	// `max` is only advertised when the model's map names it, so `high` is the
+	// top of this model's range and one more press wraps to the bottom.
 	f.ui.handleInput("\x1b[Z");
-	assert.match(f.render(), /Effort: high/);
+	assert.match(f.render(), /Effort: off/);
+	f.ui.handleInput("\x1b[Z");
+	assert.match(f.render(), /Effort: minimal/);
+});
+
+test("Shift+Tab is a no-op on a model with only one level", () => {
+	const f = picker({
+		scoped: [model("example-provider", "nothink", { reasoning: false })],
+		pickerOptions: { effort: "high" },
+	});
+	assert.match(f.render(), /Effort: off {2}· {2}no reasoning/);
+	f.ui.handleInput("\x1b[Z");
+	f.ui.handleInput("\x1b[Z");
+	// With a single supported level a wrap would be the same level anyway, so
+	// the key must simply do nothing rather than invent a level.
+	assert.match(f.render(), /Effort: off {2}· {2}no reasoning/);
 });
 
 test("moving onto a model without reasoning drops the effort to off", () => {
@@ -274,7 +290,7 @@ test("an unsupported level is clamped to the model's own range", async () => {
 	assert.deepEqual(f.efforts, ["high"]);
 });
 
-test("a model whose map names max can actually reach it", () => {
+test("a model whose map names max can actually reach it, then wraps", () => {
 	const f = picker({
 		scoped: [model("example-provider", "deep", { maxLevel: true })],
 		pickerOptions: { effort: "high" },
@@ -283,9 +299,9 @@ test("a model whose map names max can actually reach it", () => {
 	assert.match(f.render(), /Effort: xhigh/);
 	f.ui.handleInput("\x1b[Z"); // xhigh -> max
 	assert.match(f.render(), /Effort: max/);
-	// Already at the top: cycling wraps nowhere.
-	f.ui.handleInput("\x1b[Z");
-	assert.match(f.render(), /Effort: max/);
+	// Shift+Tab is the only effort key, so it must wrap instead of dead-ending.
+	f.ui.handleInput("\x1b[Z"); // max -> off
+	assert.match(f.render(), /Effort: off/);
 });
 
 test("a prefilled search filters before the rows are picked", async () => {

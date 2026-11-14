@@ -7,8 +7,7 @@
  *
  *   ↑ ↓ / ← → / PgUp PgDn   navigate (left/right = page)
  *   1–9                     select the row with that number
- *   shift+tab               cycle the reasoning effort up
- *   shift+ctrl+tab          cycle the effort back down
+ *   shift+tab               cycle the reasoning effort (wraps around)
  *   ctrl+n                  toggle digits between select and search text
  *   enter                   choose
  *   esc / ctrl+c            cancel

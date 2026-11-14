@@ -19,8 +19,7 @@ stock selector as an escape hatch.
 | `tab` | Toggle `scoped` ⇄ `all` (same as the built-in selector) |
 | `ctrl+n` | Toggle digits between **select** and **search text** |
 | `ctrl+s` | Choose and save as the startup default (model *and* effort, when the caller allows it) |
-| `shift+tab` | Cycle the reasoning effort up (`app.thinking.cycle`) |
-| `shift+ctrl+tab` | Cycle the effort back down |
+| `shift+tab` | Cycle the reasoning effort (`app.thinking.cycle`); wraps around |
 | `esc`, `ctrl+c` | Cancel |
 
 ## Effort travels with the model
@@ -34,8 +33,10 @@ follows the highlighted row: it is clamped to that model's
   rather than claiming a level it will quietly downgrade;
 - a model whose `thinkingLevelMap` does not name `xhigh`/`max` tops out lower
   and the line says so;
-- `shift+tab` steps one *supported* level at a time, so the key never appears to
-  do nothing on a model with gaps in its map.
+- `shift+tab` steps one *supported* level at a time and **wraps** at both ends,
+  so this one key reaches every level. There is deliberately no reverse binding:
+  pi has no keybinding id for "cycle backwards", so an invented chord would
+  collide with terminal shortcuts. Stepping past the top lands on `off`.
 
 The level starts from, in order: an explicit `effort` option, the level pinned
 for that model in `enabledModels` (`provider/model:high`), then the level this

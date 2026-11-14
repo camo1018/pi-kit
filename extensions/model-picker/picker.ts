@@ -248,17 +248,19 @@ export class ModelPicker implements Focusable {
 			: level;
 	}
 
-	/** Move the effort one supported level up or down for the highlighted row. */
-	private cycleEffort(delta: 1 | -1): void {
+	/**
+	 * Step one supported level for the highlighted row, wrapping at both ends so
+	 * `shift+tab` alone can reach every level. Uses the row's clamped level, so a
+	 * model with gaps in its map still advances to the next level it can do.
+	 */
+	private cycleEffort(): void {
 		const row = this.filtered[this.selected];
 		const levels = this.levelsFor(row);
 		if (levels.length <= 1) return;
 		const index = levels.indexOf(this.effortFor(row));
 		const from = index >= 0 ? index : 0;
-		const next = levels[
-			Math.max(0, Math.min(levels.length - 1, from + delta))
-		];
-		if (next && next !== this.effort) this.effort = next;
+		const next = levels[(from + 1) % levels.length];
+		if (next !== undefined) this.effort = next;
 	}
 
 	private metrics() {
@@ -370,19 +372,13 @@ export class ModelPicker implements Focusable {
 			return;
 		}
 		// Effort is part of the same choice, so it is set here rather than in a
-		// second dialog. Shift+Tab is `app.thinking.cycle`; the reverse has no
-		// binding of its own, so accept both modifier orders.
+		// second dialog. Shift+Tab (`app.thinking.cycle`) is the only effort key
+		// and it wraps, so every supported level is reachable without inventing a
+		// reverse binding that no pi keybinding id backs.
 		if (this.kb.matches(data, "app.thinking.cycle") ||
 			matchesKey(data, "shift+tab")) {
 			if (isKeyRepeat(data)) return;
-			this.cycleEffort(1);
-			this.tui.requestRender();
-			return;
-		}
-		if (matchesKey(data, "shift+ctrl+tab") ||
-			matchesKey(data, "ctrl+shift+tab")) {
-			if (isKeyRepeat(data)) return;
-			this.cycleEffort(-1);
+			this.cycleEffort();
 			this.tui.requestRender();
 			return;
 		}
