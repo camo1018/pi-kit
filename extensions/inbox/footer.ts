@@ -6,7 +6,7 @@
  * the session's group comes first, then the session name, while the directory
  * and git branch move to the right-hand side of the window:
  *
- *   GSI Data Platform • EC Feedback Follow-up PRs      ~/…/tickets (feat/x)
+ *   Payments Platform • Settlement Retry Follow-up PRs      ~/…/tickets (feat/x)
  *
  * How it works (pi has no public hook for the footer's content, so this patches
  * the bundled FooterComponent's prototype — the same instance interactive mode
