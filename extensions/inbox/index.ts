@@ -120,6 +120,7 @@ import {
 import { staleAgainstDisk } from "../../lib/session-stale.ts";
 import { writeClone as writeCloneFile } from "../../lib/session-clone.ts";
 import { handleVisitModelInput } from "./visit-models.ts";
+import { openModelPicker } from "../model-picker/picker.ts";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
@@ -136,7 +137,6 @@ import {
 	getAgentDir,
 	getMarkdownTheme,
 	getSelectListTheme,
-	ModelSelectorComponent,
 	parseSkillBlock,
 	SessionManager,
 	SettingsManager,
@@ -5436,19 +5436,40 @@ export default function (pi: ExtensionAPI) {
 		return `${ctx.model.provider}/${ctx.model.id}${level ? `:${level}` : ""}`;
 	}
 
+	/**
+	 * Pick the model a new background agent runs on. Uses this kit's
+	 * digit-select picker (not `ctx.ui.select`) so `N` behaves like `ctrl+l`.
+	 * The choice is only a draft value: the session model is left alone.
+	 */
 	async function pickModel(ctx: ExtensionContext, current: string | undefined): Promise<string | undefined> {
-		const fmt = (provider: string, id: string, level?: string) => `${provider}/${id}${level ? `:${level}` : ""}`;
-		let options = (ctx.scopedModels ?? []).map((s: any) => fmt(s.model.provider, s.model.id, s.thinkingLevel));
-		if (options.length === 0) {
+		if ((ctx.scopedModels ?? []).length === 0 &&
+			ctx.modelRegistry.getAvailable().length === 0) return current;
+		const reference = parseAgentModel(current);
+		const selected = await openModelPicker(ctx, {
+			current: reference && ctx.modelRegistry.find(
+				reference.provider,
+				reference.id,
+			),
+			// Drafts may legitimately run the window's current model.
+			allowCurrent: true,
+			commit: async () => true,
+		});
+		if (!selected) return undefined;
+		// Keep the window's effort unless enabledModels pins one for this model,
+		// so `N` means "different model, same thinking" unless asked otherwise.
+		let level = (ctx.scopedModels ?? []).find(
+			(s: any) => s.model.provider === selected.provider &&
+				s.model.id === selected.id,
+		)?.thinkingLevel;
+		if (!level) {
+			level = ctx.thinkingLevel;
 			try {
-				options = ctx.modelRegistry.getAvailable().map((m: any) => fmt(m.provider, m.id));
+				level ??= pi.getThinkingLevel();
 			} catch {
-				options = [];
+				// not available in this context
 			}
 		}
-		if (current) options = [current, ...options.filter((o) => o !== current)];
-		if (options.length === 0) return current;
-		return ctx.ui.select("Model for the new background agent", options);
+		return `${selected.provider}/${selected.id}${level ? `:${level}` : ""}`;
 	}
 
 	/** Confirm draft choices even when Pi suppresses model_select. */
@@ -5503,52 +5524,38 @@ export default function (pi: ExtensionAPI) {
 				reference.provider,
 				reference.id,
 			);
-			let selected: { model: Model<Api>; persist: boolean } | undefined;
+			// This kit's digit-select picker, not pi's stock component: the reply
+			// draft's model is chosen the same way it is anywhere else.
+			let selected: Model<Api> | undefined;
 			const choices = registry.getAvailable();
 			if (search) {
 				const exact = choices.filter((m) =>
 					m.id.toLowerCase() === search!.toLowerCase() ||
 					`${m.provider}/${m.id}`.toLowerCase() === search!.toLowerCase(),
 				);
-				if (exact.length === 1) {
-					selected = { model: exact[0], persist: false };
-				}
+				if (exact.length === 1) selected = exact[0];
 			}
 			if (!selected) {
-				const runtime = {
-					getAvailableSnapshot: () => registry.getAvailable(),
-					getModel: (provider: string, id: string) =>
-						registry.find(provider, id),
-					getError: () => registry.getError(),
-					refresh: (options: Parameters<typeof registry.refresh>[0]) =>
-						registry.refresh(options),
-				} as unknown as
-					ConstructorParameters<typeof ModelSelectorComponent>[2];
-				selected = await ctx.ui.custom<typeof selected>(
-					(tui, _theme, _kb, done) => new ModelSelectorComponent(
-						tui,
-						current,
-						runtime,
-						ctx.scopedModels,
-						(model) => done({ model, persist: false }),
-						() => done(undefined),
-						search,
-						(model) => done({ model, persist: true }),
-						settings.getDefaultProvider() && settings.getDefaultModel()
-							? {
-								provider: settings.getDefaultProvider()!,
-								id: settings.getDefaultModel()!,
-							} : undefined,
-					),
-				);
+				selected = await openModelPicker(ctx, {
+					current,
+					// Keeping the draft on the window's current model is valid.
+					allowCurrent: true,
+					initialQuery: search,
+					commit: async () => true,
+					onPersist: (model) =>
+						settings.setDefaultModelAndProvider(
+							model.provider,
+							model.id,
+						),
+				});
 			}
 			if (!selected || !active()) return;
 			const p = (G.__piInboxPi ?? pi) as ExtensionAPI;
-			const success = await p.setModel(selected.model);
+			const success = await p.setModel(selected);
 			if (!active()) return;
 			if (!success) {
 				ctx.ui.notify(
-					`No API key for ${selected.model.provider}/${selected.model.id}`,
+					`No API key for ${selected.provider}/${selected.id}`,
 					"warning",
 				);
 				return;
@@ -5556,15 +5563,9 @@ export default function (pi: ExtensionAPI) {
 			// Do not rely on model_select: choosing the foreground model again
 			// emits no event, but must still replace a different draft choice.
 			draft.model = withLevel(
-				`${selected.model.provider}/${selected.model.id}`,
+				`${selected.provider}/${selected.id}`,
 				p.getThinkingLevel(),
 			);
-			if (selected.persist) {
-				settings.setDefaultModelAndProvider(
-					selected.model.provider,
-					selected.model.id,
-				);
-			}
 			const live = (G.__piInboxAgentsCtx as ExtensionContext) ?? ctx;
 			showReplyWidget(live);
 		}

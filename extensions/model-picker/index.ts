@@ -28,43 +28,24 @@
  */
 
 import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
-import type {
-	ExtensionAPI,
-	ExtensionContext,
+import {
+	getAgentDir,
+	SettingsManager,
+	type ExtensionAPI,
+	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { CustomEditor } from "@earendil-works/pi-coding-agent";
-import type { Model } from "@earendil-works/pi-ai";
-import { ModelPicker, type Entry } from "./picker.ts";
+import { openModelPicker } from "./picker.ts";
 
 const STATE_KEY = Symbol.for("pi.ext.model-picker");
 const g = globalThis as unknown as Record<symbol, { open?: () => void; patched?: boolean } | undefined>;
 const state = (g[STATE_KEY] ??= {});
 
 /** Reached only while the user is in TUI mode; guards against print/json runs. */
-function modelsFor(ctx: ExtensionContext): { scoped: Entry[]; all: Entry[] } {
-	const toEntry = (model: Model<any>): Entry => ({
-		model,
-		provider: model.provider,
-		id: model.id,
-		name: model.name,
+function settingsFor(ctx: ExtensionContext) {
+	return SettingsManager.create(ctx.cwd, getAgentDir(), {
+		projectTrusted: ctx.isProjectTrusted(),
 	});
-	const sort = (list: Entry[], current: Model<any> | undefined): Entry[] =>
-		list.slice().sort((a, b) => {
-			const aCur = current?.provider === a.provider && current?.id === a.id;
-			const bCur = current?.provider === b.provider && current?.id === b.id;
-			if (aCur !== bCur) return aCur ? -1 : 1;
-			const byProvider = a.provider.localeCompare(b.provider);
-			return byProvider !== 0 ? byProvider : a.id.localeCompare(b.id);
-		});
-	const scoped = sort(
-		ctx.scopedModels.map((s) => toEntry(s.model)),
-		ctx.model,
-	);
-	const all = sort(
-		ctx.modelRegistry.getAvailable().map(toEntry),
-		ctx.model,
-	);
-	return { scoped, all };
 }
 
 function installPatch(): void {
@@ -94,26 +75,13 @@ function installPatch(): void {
 }
 
 async function openPicker(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
-	if (ctx.mode !== "tui" || !ctx.hasUI) {
-		ctx.ui.notify("The model picker needs the interactive UI.", "warning");
-		return;
-	}
-	const { scoped, all } = modelsFor(ctx);
-	const picked = await ctx.ui.custom<Model<any> | undefined>(
-		(tui, theme, keybindings, done) =>
-			new ModelPicker(
-				tui,
-				theme,
-				keybindings,
-				done,
-				scoped,
-				all,
-				ctx.model,
-				// setModel lives on the extension API, not on ctx.
-				(model) => pi.setModel(model),
-			),
-		{ overlay: true },
-	);
+	const picked = await openModelPicker(ctx, {
+		// setModel lives on the extension API, not on ctx.
+		commit: (model) => pi.setModel(model),
+		// ctrl+s saves the startup default, like the stock selector.
+		onPersist: (model) =>
+			settingsFor(ctx).setDefaultModelAndProvider(model.provider, model.id),
+	});
 	if (picked) {
 		ctx.ui.notify(`Model: ${picked.provider}/${picked.id}`, "info");
 	}

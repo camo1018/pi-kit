@@ -3,7 +3,10 @@
 Replaces the model selector's numeric behavior: **digits select, arrows
 navigate, `ctrl+n` toggles digits into search text.**
 
-`ctrl+l` and `/models` open it. `/model` still opens pi's stock selector.
+`ctrl+l` and `/models` open it. The inbox opens the same component for a pending
+reply's model, for `N` (a new agent's model) and while visiting a session, so
+every model selector in this kit behaves the same. `/model` still opens pi's
+stock selector as an escape hatch.
 
 ## Keys
 
@@ -15,7 +18,16 @@ navigate, `ctrl+n` toggles digits into search text.**
 | `enter` | Choose the highlighted model |
 | `tab` | Toggle `scoped` ⇄ `all` (same as the built-in selector) |
 | `ctrl+n` | Toggle digits between **select** and **search text** |
+| `ctrl+s` | Choose and save as the startup default (when the caller allows it) |
 | `esc`, `ctrl+c` | Cancel |
+
+## Row order is stable
+
+Rows never move. `scoped` keeps `enabledModels` order (which is also the
+`ctrl+p` cycle order) and `all` is provider then id. The current model is
+marked `✓` and highlighted when the picker opens, but it is **not** moved to
+the top: a list that reshuffles on every pick makes `1`–`9` pick a different
+model each time.
 
 A page holds at most 9 rows so every row keeps a single-digit shortcut. The
 row count in the footer tells you the size of the current scope.
@@ -73,6 +85,7 @@ node --experimental-strip-types --test extensions/model-picker/picker.test.ts
 | `ctx.scopedModels` | `scoped-models-context` | the `scoped` scope | it stops being an array; the picker cannot tell scoped from all |
 | `ctx.modelRegistry.getAvailable()` | `model-registry-available` | the `all` scope | it is removed; only scoped models would be listable |
 | `pi.setModel()` | `set-model-api` | applying a choice | it is removed; choosing becomes a no-op |
+| `SettingsManager.prototype.setDefaultModelAndProvider` | `settings-manager-default` | `ctrl+s` saving the startup default | it is renamed or removed; `ctrl+s` stops saving (the pick itself still applies) |
 | The extension's own patch | `patch-installed` | confirming hooks actually installed | the extension loads but its patch silently did not run |
 
 The `actionHandlers` shape is also probed for `tool-output-hide` and

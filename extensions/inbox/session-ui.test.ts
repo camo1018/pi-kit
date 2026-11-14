@@ -527,6 +527,15 @@ test("returning to the main clears the visit's queue status", async (t) => {
 
 const nextTick = () => new Promise<void>((resolve) => setImmediate(resolve));
 
+/** Wait for the overlay a list action opens (the digit-select picker). */
+async function nextOverlay(f: Awaited<ReturnType<typeof setup>>) {
+	const previous = f.overlay();
+	for (let i = 0; i < 200 && f.overlay() === previous; i++)
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	assert.notEqual(f.overlay(), previous, "the model picker should open");
+	return f.overlay();
+}
+
 test("model picker changes only the busy visit and survives queued replies", async (t) => {
 	const f = await setup(t);
 	const a = await f.visit("model target");
@@ -534,8 +543,8 @@ test("model picker changes only the busy visit and survives queued replies", asy
 	const visitBefore = readFileSync(a.sessionFile!, "utf8");
 	assert.equal(f.footer.session.model?.id, "beta");
 	assert.deepEqual(f.key("\x0c"), { consume: true });
-	assert.equal(f.overlay().constructor.name, "ModelSelectorComponent");
-	f.overlay().handleInput("gamma");
+	assert.equal(f.overlay().constructor.name, "ModelPicker");
+	f.overlay().handleInput("3"); // gamma, per this kit's digits-select rows
 	f.overlay().handleInput("\r");
 	await nextTick();
 	assert.equal(a.nextModel, "test/vendor/gamma:free:low");
@@ -1033,15 +1042,17 @@ test("an explicit new-agent model survives the switch to blank home",
 	async (t) => {
 		const f = await setup(t, false);
 		const fresh = mockHomeSwitch(f);
-		f.ui.select = mock.fn(async () => "test/vendor/gamma:free:high");
 		const { list, done } = await f.openInbox();
 		list.handleInput("N");
+		const picker = await nextOverlay(f);
+		assert.equal(picker.constructor.name, "ModelPicker");
+		picker.handleInput("3"); // gamma, a different model from the window's
 		await done;
 		assert.equal((globalThis as any)[
 			Symbol.for("pi.inbox.reply-target")
-		].model, "test/vendor/gamma:free:high");
+		].model, "test/vendor/gamma:free:low");
 		assert.equal(fresh.model.id, "vendor/gamma:free");
-		assert.equal(fresh.thinkingLevel, "high");
+		assert.equal(fresh.thinkingLevel, "low");
 	});
 
 test("native new sessions inherit without changing saved startup defaults",
@@ -1119,9 +1130,10 @@ test("an unavailable inherited model falls back consistently", async (t) => {
 async function composeOnAnotherModel(
 	f: Awaited<ReturnType<typeof setup>>,
 ) {
-	f.ui.select = mock.fn(async () => "test/beta:low");
 	const { list, done } = await f.openInbox();
 	list.handleInput("N");
+	const picker = await nextOverlay(f);
+	picker.handleInput("2"); // beta, keeping the window's thinking level
 	await done;
 	return (globalThis as any)[Symbol.for("pi.inbox.reply-target")];
 }
@@ -1134,8 +1146,8 @@ test("confirming the current model repairs a different pending agent model",
 		(f.pi.setModel as any).mock.mockImplementation(async () => true);
 		assert.equal(target.model, "test/beta:low");
 		assert.deepEqual(f.key("\x0c"), { consume: true });
-		assert.equal(f.overlay().constructor.name, "ModelSelectorComponent");
-		f.overlay().handleInput("alpha");
+		assert.equal(f.overlay().constructor.name, "ModelPicker");
+		f.overlay().handleInput("1"); // digits select rows
 		f.overlay().handleInput("\r");
 		await nextTick();
 		assert.equal(target.model, "test/alpha:low");
@@ -1171,7 +1183,7 @@ test("a pending-agent model picker cannot apply to a replaced draft",
 		const target = await composeOnAnotherModel(f);
 		assert.deepEqual(f.key("\x0c"), { consume: true });
 		delete (globalThis as any)[Symbol.for("pi.inbox.reply-target")];
-		f.overlay().handleInput("alpha");
+		f.overlay().handleInput("1"); // digits select rows
 		f.overlay().handleInput("\r");
 		await nextTick();
 		assert.equal(target.model, "test/beta:low");
@@ -1196,7 +1208,7 @@ test("opening a visit invalidates a pending-agent model picker", async (t) => {
 	assert.deepEqual(f.key("\x0c"), { consume: true });
 	const picker = f.overlay();
 	const a = await f.visit("another session");
-	picker.handleInput("alpha");
+	picker.handleInput("1"); // digits select rows
 	picker.handleInput("\r");
 	await nextTick();
 	assert.equal(target.model, "test/beta:low");
@@ -1210,7 +1222,7 @@ test("reloading extensions invalidates a pending-agent model picker",
 		const target = await composeOnAnotherModel(f);
 		assert.deepEqual(f.key("\x0c"), { consume: true });
 		(globalThis as any).__piInboxPi = {};
-		f.overlay().handleInput("alpha");
+		f.overlay().handleInput("1"); // digits select rows
 		f.overlay().handleInput("\r");
 		await nextTick();
 		assert.equal(target.model, "test/beta:low");

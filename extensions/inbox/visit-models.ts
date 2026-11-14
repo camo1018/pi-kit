@@ -7,7 +7,6 @@ import {
 } from "@earendil-works/pi-ai";
 import {
 	getAgentDir,
-	ModelSelectorComponent,
 	SettingsManager,
 	ThinkingSelectorComponent,
 	type ExtensionContext,
@@ -19,6 +18,7 @@ import {
 	setAgentModel,
 } from "../../lib/inbox-agents.ts";
 import { visiting } from "../../lib/visit-runtime.ts";
+import { openModelPicker } from "../model-picker/picker.ts";
 
 type Action = "select" | "forward" | "backward" | "thinking" | "cycleThinking";
 
@@ -72,11 +72,7 @@ export function handleVisitModelInput(
 		});
 		const currentLevel = current?.thinkingLevel ?? "medium";
 
-		function apply(
-			next: Model<Api>,
-			level?: ThinkingLevel,
-			persistDefault = false,
-		) {
+		function apply(next: Model<Api>, level?: ThinkingLevel) {
 			// A selector may outlive navigation; never apply to a different view.
 			if (!visit || visiting() !== visit) return false;
 			const blocked = blockedReason();
@@ -94,9 +90,6 @@ export function handleVisitModelInput(
 			const reference = `${next.provider}/${next.id}:${thinking}`;
 			setAgentModel(visit.id, visit.file, reference);
 			visit.selectedModel = reference;
-			if (persistDefault) {
-				settings.setDefaultModelAndProvider(next.provider, next.id);
-			}
 			tui.requestRender();
 			return true;
 		}
@@ -171,40 +164,22 @@ export function handleVisitModelInput(
 			);
 			if (matches.length === 1) return apply(matches[0]);
 		}
-		// Use Pi's normal picker with a read-only registry facade, not the main's
-		// ModelRuntime. Only its selection callback writes the visited choice.
-		const runtime = {
-			getAvailableSnapshot: () => registry.getAvailable(),
-			getModel: (provider: string, id: string) => registry.find(provider, id),
-			getError: () => registry.getError(),
-			refresh: (options: Parameters<typeof registry.refresh>[0]) =>
-				registry.refresh(options),
-		} as unknown as ConstructorParameters<typeof ModelSelectorComponent>[2];
-		const selected = await ctx.ui.custom<
-			| {
-					model: Model<Api>;
-					persist: boolean;
-			  }
-			| undefined
-		>(
-			(tui, _theme, _kb, done) =>
-				new ModelSelectorComponent(
-					tui,
-					model,
-					runtime,
-					ctx.scopedModels,
-					(model) => done({ model, persist: false }),
-					() => done(undefined),
-					search,
-					(model) => done({ model, persist: true }),
-					settings.getDefaultProvider() && settings.getDefaultModel()
-						? {
-								provider: settings.getDefaultProvider()!,
-								id: settings.getDefaultModel()!,
-							}
-						: undefined,
-				),
-		);
-		if (selected) apply(selected.model, undefined, selected.persist);
+		// Use this kit's digit-select picker instead of pi's stock component so
+		// visiting behaves like ctrl+l anywhere else. Only its commit callback
+		// writes the visited choice; the hidden main stays untouched.
+		await openModelPicker(ctx, {
+			current: model,
+			allowCurrent: true,
+			initialQuery: search,
+			// The picker closes on any confirmed row; `apply` reports its own
+			// refusal (navigation changed under it) instead of the picker
+			// blaming the model.
+			commit: (next) => {
+				apply(next);
+				return Promise.resolve(true);
+			},
+			onPersist: (next) =>
+				settings.setDefaultModelAndProvider(next.provider, next.id),
+		});
 	}
 }

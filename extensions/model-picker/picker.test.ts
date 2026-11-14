@@ -40,6 +40,11 @@ function picker(options: {
 	all?: Model<any>[];
 	current?: Model<any>;
 	commit?: (m: Model<any>) => Promise<boolean>;
+	pickerOptions?: {
+		allowCurrent?: boolean;
+		initialQuery?: string;
+		onPersist?: (m: Model<any>) => void;
+	};
 } = {}) {
 	const scoped = (options.scoped ?? MODELS).map((m) => ({
 		model: m, provider: m.provider, id: m.id, name: m.name,
@@ -61,6 +66,7 @@ function picker(options: {
 			committed.push(m);
 			return options.commit ? options.commit(m) : true;
 		},
+		options.pickerOptions,
 	);
 	return { ui, result: () => result, committed, render: () => ui.render(120).join("\n") };
 }
@@ -75,14 +81,36 @@ test("digits select the numbered row by default", async () => {
 	assert.deepEqual(f.committed, [MODELS[1]]);
 });
 
-test("the current model is first and selecting it is a no-op", async () => {
-	const f = picker({ current: MODELS[1] });
-	assert.match(f.render(), /▶ 2 ✓ beta/);
-	f.ui.handleInput("2");
-	await tick();
-	assert.equal(f.result(), undefined);
-	assert.deepEqual(f.committed, []);
+test("the row order never depends on which model is selected", async () => {
+	// A list that reshuffles the selected model to the top makes digits
+	// unpickable: row 2 today is row 1 tomorrow. Order is fixed; only the ✓
+	// and the initial highlight follow the current model.
+	const first = picker({ current: MODELS[0] }).render();
+	const second = picker({ current: MODELS[2] }).render();
+	const rows = (text: string) =>
+		text.split("\n")
+			// Row number, selection arrow and current-model ✓ vary; row order is
+			// what this test pins.
+			.map((line) => line.match(/^\s*[▶ ]\s\d\s+[✓ ]\s+(.+)$/)?.[1])
+			.filter((row): row is string => !!row);
+	assert.deepEqual(rows(first), rows(second));
+	assert.deepEqual(rows(first), [
+		"alpha [example-provider]",
+		"beta [example-provider]",
+		"gamma [example-provider]",
+	]);
 });
+
+test("the current model is marked and highlighted but not moved to the top",
+	async () => {
+		const f = picker({ current: MODELS[1] });
+		assert.match(f.render(), /▶ 2 ✓ beta/);
+		assert.match(f.render(), / 1   alpha/);
+		f.ui.handleInput("2");
+		await tick();
+		assert.equal(f.result(), undefined);
+		assert.deepEqual(f.committed, []);
+	});
 
 test("arrow navigation wraps and follows the page", () => {
 	const f = picker();
@@ -119,6 +147,54 @@ test("a dotted version number is typeable after Ctrl+N", async () => {
 	f.ui.handleInput("\r");
 	await tick();
 	assert.equal((f.result() as Model<any>).id, "model-4.1-flash");
+});
+
+test("the current model keeps its row across a switch", async () => {
+	// Regression guard for the ordering complaint: switch to gamma, reopen,
+	// and gamma is highlighted in row 3 where it always was — alpha is still 1.
+	const f = picker({ current: MODELS[2] });
+	assert.match(f.render(), /▶ 3 ✓ gamma/);
+	assert.match(f.render(), / 1   alpha/);
+	f.ui.handleInput("1");
+	await tick();
+	assert.equal(f.result(), MODELS[0]);
+});
+
+test("allowCurrent resolves with the current model", async () => {
+	const f = picker({
+		current: MODELS[1],
+		pickerOptions: { allowCurrent: true },
+	});
+	f.ui.handleInput("2");
+	await tick();
+	assert.equal(f.result(), MODELS[1]);
+});
+
+test("Ctrl+S saves the choice as the startup default", async () => {
+	const persisted: Model<any>[] = [];
+	const f = picker({
+		current: MODELS[0],
+		pickerOptions: { allowCurrent: true, onPersist: (m) => persisted.push(m) },
+	});
+	assert.match(f.render(), /Ctrl\+S set as default/);
+	f.ui.handleInput("\x1b[B"); // down to row 2
+	f.ui.handleInput("\x1b[B"); // down to row 3
+	f.ui.handleInput("\x13"); // ctrl+s
+	await tick();
+	assert.deepEqual(persisted, [MODELS[2]]);
+	assert.equal(f.result(), MODELS[2]);
+});
+
+test("a prefilled search filters before the rows are picked", async () => {
+	const f = picker({ pickerOptions: { initialQuery: "gam" } });
+	assert.match(f.render(), /filter: gam/);
+	assert.match(f.render(), /1   gamma/);
+	assert.doesNotMatch(f.render(), /alpha/);
+	// A prefilled query means the user came to type, so digits stay text.
+	assert.match(f.render(), /Digits: text/);
+	f.ui.handleInput("\r");
+	await tick();
+	assert.equal(f.result(), MODELS[2]);
 });
 
 test("Ctrl+N is a toggle, so digits select again", async () => {

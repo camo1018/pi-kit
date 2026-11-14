@@ -3,7 +3,7 @@
  * construct it without installing the editor patch or registering commands.
  */
 
-import type { Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import {
 	isKeyRelease,
 	isKeyRepeat,
@@ -24,6 +24,80 @@ export interface Entry {
 	provider: string;
 	id: string;
 	name: string;
+}
+
+/**
+ * The scoped and all lists, in a STABLE order that never depends on which
+ * model is selected: `scoped` keeps `enabledModels` order (it is also the
+ * ctrl+p cycle order), `all` is provider then id. The current model is marked
+ * with a ✓ and starts highlighted, but it is not moved to the top — a list
+ * whose rows shuffle every time you pick one makes digits unpickable.
+ */
+export function entriesFor(ctx: ExtensionContext): {
+	scoped: Entry[];
+	all: Entry[];
+} {
+	const toEntry = (model: Model<any>): Entry => ({
+		model,
+		provider: model.provider,
+		id: model.id,
+		name: model.name,
+	});
+	const scoped = (ctx.scopedModels ?? []).map((s) => toEntry(s.model));
+	const all = ctx.modelRegistry.getAvailable()
+		.map(toEntry)
+		.sort((a, b) => {
+			const byProvider = a.provider.localeCompare(b.provider);
+			return byProvider !== 0 ? byProvider : a.id.localeCompare(b.id);
+		});
+	return { scoped, all };
+}
+
+export interface ModelPickerOptions {
+	/** Resolve with the current model instead of `undefined` when picked. */
+	allowCurrent?: boolean;
+	/** `ctrl+s`: save the choice as the startup default, then resolve. */
+	onPersist?: (model: Model<any>) => void;
+	/** Prefill the filter, e.g. from `/model <search>`. */
+	initialQuery?: string;
+}
+
+export interface OpenModelPickerOptions extends ModelPickerOptions {
+	/** Highlight and compare against this model instead of `ctx.model`. */
+	current?: Model<any>;
+	/** Apply the choice. Resolving false keeps the picker open. */
+	commit: (model: Model<any>) => Promise<boolean>;
+}
+
+/**
+ * Open the digit-select picker. Shared by `ctrl+l` / `/models`, the inbox's
+ * new-agent flows and the visit view, so every model selector in this kit
+ * behaves the same instead of falling back to pi's stock component.
+ */
+export function openModelPicker(
+	ctx: ExtensionContext,
+	options: OpenModelPickerOptions,
+): Promise<Model<any> | undefined> {
+	if (ctx.mode !== "tui" || !ctx.hasUI) {
+		ctx.ui.notify("The model picker needs the interactive UI.", "warning");
+		return Promise.resolve(undefined);
+	}
+	const { scoped, all } = entriesFor(ctx);
+	return ctx.ui.custom<Model<any> | undefined>(
+		(tui, theme, keybindings, done) =>
+			new ModelPicker(
+				tui,
+				theme,
+				keybindings,
+				done,
+				scoped,
+				all,
+				options.current ?? ctx.model,
+				options.commit,
+				options,
+			),
+		{ overlay: true },
+	);
 }
 
 export class ModelPicker implements Focusable {
@@ -54,6 +128,8 @@ export class ModelPicker implements Focusable {
 	private readonly allEntries: Entry[];
 	private readonly current: Model<any> | undefined;
 	private readonly commit: (model: Model<any>) => Promise<boolean>;
+	private readonly allowCurrent: boolean;
+	private readonly onPersist?: (model: Model<any>) => void;
 
 	constructor(
 		tui: TUI,
@@ -64,6 +140,7 @@ export class ModelPicker implements Focusable {
 		allEntries: Entry[],
 		current: Model<any> | undefined,
 		commit: (model: Model<any>) => Promise<boolean>,
+		options: ModelPickerOptions = {},
 	) {
 		this.tui = tui;
 		this.theme = theme;
@@ -73,11 +150,21 @@ export class ModelPicker implements Focusable {
 		this.allEntries = allEntries;
 		this.current = current;
 		this.commit = commit;
+		this.allowCurrent = options.allowCurrent ?? false;
+		this.onPersist = options.onPersist;
 		this.scope = scopedEntries.length > 0 ? "scoped" : "all";
 		this.entries = this.scope === "scoped" ? scopedEntries : allEntries;
 		this.filtered = this.entries;
 		const index = this.filtered.findIndex((entry) => this.isCurrent(entry));
 		this.selected = index >= 0 ? index : 0;
+		if (options.initialQuery) {
+			// Prefilled search (e.g. `/model 4.1`) means the user intended to type,
+			// so digits filter rather than select.
+			this.query = options.initialQuery;
+			this.digitsAsText = true;
+			this.applyFilter();
+			this.selected = 0;
+		}
 	}
 
 	dispose(): void {
@@ -120,11 +207,19 @@ export class ModelPicker implements Focusable {
 		this.entries = scope === "scoped" ? this.scopedEntries : this.allEntries;
 		this.selected = 0;
 		this.applyFilter();
+		// Keep the cursor on the active model when the other scope has it.
+		const index = this.filtered.findIndex((entry) => this.isCurrent(entry));
+		if (index >= 0) this.selected = index;
 	}
 
-	private async choose(entry: Entry | undefined): Promise<void> {
+	private async choose(
+		entry: Entry | undefined,
+		persist = false,
+	): Promise<void> {
 		if (!entry || this.busy) return;
-		if (this.isCurrent(entry)) {
+		// Choosing the active model is a no-op unless the caller wants it back
+		// (a new-agent draft may legitimately run the window's current model).
+		if (!this.allowCurrent && !persist && this.isCurrent(entry)) {
 			this.done(undefined);
 			return;
 		}
@@ -138,6 +233,7 @@ export class ModelPicker implements Focusable {
 				this.error = `No API key for ${entry.provider}/${entry.id}`;
 				return;
 			}
+			if (persist) this.onPersist?.(entry.model);
 			this.done(entry.model);
 		} catch (error) {
 			if (!this.disposed) {
@@ -184,6 +280,11 @@ export class ModelPicker implements Focusable {
 		if (this.kb.matches(data, "tui.select.confirm") ||
 			this.kb.matches(data, "tui.input.submit")) {
 			void this.choose(this.filtered[this.selected]);
+			return;
+		}
+		if (this.onPersist && (this.kb.matches(data, "app.models.save") ||
+			matchesKey(data, "ctrl+s"))) {
+			void this.choose(this.filtered[this.selected], true);
 			return;
 		}
 		if (this.kb.matches(data, "tui.select.up") ||
@@ -295,7 +396,8 @@ export class ModelPicker implements Focusable {
 			lines.push(th.fg("dim",
 				"  ↑↓ ←→ PgUp PgDn navigate · Enter choose · Esc cancel"));
 			lines.push(th.fg("dim",
-				"  Tab scope · Ctrl+N digits select/search"));
+				`  Tab scope · Ctrl+N digits select/search` +
+				(this.onPersist ? " · Ctrl+S set as default" : "")));
 		}
 
 		return lines.map((line) => truncateToWidth(line, Math.max(1, width)));

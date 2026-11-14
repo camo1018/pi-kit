@@ -325,6 +325,18 @@ const PROBES: Probe[] = [
 	},
 	{
 		ext: "model-picker",
+		id: "settings-manager-default",
+		check: () =>
+			need(
+				typeof A.SettingsManager?.create === "function" &&
+				typeof A.SettingsManager.prototype.setDefaultModelAndProvider ===
+					"function",
+				"SettingsManager.setDefaultModelAndProvider is gone " +
+					"(ctrl+s cannot save the default model)",
+			),
+	},
+	{
+		ext: "model-picker",
 		id: "set-model-api",
 		check: (_c, pi) =>
 			need(typeof pi.setModel === "function", "pi.setModel is gone (choosing a model would be a no-op)"),
@@ -482,12 +494,9 @@ const PROBES: Probe[] = [
 		ext: "inbox",
 		id: "visit-model-selectors",
 		check: () => need(
-			typeof A.ModelSelectorComponent === "function" &&
-			typeof A.ModelSelectorComponent.prototype.handleInput === "function" &&
-			typeof A.ModelSelectorComponent.prototype.dispose === "function" &&
 			typeof A.ThinkingSelectorComponent === "function" &&
 			typeof A.ThinkingSelectorComponent.prototype.handleInput === "function",
-			"Native model/thinking selectors changed (visited model controls)",
+			"Native thinking selector changed (visited model controls)",
 		),
 	},
 	{
