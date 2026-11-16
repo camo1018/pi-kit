@@ -94,7 +94,7 @@ For a cloned install, `git pull` is equivalent to `pi update --extension`.
 | `tool-output-hide/` | Add a hidden state for noisy tool output. ⚠️ [internals](extensions/tool-output-hide/README.md) |
 | `model-picker/` | Digits select a model and arrows navigate in the model selector (`ctrl+l`, `/models`); `ctrl+n` toggles digits to search text. ⚠️ [internals](extensions/model-picker/README.md) |
 | `thinking-block-hide/` | Add a fully hidden state for thinking blocks (`ctrl+t`, `/thinking-blocks`). ⚠️ [internals](extensions/thinking-block-hide/README.md) |
-| `final-answer-divider/` | Visual divider before the final answer |
+| `final-answer-divider/` | Visual divider before the final answer; `ctrl+f` / `/final` scrolls to the last one. ⚠️ [internals](extensions/final-answer-divider/README.md) |
 | `tree-position/` | Remember `/tree` navigation: resumes a session at your tree position (plus editor draft) instead of the latest branch |
 | `compat-check/` | Warns on startup / `/reload` when a Pi upgrade breaks an extension that uses Pi internals (`/compat` for the full report) |
 

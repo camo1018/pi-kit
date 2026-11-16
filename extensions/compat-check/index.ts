@@ -554,6 +554,45 @@ const PROBES: Probe[] = [
 			}
 		},
 	},
+	// ── final-answer-divider ─────────────────────────────────────────
+	{
+		ext: "final-answer-divider",
+		id: "transcript-scroll-targets",
+		check: () =>
+			need(
+				hasMethod(T.TuiAltScreen, "getPrimaryScrollView") &&
+					hasMethod(T.ScrollView, "scrollTo") &&
+					classSource(T.TuiAltScreen).includes("scrollContentLines"),
+				"TuiAltScreen#getPrimaryScrollView / ScrollView#scrollTo or the layout's " +
+					"scrollContentLines are gone (ctrl+f cannot find the final answer)",
+			),
+	},
+	{
+		ext: "final-answer-divider",
+		id: "scroll-view-child",
+		check: () => {
+			try {
+				const view = new T.ScrollView(new T.Text("x", 0, 0), { primary: true });
+				const child = view.child;
+				return need(
+					child !== undefined && typeof child.render === "function",
+					"ScrollView#child is not a renderable document component " +
+						"(the no-layout fallback for ctrl+f breaks)",
+				);
+			} catch (e) {
+				return `ScrollView probe threw: ${(e as Error).message}`;
+			}
+		},
+	},
+	{
+		ext: "final-answer-divider",
+		id: "set-widget-tui",
+		check: (c) =>
+			need(
+				!c.hasUI || typeof c.ui.setWidget === "function",
+				"ctx.ui.setWidget is gone (the TUI cannot be captured, so ctrl+f is dead)",
+			),
+	},
 ];
 
 interface Result {
