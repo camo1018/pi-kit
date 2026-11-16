@@ -1239,6 +1239,8 @@ export function mentionChoices(opts: {
 	 */
 	groupId?: string;
 	withArchived?: boolean;
+	/** Archived sessions only — the TUI's `@a[`, for referencing a filed session. */
+	archivedOnly?: boolean;
 	includeSelf?: boolean;
 } = {}): {
 	mentions: MentionChoice[];
@@ -1284,7 +1286,10 @@ export function mentionChoices(opts: {
 	const mentions: MentionChoice[] = [];
 	for (const h of none ? [] : scanHeaders()) {
 		const meta = store.sessions[h.id] ?? {};
-		if (meta.archivedAt && !opts.withArchived) continue;
+		// `archivedOnly` is the TUI's `@a[`: archived sessions, and nothing else.
+		if (opts.archivedOnly ? !meta.archivedAt : meta.archivedAt && !opts.withArchived) {
+			continue;
+		}
 		if (meta.filter === "hide") continue;
 		if (!opts.includeSelf && opts.from && h.id === opts.from) continue;
 		const gid = groupOf(h.id);
@@ -1996,6 +2001,7 @@ async function handle(
 				from: url.searchParams.get("from") ?? undefined,
 				groupId: url.searchParams.get("group") ?? undefined,
 				withArchived: url.searchParams.get("archived") === "1",
+				archivedOnly: url.searchParams.get("archivedOnly") === "1",
 				includeSelf: url.searchParams.get("self") === "1",
 			}),
 		);

@@ -187,12 +187,13 @@ opens. There are no insert buttons on the composer — the characters are one ke
 each on a real keyboard, and a phone keyboard reaches them in the same place.
 
 Sessions are filtered from the popup, because the raw triggers are the TUI's and
-they are awkward on glass: a plain `@` lists every session (`@[` still works and
-means the same thing), and the dropdown in the popup header switches to this
-session's group, that group plus archived, or any group by name — without
-retyping the token. Picking a row always inserts the full `@[<session-id>]`
-form, whatever the filter. Up/Down/Tab/Enter move and accept, Escape dismisses,
-and the group picker is the only control that steals focus.
+they are awkward on glass: a plain `@` lists every active session (`@[` still
+works and means the same thing), and the dropdown in the popup header switches
+to archived sessions only, this session's group, that group plus archived, or
+any group by name — without retyping the token. Picking a row always inserts the
+full `@[<session-id>]` form, whatever the filter. Up/Down/Tab/Enter move and
+accept, Escape dismisses, and the group picker is the only control that steals
+focus.
 
 The new-agent prompt (header **＋**) offers the same list, since its prompt is
 expanded by the same extensions on the request side.

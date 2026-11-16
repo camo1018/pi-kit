@@ -1,23 +1,34 @@
 # session-mention
 
-Reference other Pi sessions from a prompt with `@[...]` (or sessions in your current inbox group with `@g[...]` / `@ga[...]`).
+Reference other Pi sessions from a prompt with `@[...]` (or sessions in your current inbox group with `@g[...]` / `@ga[...]`, or archived sessions with `@a[...]`).
 
-- Typing `@[` opens a fuzzy picker over all saved sessions (all projects),
+- Typing `@[` opens a fuzzy picker over saved sessions (all projects),
   matched by name, first message, cwd basename, or id. The picker displays the
   session title but always inserts its immutable id, so duplicate or later
   renamed titles cannot redirect the mention. Plain `@` file completion is
   untouched.
+- `@[` lists **only unarchived sessions**. Archived sessions are 90% of a real
+  session tree and are the reason the picker used to take seconds, so they are
+  filtered out from a 4 KB header read before any transcript is parsed: ~0.3 s
+  cold instead of ~2.8 s for `SessionManager.listAll()`, with identical fields
+  for every row it shows.
+- Typing `@a[` lists **only archived sessions**, for the rare reference to one
+  you filed away. Cold is ~0.9 s rather than ~2.3 s: the rows need each file's
+  last `session_info` title (which sits anywhere in the transcript), so this
+  walk reads the bytes but never parses the message bodies.
 - Typing `@g[` restricts the autocomplete suggestions specifically to other
   saved sessions that belong to the relevant inbox group, **excluding sessions
   the Inbox has archived**. Typing `@ga[` uses the same group filter but
   **includes archived sessions too**.
+- Archiving hides a session from the pickers, not from expansion: `@[<id>]`
+  still expands for an archived session, so a reference inserted by `@a[` (or
+  typed before the session was archived) keeps working.
 - The group path resolves members from filenames (`<timestamp>_<session-id>.jsonl`)
   and reads only each member's header line and its last `session_info` entry, so
   it never runs pi's full scan. Cold is ~250 ms for a 139-member group and ~0 ms
   per follow-up keystroke (1 s cache), versus ~2.5 s per keystroke for
-  `SessionManager.listAll()` on an 834-file / 1 GB tree. `@[` still uses
-  `SessionManager.listAll()`, since it spans every project.
-- A member whose file is gone (a deleted session whose group membership
+  `SessionManager.listAll()` on an 834-file / 1 GB tree. `@[` / `@a[` resolve
+  ids the same way from the header index; neither calls `listAll()`.- A member whose file is gone (a deleted session whose group membership
   outlived it) is skipped. It is *not* worth seconds per keystroke to chase, and
   the alternative — a full scan on every keystroke — is what made `@g[` feel
   broken. A member whose file was renamed or copied is still found: the filename
@@ -30,7 +41,7 @@ Reference other Pi sessions from a prompt with `@[...]` (or sessions in your cur
   session is ungrouped (or if no other sessions exist in that group), an
   informative placeholder item is shown instead of inserting arbitrary sessions.
   When every sibling in the group is archived, the `@g[` placeholder points at
-  `@ga[`.
+  `@ga[`. `@a[` shows its own placeholder when nothing is archived.
   Selecting a suggestion inserts the standard `@[id]` token.
 - The group `@g[` means is resolved from the action you are taking, most
   specific first: the pending inbox target (composing a new agent's chosen
@@ -61,8 +72,8 @@ Reference other Pi sessions from a prompt with `@[...]` (or sessions in your cur
 | Dependency | Used for | Breaks if |
 | --- | --- | --- |
 | `lib/inbox-agents.ts` → `transcriptMarkdown()` | rendering another session's branch | the inbox extension's transcript format changes; the extension still loads, mention blocks then render a `_Could not read session_` body |
-| `SessionManager.listAll()` / `.open()` / `SessionInfo` (public API) | listing sessions, resolving ids, reading branches | public API surface change in pi core |
-| `~/.pi/agent/inbox.json` (`sessions[id].archivedAt`) | deciding which group siblings `@g[` hides | the Inbox moves archive state to another file; `@g[` then shows archived sessions again (`@ga[` is unaffected) |
+| `SessionManager.open()` / `SessionInfo` (public API) | reading a mentioned branch, and the `SessionInfo` shape every list entry mimics | public API surface change in pi core. Session **listing** no longer uses `SessionManager.listAll()`; it walks `~/.pi/agent/sessions` headers itself, so a change to pi's session-file layout (header line, `<timestamp>_<id>.jsonl` name) would break the pickers while expansion kept working |
+| `~/.pi/agent/inbox.json` (`sessions[id].archivedAt`) | deciding which sessions `@[` hides, `@a[` lists, and `@g[` excludes | the Inbox moves archive state to another file; `@[` then lists archived sessions again (`@g[` / `@ga[` filters still work off membership) |
 | Pi's session-file naming (`<timestamp>_<id>.jsonl`) and folder layout | resolving a whole group without pi's full scan | the format changes; the filename stem no longer matches, but header-id matching still finds every member (correct, just slower on a cold cache) |
 | Inbox globals `pi.inbox.reply-target`, `pi.inbox.next-agent-group`, `pi.inbox.group-view`, `pi.inbox.mode` | resolving which group `@g[` means | the Inbox renames those keys; `@g[` then falls back to the session's own membership and stops following the agent you are replying to |
 

@@ -574,6 +574,10 @@ test("archived sessions are left out of mentions unless asked for", () => {
 	assert.ok(!hidden.includes(id));
 	const shown = mentionChoices({ withArchived: true }).mentions.map((m) => m.id);
 	assert.ok(shown.includes(id));
+	// `archivedOnly` is the TUI's `@a[`: archived sessions, and only those.
+	const onlyArchived = mentionChoices({ archivedOnly: true }).mentions
+		.map((m) => m.id);
+	assert.deepEqual(onlyArchived, [id]);
 	fs.rmSync(store, { force: true });
 });
 

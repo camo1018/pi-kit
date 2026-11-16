@@ -21,14 +21,16 @@ import {
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	getAgentDir,
-	SessionManager,
 	type SessionInfo,
 } from "@earendil-works/pi-coding-agent";
 import { fuzzyFilter } from "@earendil-works/pi-tui";
 
-// `@[` = any saved session; `@g[` = this session's group, archived hidden;
-// `@ga[` = this session's group, archived included.
-const COMPLETION_PATTERN = /(?:^|[\s([{<"'`])(@(?:ga|g)?\[)([^\]\n]*)$/;
+// `@[` = any saved session that is not archived; `@a[` = archived sessions
+// (all projects); `@g[` = this session's group, archived hidden; `@ga[` = this
+// session's group, archived included. Expansion always accepts `@[<id>]`, so an
+// archived reference inserted by `@a[` still resolves.
+const COMPLETION_PATTERN =
+	/(?:^|[\s([{<"'`])(@(?:ga|g|a)?\[)([^\]\n]*)$/;
 const TOKEN_PATTERN = /(^|[\s([{<"'])@\[([^\]\n]+)\]/g;
 const MAX_SESSION_TRANSCRIPT_CHARS = 24 * 1024;
 const MAX_REQUEST_TRANSCRIPT_CHARS = 64 * 1024;
@@ -130,6 +132,14 @@ function mentionGroupId(
 let cachedAt = 0;
 let cachedSessions: SessionRef[] | undefined;
 let inflight: Promise<SessionRef[]> | undefined;
+/** Non-archived sessions only: what `@[` lists. */
+let activeAt = 0;
+let activeRefs: SessionRef[] | undefined;
+let activeInflight: Promise<SessionRef[]> | undefined;
+/** Archived sessions only: what `@a[` lists. */
+let archivedRefsAt = 0;
+let archivedRefs: SessionRef[] | undefined;
+let archivedRefsInflight: Promise<SessionRef[]> | undefined;
 let cachedArchivedAt = 0;
 let cachedArchived: Set<string> | undefined;
 /** Group-id → its members' refs. A group has a handful of members, not 500. */
@@ -139,6 +149,12 @@ export function clearSessionCache(): void {
 	cachedAt = 0;
 	cachedSessions = undefined;
 	inflight = undefined;
+	activeAt = 0;
+	activeRefs = undefined;
+	activeInflight = undefined;
+	archivedRefsAt = 0;
+	archivedRefs = undefined;
+	archivedRefsInflight = undefined;
 	cachedArchivedAt = 0;
 	cachedArchived = undefined;
 	fileIndexAt = 0;
@@ -180,25 +196,27 @@ function archivedSessionIds(): Set<string> {
 	return ids;
 }
 
-function toRef(info: SessionInfo): SessionRef {
-	return {
-		info,
-		preview: previewOf(info),
-		dir: info.cwd.split("/").filter(Boolean).pop() ?? info.cwd,
-	};
-}
-
+/**
+ * Every session, archived included: what a `@[<id>]` token can resolve to.
+ *
+ * Archiving hides a session from the pickers, not from mention expansion — an
+ * id typed (or inserted by `@a[`) before the session was archived must keep
+ * resolving. `SessionManager.listAll()` is not used here: it parses every
+ * archived transcript (~2.8 s on a real tree) to answer a question this can
+ * answer from headers plus the active sessions' own bodies. See
+ * `listActiveSessions` and `listArchivedSessions` for the split.
+ */
 async function listSessions(): Promise<SessionRef[]> {
 	const now = Date.now();
 	if (cachedSessions && now - cachedAt < 1000) return cachedSessions;
 	if (inflight) return inflight;
 	inflight = (async () => {
 		try {
-			const infos = await SessionManager.listAll();
-			return infos
-				.filter((info) => info.messageCount > 0)
-				.map(toRef)
-				.sort(byModified);
+			const [active, archived] = await Promise.all([
+				listActiveSessions(),
+				listArchivedSessions(),
+			]);
+			return [...active, ...archived].sort(byModified);
 		} catch {
 			return [];
 		} finally {
@@ -209,6 +227,77 @@ async function listSessions(): Promise<SessionRef[]> {
 	cachedSessions = result;
 	cachedAt = now;
 	return result;
+}
+
+/**
+ * Non-archived sessions, with the same fields `SessionManager.listAll()`
+ * reports.
+ *
+ * Archive state lives in `inbox.json`, so the ids can be filtered from a 4 KB
+ * header read before any transcript is parsed. Only the ~8% of sessions that
+ * are not archived then need a full parse: 71 of 918 files here, ~300 ms
+ * instead of ~2.8 s. Fidelity is unchanged for the rows `@[` actually shows.
+ */
+async function listActiveSessions(): Promise<SessionRef[]> {
+	const now = Date.now();
+	if (activeRefs && now - activeAt < 1000) return activeRefs;
+	if (activeInflight) return activeInflight;
+	activeInflight = (async () => {
+		try {
+			const archived = archivedSessionIds();
+			const refs: SessionRef[] = [];
+			for (const file of sessionFiles().files) {
+				const id = headerIdOf(file);
+				if (!id || archived.has(id)) continue;
+				const ref = readSessionRef(file);
+				if (ref && ref.info.messageCount > 0) refs.push(ref);
+			}
+			return refs.sort(byModified);
+		} catch {
+			return [];
+		} finally {
+			activeInflight = undefined;
+		}
+	})();
+	const refs = await activeInflight;
+	activeRefs = refs;
+	activeAt = now;
+	return refs;
+}
+
+/**
+ * Archived sessions, for `@a[`. Header + name + first prompt only.
+ *
+ * Archived transcripts are most of the tree (845 of 918 files here, 1 GB), and
+ * they are the ones nobody opens; a full parse would cost ~2.3 s per cold
+ * picker for a list whose rows only show a title and a directory.
+ */
+async function listArchivedSessions(): Promise<SessionRef[]> {
+	const now = Date.now();
+	if (archivedRefs && now - archivedRefsAt < 1000) return archivedRefs;
+	if (archivedRefsInflight) return archivedRefsInflight;
+	archivedRefsInflight = (async () => {
+		try {
+			const archived = archivedSessionIds();
+			if (archived.size === 0) return [];
+			const refs: SessionRef[] = [];
+			for (const file of sessionFiles().files) {
+				const id = headerIdOf(file);
+				if (!id || !archived.has(id)) continue;
+				const ref = refFromFile(file, id);
+				if (ref) refs.push(ref);
+			}
+			return refs.sort(byModified);
+		} catch {
+			return [];
+		} finally {
+			archivedRefsInflight = undefined;
+		}
+	})();
+	const refs = await archivedRefsInflight;
+	archivedRefs = refs;
+	archivedRefsAt = now;
+	return refs;
 }
 
 /**
@@ -320,6 +409,117 @@ function findSessionFiles(ids: Set<string>): Map<string, string> {
 		found.set(headerId, file);
 	}
 	return found;
+}
+
+/**
+ * A session ref with the same fields `SessionManager.listAll()` reports:
+ * message count, first user message, last activity time and the latest name.
+ *
+ * Only called for the few sessions a picker shows (~8% of a real tree are not
+ * archived). One streaming pass over the file, no buffering of the whole
+ * transcript: `allMessagesText` is only used for fuzzy matching by the manager
+ * and is reconstructed from the first message here, which is all the picker
+ * ever reads.
+ */
+function readSessionRef(file: string): SessionRef | undefined {
+	let stat: fs.Stats;
+	try {
+		stat = fs.statSync(file);
+	} catch {
+		return undefined;
+	}
+	let fd: number | undefined;
+	try {
+		fd = fs.openSync(file, "r");
+		const buf = Buffer.alloc(1024 * 1024);
+		let pos = 0;
+		let carry = "";
+		let header: any;
+		let name: string | undefined;
+		let firstMessage = "";
+		let messageCount = 0;
+		let lastActivity: number | undefined;
+		let read: number;
+		while ((read = fs.readSync(fd, buf, 0, buf.length, pos)) > 0) {
+			pos += read;
+			const lines = (carry + buf.subarray(0, read).toString("utf8"))
+				.split("\n");
+			carry = lines.pop() ?? "";
+			for (const line of lines) {
+				if (!line) continue;
+				let entry: any;
+				try {
+					entry = JSON.parse(line);
+				} catch {
+					continue; // pi skips malformed lines too
+				}
+				if (!header) {
+					if (entry?.type !== "session") return undefined;
+					header = entry;
+					continue;
+				}
+				if (entry.type === "session_info") {
+					name = typeof entry.name === "string"
+						? entry.name.trim() || undefined
+						: undefined;
+					continue;
+				}
+				if (entry.type !== "message") continue;
+				const message = entry.message;
+				if (!message || typeof message.role !== "string") continue;
+				messageCount++;
+				if (message.role === "user" || message.role === "assistant") {
+					const at = (message as { timestamp?: number }).timestamp;
+					if (typeof at === "number" && Number.isFinite(at)) {
+						lastActivity = Math.max(lastActivity ?? 0, at);
+					}
+				}
+				if (!firstMessage && message.role === "user") {
+					firstMessage = messageText(message.content);
+				}
+			}
+		}
+		if (!header) return undefined;
+		const id = typeof header.id === "string" ? header.id : undefined;
+		if (!id) return undefined;
+		const headerTime = typeof header.timestamp === "string"
+			? new Date(header.timestamp).getTime()
+			: NaN;
+		const modified = lastActivity && lastActivity > 0
+			? new Date(lastActivity)
+			: Number.isFinite(headerTime)
+				? new Date(headerTime)
+				: stat.mtime;
+		const info = {
+			path: file,
+			id,
+			cwd: typeof header.cwd === "string" ? header.cwd : "",
+			name,
+			created: Number.isFinite(headerTime)
+				? new Date(headerTime)
+				: stat.mtime,
+			modified,
+			messageCount,
+			firstMessage: firstMessage || "(no messages)",
+			allMessagesText: firstMessage,
+		} as unknown as SessionInfo;
+		return { info, preview: previewOf(info), dir: shortDir(info.cwd) };
+	} catch {
+		return undefined;
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd);
+	}
+}
+
+/** Text blocks of a message's content, the way pi joins them for matching. */
+function messageText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((block: any) =>
+			block?.type === "text" && typeof block.text === "string")
+		.map((block: any) => block.text)
+		.join(" ");
 }
 
 /**
@@ -737,8 +937,9 @@ export default function (pi: ExtensionAPI): void {
 					);
 				}
 
-				const trigger = match[1]; // "@[", "@g[" or "@ga["
+				const trigger = match[1]; // "@[", "@a[", "@g[" or "@ga["
 				const query = match[2] ?? "";
+				const isArchivedOnly = trigger === "@a[";
 				const isGroupOnly = trigger === "@g[" || trigger === "@ga[";
 				const includeArchived = trigger === "@ga[";
 
@@ -795,7 +996,20 @@ export default function (pi: ExtensionAPI): void {
 				}
 
 				let sessions: SessionRef[];
-				if (isGroupOnly && groupSessionIds && currentGroupId) {
+				if (isArchivedOnly) {
+					sessions = await listArchivedSessions();
+					if (sessions.length === 0) {
+						return {
+							prefix: `${trigger}${query}`,
+							items: [{
+								value: "",
+								label: "(No archived sessions)",
+								description:
+									"Nothing archived; @[ lists active sessions",
+							}],
+						};
+					}
+				} else if (isGroupOnly && groupSessionIds && currentGroupId) {
 					// Filename resolution: only this group's files are touched, so the
 					// picker doesn't read the whole session tree on every keystroke.
 					sessions = await listGroupSessions(
@@ -826,7 +1040,7 @@ export default function (pi: ExtensionAPI): void {
 						};
 					}
 				} else {
-					sessions = await listSessions();
+					sessions = await listActiveSessions();
 				}
 
 				const matches = query
@@ -896,7 +1110,7 @@ export default function (pi: ExtensionAPI): void {
 					);
 				}
 
-				const trigger = match[1]; // "@[", "@g[" or "@ga["
+				const trigger = match[1]; // "@[", "@a[", "@g[" or "@ga["
 				const query = match[2] ?? "";
 				const tokenStart = cursorCol - (query.length + trigger.length);
 

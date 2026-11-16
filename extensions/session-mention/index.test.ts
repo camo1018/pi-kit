@@ -10,29 +10,21 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import sessionMention, { clearSessionCache } from "./index.ts";
 
-const info = {
-	id: "session-id",
-	name: "shared title",
-	path: "/missing/session.jsonl",
-	cwd: "/tmp/project",
-	firstMessage: "first prompt",
-	messageCount: 2,
-	modified: new Date(),
-} as SessionInfo;
-
-const infoInGroup = {
-	id: "session-in-group",
-	name: "group sibling title",
-	path: "/missing/sibling.jsonl",
-	cwd: "/tmp/project",
-	firstMessage: "sibling prompt",
-	messageCount: 3,
-	modified: new Date(),
-} as SessionInfo;
-
 test("expands only the request clone and autocomplete inserts the id", async () => {
-	const originalListAll = SessionManager.listAll;
-	(SessionManager as any).listAll = async () => [info];
+	clearSessionCache();
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mention-test-"));
+	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = tmpDir;
+	// Real files, not a listAll stub: expansion and the picker both read the
+	// session tree themselves now, so a stub would leave the real path untested
+	// (and silently back on the archived-scan cost).
+	writeSession(tmpDir, "--tmp-project--", "session-id", {
+		name: "shared title",
+	});
+	fs.writeFileSync(
+		path.join(tmpDir, "inbox.json"),
+		JSON.stringify({ version: 1, sessions: {} }),
+	);
 	const handlers = new Map<string, (...args: any[]) => any>();
 	const pi = {
 		on(event: string, handler: (...args: any[]) => any) {
@@ -93,7 +85,8 @@ test("expands only the request clone and autocomplete inserts the id", async () 
 		);
 		assert.deepEqual(applied.lines, ["hello @[session-id] "]);
 	} finally {
-		(SessionManager as any).listAll = originalListAll;
+		process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}
 });
 
@@ -222,7 +215,8 @@ test("@g[ filters specifically for other sessions in the same group", async () =
 			3,
 			{},
 		);
-		// Only infoInGroup should be returned, NOT info (which is in grp-2) and NOT current-session
+		// Only the grp-1 sibling is returned, NOT the grp-2 one and NOT
+		// current-session.
 		assert.equal(suggestions.items.length, 1);
 		assert.equal(suggestions.items[0].value, "@[session-in-group]");
 		assert.equal(suggestions.items[0].label, "group sibling title");
@@ -240,16 +234,6 @@ test("@g[ filters specifically for other sessions in the same group", async () =
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}
 });
-
-const infoArchived = {
-	id: "session-archived",
-	name: "archived sibling title",
-	path: "/missing/archived.jsonl",
-	cwd: "/tmp/project",
-	firstMessage: "archived sibling prompt",
-	messageCount: 4,
-	modified: new Date(),
-} as SessionInfo;
 
 function groupFixture(tmpDir: string) {
 	fs.writeFileSync(
@@ -923,6 +907,158 @@ test("@g[ finds a member whose transcript file was renamed", async () => {
 		assert.equal(suggestions.items[0].label, "a renamed sibling");
 	} finally {
 		(SessionManager as any).listAll = originalListAll;
+		process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("@[ lists only unarchived sessions, skipping archived files entirely", async () => {
+	clearSessionCache();
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mention-test-"));
+	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = tmpDir;
+
+	fs.writeFileSync(
+		path.join(tmpDir, "inbox.json"),
+		JSON.stringify({
+			version: 1,
+			sessions: { "old-archived": { archivedAt: 1 } },
+		}),
+	);
+	writeSession(tmpDir, "--tmp-project--", "live-one", {
+		name: "a live session",
+	});
+	// Valid and non-empty, so it appears in the list unless the archive filter
+	// actually ran.
+	writeSession(tmpDir, "--tmp-other--", "old-archived", {
+		name: "an archived session",
+		messages: 4,
+	});
+
+	const originalListAll = SessionManager.listAll;
+	(SessionManager as any).listAll = async () => {
+		throw new Error("@[ must not full-scan for an active-only list");
+	};
+
+	try {
+		const suggestions = await suggestionsFor("@[", "current-session");
+		assert.deepEqual(
+			suggestions.items.map((item: any) => item.value),
+			["@[live-one]"],
+		);
+	} finally {
+		(SessionManager as any).listAll = originalListAll;
+		process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("@a[ lists archived sessions only, without a full scan", async () => {
+	clearSessionCache();
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mention-test-"));
+	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = tmpDir;
+
+	fs.writeFileSync(
+		path.join(tmpDir, "inbox.json"),
+		JSON.stringify({
+			version: 1,
+			sessions: {
+				"old-archived": { archivedAt: 1 },
+				"older-archived": { archivedAt: 2 },
+			},
+		}),
+	);
+	writeSession(tmpDir, "--tmp-project--", "live-one", {
+		name: "a live session",
+	});
+	writeSession(tmpDir, "--tmp-project--", "old-archived", {
+		name: "an archived session",
+	});
+	writeSession(tmpDir, "--tmp-other--", "older-archived", {
+		name: "an older archived session",
+	});
+
+	// `@a[` is the one picker that must read archived transcripts' neighbours,
+	// but pi's full scan parses every line of every archived file. Stub it to
+	// throw so a regression to listAll() is loud rather than slow.
+	const originalListAll = SessionManager.listAll;
+	(SessionManager as any).listAll = async () => {
+		throw new Error("@a[ must not full-scan the session tree");
+	};
+
+	try {
+		const suggestions = await suggestionsFor("@a[", "current-session");
+		const values = suggestions.items.map((item: any) => item.value).sort();
+		assert.deepEqual(values, ["@[old-archived]", "@[older-archived]"]);
+		assert.equal(suggestions.prefix, "@a[");
+		const archived = suggestions.items.find(
+			(item: any) => item.value === "@[old-archived]",
+		);
+		assert.equal(archived.label, "an archived session");
+	} finally {
+		(SessionManager as any).listAll = originalListAll;
+		process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("@a[ shows a placeholder when nothing is archived", async () => {
+	clearSessionCache();
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mention-test-"));
+	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = tmpDir;
+
+	fs.writeFileSync(
+		path.join(tmpDir, "inbox.json"),
+		JSON.stringify({ version: 1, sessions: {} }),
+	);
+	writeSession(tmpDir, "--tmp-project--", "live-one", {
+		name: "a live session",
+	});
+
+	try {
+		const suggestions = await suggestionsFor("@a[", "current-session");
+		assert.equal(suggestions.items.length, 1);
+		assert.equal(suggestions.items[0].value, "");
+		assert.equal(suggestions.items[0].label, "(No archived sessions)");
+	} finally {
+		process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("an archived session still expands, so @a[ references resolve", async () => {
+	clearSessionCache();
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mention-test-"));
+	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = tmpDir;
+
+	fs.writeFileSync(
+		path.join(tmpDir, "inbox.json"),
+		JSON.stringify({
+			version: 1,
+			sessions: { "old-archived": { archivedAt: 1 } },
+		}),
+	);
+	writeSession(tmpDir, "--tmp-project--", "old-archived", {
+		name: "an archived session",
+	});
+
+	const handlers = new Map<string, (...args: any[]) => any>();
+	sessionMention({
+		on(event: string, handler: (...args: any[]) => any) {
+			handlers.set(event, handler);
+		},
+	} as unknown as ExtensionAPI);
+
+	try {
+		const message = { role: "user", content: "recall @[old-archived]" };
+		await handlers.get("context")?.({ messages: [message] });
+		// Archiving hides a session from the pickers, not from expansion: an id
+		// inserted by `@a[` would be dead otherwise.
+		assert.match(message.content, /«an archived session»/);
+	} finally {
 		process.env.PI_CODING_AGENT_DIR = originalAgentDir;
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}
