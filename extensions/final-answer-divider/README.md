@@ -53,14 +53,9 @@ ordinary scroll surface — this key only ever jumps to the latest one.
 
 `ctrl+f` is a single control byte (`0x06`), so it arrives identically under the
 legacy, xterm `modifyOtherKeys`, and kitty keyboard protocols — no modifier
-support is needed from the terminal at all. The longer chords that *look* more
-conventional are worse here:
-
-- **`alt+g`** — unusable. iTerm2 ships `Option Key Sends = Normal`, which
-  composes Option+letter into a character, so `⌥g` arrives as `©`. The chord
-  never reaches pi unless the user changes a terminal setting.
-- **`ctrl+shift+g`** — works, but needs a terminal that reports the shift
-  modifier distinctly (kitty protocol or `modifyOtherKeys`).
+support is needed from the terminal at all. A chord with a modifier (a
+`ctrl+shift+…` combination) instead depends on the terminal reporting shift
+distinctly, which is exactly the kind of thing that silently stops working.
 
 ### This takes over `ctrl+f`
 

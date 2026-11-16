@@ -262,11 +262,9 @@ export default function finalAnswerDivider(pi: ExtensionAPI) {
 		return markdown;
 	});
 
-	// ctrl+f. Chosen over the more conventional ctrl+shift+g / alt+g because it
-	// is a single control byte (0x06): it arrives identically under the legacy,
-	// xterm modifyOtherKeys, and kitty protocols, so it needs no modifier
-	// support from the terminal. alt+g is unusable here (iTerm2's default
-	// "Option Key Sends = Normal" composes Option+letter, so ⌥g arrives as "©").
+	// ctrl+f, because it is a single control byte (0x06): it arrives identically
+	// under the legacy, xterm modifyOtherKeys, and kitty protocols, so it needs
+	// no modifier support from the terminal.
 	//
 	// This takes over `tui.editor.cursorRight` ("move cursor right", also →).
 	// That is safe and deliberate: extension shortcuts are dispatched BEFORE any
