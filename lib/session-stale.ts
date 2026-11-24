@@ -61,6 +61,57 @@ export interface StaleCheck {
  *   - A KNOWN tip with a different in-memory leaf is a deliberate /tree
  *     navigation, and must not read as staleness.
  */
+/**
+ * The leaf a message may pin before its run spawns, plus the disk tip it was
+ * captured against. Computed at SEND time, where the sender's view is known.
+ *
+ * A spawn is `pi --session <path>` with no leaf argument, so a child resumes on
+ * the file's LAST line. The pin exists for one case: the user navigated with
+ * `/tree` to an older branch and typed. Without a marker that position is
+ * silently discarded.
+ *
+ * The trap is that the same mechanism fires on a plain QUEUED message. A reply
+ * typed while a run is in flight captures the host's in-memory leaf, which is
+ * behind what that run is writing; pinning it later branches the transcript
+ * back and strands the finished run's entries on a dead sibling -- the
+ * "queueing a message starts a new branch" symptom.
+ *
+ * `staleAgainstDisk` already draws that line: a disk tip this process has never
+ * seen is a writer's, while a KNOWN tip with a different in-memory leaf is
+ * deliberate navigation. So a stale sender pins the DISK TIP (continue where the
+ * conversation actually is) and a fresh one pins the branch on screen.
+ */
+export function pinnedLeafFor(
+	sm: ReadonlySessionManager,
+	file?: string,
+): { leaf?: string; tip?: string } {
+	const check = staleAgainstDisk(sm, file);
+	const tip = check.diskLastId;
+	if (check.stale) return { leaf: tip, tip };
+	const leaf = sm.getLeafId() ?? undefined;
+	return { leaf, tip: tip ?? leaf };
+}
+
+/**
+ * Should `run()` write a tree-position marker for `leaf`?
+ *
+ * Only when the file still ends where the sender saw it. If the tip moved, a
+ * run wrote past the captured leaf and continuing the tip is correct in every
+ * case -- a deliberate `/tree` does not move the tip, so this cannot cancel the
+ * navigation it exists to preserve.
+ */
+export function shouldPinLeaf(
+	sm: ReadonlySessionManager,
+	opts: { leaf?: string; capturedTip?: string },
+): boolean {
+	const { leaf, capturedTip } = opts;
+	if (!leaf || capturedTip === undefined) return false;
+	const tipNow = sm.getLeafId();
+	if (!tipNow || tipNow !== capturedTip || tipNow === leaf) return false;
+	// Only a leaf this session actually has, or the marker points at nothing.
+	return sm.getEntry(leaf) !== undefined;
+}
+
 export function staleAgainstDisk(
 	sm: ReadonlySessionManager,
 	file?: string,

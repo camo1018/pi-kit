@@ -117,7 +117,7 @@ import { registerLoadedExtension } from "../../lib/loaded-extensions.ts";
 import {
 	beforeRun, branchName, selectedHistory, sourceName,
 } from "../../lib/session-branch.ts";
-import { staleAgainstDisk } from "../../lib/session-stale.ts";
+import { pinnedLeafFor, staleAgainstDisk } from "../../lib/session-stale.ts";
 import { writeClone as writeCloneFile } from "../../lib/session-clone.ts";
 import { handleVisitModelInput } from "./visit-models.ts";
 import { openModelPicker } from "../model-picker/picker.ts";
@@ -7505,15 +7505,17 @@ export default function (pi: ExtensionAPI) {
 				);
 			// The visit's model comes from its own saved/pending choice, never
 			// from the hidden foreground runtime used to host this view.
-			// The visit renders its own branch from disk, so pin the session's
-			// current tip rather than whatever the hidden main is showing.
+			// The visit renders its own branch from disk, so the leaf comes from a
+			// fresh open of the file rather than the hidden main's view. A fresh open
+			// knows every entry, so it never reports itself stale and a plain queued
+			// reply adds no marker.
 			sendToAgent({
 				id: v.id,
 				cwd: v.cwd,
 				sessionFile: v.file,
 				title: v.title,
 				text,
-				leaf: SessionManager.open(v.file).getLeafId() ?? undefined,
+				...pinnedLeafFor(SessionManager.open(v.file), v.file),
 			});
 			showModeWidget(ctx);
 			showLiveStream(ctx); // queued count / running state may have changed
@@ -7577,8 +7579,14 @@ export default function (pi: ExtensionAPI) {
 				title,
 				text,
 				model: currentModel(ctx),
-				// The branch on screen, which `/tree` may have moved off the tip.
-				leaf: ctx.sessionManager.getLeafId() ?? undefined,
+				// The branch on screen, which `/tree` may have moved off the tip. When
+				// this process is BEHIND the file (a reply queued while a run is
+				// writing), that branch is a stale ancestor and pinning it forks the
+				// tree -- so `pinnedLeafFor` pins the disk tip instead.
+				...pinnedLeafFor(
+					ctx.sessionManager,
+					ctx.sessionManager.getSessionFile(),
+				),
 			});
 			modeState().wasRunning.add(id);
 			// No notify() here: in pi that's a permanent chat line, so "Queued" outlived the delivery.

@@ -38,6 +38,7 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
 	BACKGROUND_MCP_AUTO_APPROVE_ENV,
 } from "./background-mcp-approval.ts";
+import { shouldPinLeaf } from "./session-stale.ts";
 import { getAgentDir, getMarkdownTheme, SessionManager, type Theme } from "@earendil-works/pi-coding-agent";
 import { type KeybindingsManager, Markdown, matchesKey, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
@@ -84,6 +85,17 @@ export interface BgAgent {
 	 * I typed" -- which is also correct for a message that waits in `pending`.
 	 */
 	nextRunLeaf?: string;
+	/**
+	 * Disk tip the leaf above was captured against.
+	 *
+	 * A pin is only safe while the file still ends where the sender saw it.
+	 * A message QUEUED behind a running agent captures the host's in-memory
+	 * leaf, which that run has usually already written past; pinning it then
+	 * branches the transcript back and strands the finished run's entries on a
+	 * dead sibling. `shouldPinLeaf` compares this to the tip at spawn time and
+	 * drops a pin whose tip has moved.
+	 */
+	nextRunLeafTip?: string;
 	/** Bytes of the event file consumed so far. */
 	outOffset?: number;
 	createdAt: number;
@@ -470,6 +482,8 @@ interface SavedAgent {
 	runBaseLeafId?: string | null;
 	/** Leaf the next run must resume on; see `BgAgent.nextRunLeaf`. */
 	nextRunLeaf?: string;
+	/** Disk tip `nextRunLeaf` was captured against. */
+	nextRunLeafTip?: string;
 	createdAt: number;
 	updatedAt: number;
 	runs: number;
@@ -555,6 +569,7 @@ function persist(a: BgAgent) {
 		runStartedAt: a.runStartedAt,
 		runBaseLeafId: a.runBaseLeafId,
 		nextRunLeaf: a.nextRunLeaf,
+		nextRunLeafTip: a.nextRunLeafTip,
 		createdAt: a.createdAt,
 		updatedAt: a.updatedAt,
 		runs: a.runs,
@@ -977,6 +992,7 @@ function adopt(s: SavedAgent) {
 		a.runStartedAt = s.runStartedAt;
 		a.runBaseLeafId = s.runBaseLeafId;
 		a.nextRunLeaf = s.nextRunLeaf;
+		a.nextRunLeafTip = s.nextRunLeafTip;
 		a.outOffset = 0; // replay the run so far
 		a.liveRun = newLiveRun();
 		if (s.runPrompt) {
@@ -1424,7 +1440,9 @@ function run(a: BgAgent) {
 	// Capture before the child can append its prompt or any tool steps.
 	a.runStartedAt = Date.now();
 	const resumeLeaf = a.nextRunLeaf;
+	const resumeLeafTip = a.nextRunLeafTip;
 	a.nextRunLeaf = undefined;
+	a.nextRunLeafTip = undefined;
 	a.runBaseLeafId = a.sessionFile && fs.existsSync(a.sessionFile)
 		? SessionManager.open(a.sessionFile).getLeafId() : null;
 	// Pin the caller's view before spawning. There is no leaf argument on the
@@ -1432,12 +1450,15 @@ function run(a: BgAgent) {
 	// this a `/tree` position is silently discarded and the prompt continues the
 	// newest branch instead. The marker is the same mechanism `tree-position`
 	// uses, and the last line of the file then IS the chosen leaf.
+	//
+	// `shouldPinLeaf` refuses a pin whose tip has moved: a message QUEUED behind a
+	// running agent captured the host's in-memory leaf, which that run wrote past.
+	// Pinning it here is what forked the transcript and stranded the run's work on
+	// a dead sibling, so continuing the tip is the fix for that symptom.
 	if (resumeLeaf && a.sessionFile && fs.existsSync(a.sessionFile)) {
 		try {
 			const sm = SessionManager.open(a.sessionFile);
-			// Only when it would otherwise resume somewhere else: an ordinary
-			// send already lands on the tip and does not need another marker.
-			if (sm.getLeafId() !== resumeLeaf && sm.getEntry(resumeLeaf)) {
+			if (shouldPinLeaf(sm, { leaf: resumeLeaf, capturedTip: resumeLeafTip })) {
 				sm.branch(resumeLeaf);
 				sm.appendCustomEntry("pi-kit.tree-position", {});
 			}
@@ -1976,11 +1997,16 @@ export function sendToAgent(opts: {
 	id: string; cwd: string; sessionFile?: string; title: string;
 	text: string; model?: string; extensionPaths?: string[];
 	/**
-	 * Leaf the sender was viewing. Pins where the child resumes, so a `/tree`
-	 * position survives the delegated spawn instead of the prompt landing on the
-	 * file's newest line. Omit for a background worker with no branch on screen.
+	 * Leaf the sender was viewing, and the disk tip it saw; from `pinnedLeafFor`.
+	 * Pins where the child resumes so a `/tree` position survives the delegated
+	 * spawn instead of the prompt landing on the file's newest line. The tip is
+	 * recorded so `run()` can drop a pin that a later writer invalidated -- the
+	 * queued-message case that used to fork the transcript. Omit both for a
+	 * background worker with no branch on screen.
 	 */
 	leaf?: string;
+	/** Disk tip at SEND time; see `leaf`. */
+	tip?: string;
 }): BgAgent {
 	let a = getAgent(opts.id);
 	if (!a) {
@@ -2002,7 +2028,10 @@ export function sendToAgent(opts: {
 		registry().agents.set(a.id, a);
 	}
 	a.pending.push(opts.text);
-	if (opts.leaf) a.nextRunLeaf = opts.leaf;
+	if (opts.leaf) {
+		a.nextRunLeaf = opts.leaf;
+		a.nextRunLeafTip = opts.tip;
+	}
 	if (opts.extensionPaths) a.extensionPaths = opts.extensionPaths;
 	if (opts.model) {
 		a.nextModel = opts.model;
