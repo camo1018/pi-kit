@@ -1899,6 +1899,84 @@ function printable(data: string): string | undefined {
 	return undefined;
 }
 
+// ────────────────────────── addon header providers ───────────────────────────
+
+/**
+ * Addons (e.g. `extensions/inbox-questions`) can contribute a short segment to the
+ * orchestrator header, next to `agents: …`. A provider is a plain function so the
+ * inbox keeps no dependency on the addon and keeps working if it is not installed.
+ *
+ * Registered on globalThis because the extension is re-instantiated on every
+ * session switch; re-registering replaces, so /reload cannot stack providers.
+ */
+const HEADER_PROVIDERS_KEY = Symbol.for("pi.inbox.headerProviders");
+
+export interface InboxHeaderProvider {
+	/** Stable id, so re-registering replaces instead of duplicating. */
+	id: string;
+	/** Return the segment text (already plain), or undefined for none. */
+	text: () => string | undefined;
+	/** Optional: return true to consume the `q` key before the inbox closes. */
+	onQuitKey?: () => boolean;
+}
+
+function headerProviders(): InboxHeaderProvider[] {
+	const g = globalThis as any;
+	return (g[HEADER_PROVIDERS_KEY] ??= []) as InboxHeaderProvider[];
+}
+
+/** Register (or replace) a header provider. Returns an unregister function. */
+export function registerInboxHeaderProvider(provider: InboxHeaderProvider): () => void {
+	const list = headerProviders();
+	const i = list.findIndex((p) => p.id === provider.id);
+	if (i >= 0) list[i] = provider;
+	else list.push(provider);
+	return () => {
+		const cur = headerProviders();
+		const j = cur.findIndex((p) => p.id === provider.id);
+		if (j >= 0) cur.splice(j, 1);
+	};
+}
+
+function addonHeaderSegments(): string[] {
+	return headerProviders()
+		.map((p) => {
+			try {
+				return p.text();
+			} catch {
+				return undefined;
+			}
+		})
+		.filter((t): t is string => !!t);
+}
+
+/**
+ * Should an addon take this `q` instead of the inbox's own handling?
+ *
+ * Precedence, in order:
+ *  - ctrl+c is never an addon key (it is the quit gesture);
+ *  - while a search query is active, `q` clears the query first;
+ *  - otherwise the first addon that returns true owns the key.
+ */
+export function addonClaimsQuit(data: string, query: string | undefined): boolean {
+	if (matchesKey(data, "ctrl+c")) return false;
+	if (query) return false;
+	if (printable(data) !== "q") return false;
+	return addonConsumesQuit();
+}
+
+/** Let an addon claim `q`. Returns true when something consumed it. */
+function addonConsumesQuit(): boolean {
+	for (const p of headerProviders()) {
+		try {
+			if (p.onQuitKey?.()) return true;
+		} catch {
+			// a broken addon must not break the inbox
+		}
+	}
+	return false;
+}
+
 // ───────────────────────────── UI component ─────────────────────────────
 
 type View = "inbox" | "archived" | "all" | "filtered";
@@ -2470,6 +2548,8 @@ class InboxComponent {
 			matchesKey(data, "ctrl+c") ||
 			ch === "q"
 		) {
+			// An addon with its own screen gets first refusal on plain `q`.
+			if (addonClaimsQuit(data, this.state.query)) return;
 			if (this.state.query) {
 				this.state.query = "";
 				this.rebuild();
@@ -2623,6 +2703,7 @@ class InboxComponent {
 
 		// top border with title
 		const summary = orchestrating() ? agentsSummary() : undefined;
+		const addons = addonHeaderSegments();
 		const preview = process.env.PI_INBOX_PREVIEW_DIR === AGENT_DIR;
 		const heading = orchestrating()
 			? "📥 Pi Inbox · orchestrator" : "📥 Pi Inbox";
@@ -2636,6 +2717,7 @@ class InboxComponent {
 			th.bold(th.fg("accent", defaultName)) +
 			(preview ? th.bold(th.fg("warning", " · PREVIEW")) : "") +
 			(summary ? th.fg("dim", `  ${summary}`) : "") +
+			addons.map((t) => th.fg("warning", `  ${t}`)).join("") +
 			" ";
 		const spin = this.loading ? th.fg("dim", " ⟳ ") : "";
 		out.push(
