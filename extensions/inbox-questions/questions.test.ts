@@ -7,6 +7,7 @@ import { after, test } from "node:test";
 const home = mkdtempSync(join(tmpdir(), "pi-questions-"));
 const oldState = process.env.JIRA_AUTOPILOT_STATE;
 process.env.JIRA_AUTOPILOT_STATE = home;
+process.env.PR_AUTOPILOT_STATE = join(home, "pr");
 
 const { readQuestions, openCount, wrap, writeAnswer } = await import("./index.ts");
 
@@ -182,4 +183,12 @@ test("a resolved record is neither listed nor counted", () => {
 	});
 	assert.equal(readQuestions().filter((q) => q.key === "X#1").length, 0);
 	assert.equal(openCount(), 0);
+});
+
+// ── test isolation ───────────────────────────────────────────────────────────
+// Guard against ever reading or writing the live queue again.
+
+test("the test harness never points at real state", () => {
+	const dir = process.env.JIRA_AUTOPILOT_STATE ?? "";
+	assert.ok(dir.startsWith(tmpdir()), `refusing to run against real state: ${dir}`);
 });

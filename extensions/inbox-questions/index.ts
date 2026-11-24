@@ -214,7 +214,10 @@ export default function (pi: ExtensionAPI) {
 		},
 		onQuitKey: () => {
 			if (!openCount()) return false;
-			openScreen?.();
+			// Defer: the inbox is closing its overlay in the same key handler, and a
+			// command needs a fresh command context after that has unwound. Sending
+			// synchronously here loses the message (or renders under the overlay).
+			setTimeout(() => openScreen?.(), 50);
 			return true;
 		},
 	});
@@ -271,14 +274,7 @@ async function showQuestions(ctx: ExtensionContext, initial: Question[]): Promis
 		if (!action) return;
 		const q = items.find((x) => x.key === action.key);
 		if (!q) return;
-		let answer = action.answer;
-		if (answer === "\u0000option") {
-			// Quick-pick one of the offered options.
-			const opts = q.options.map((o) => `${o.id}: ${o.text}`);
-			const pick = await ctx.ui.select(`Answer ${q.key}`, opts);
-			if (!pick) continue;
-			answer = pick.split(":")[0].trim();
-		}
+		const answer = action.answer;
 		writeAnswer(q, answer);
 		ctx.ui.notify(`${q.key} answered: ${answer.slice(0, 60)}`, "info");
 		items = readQuestions();
@@ -291,8 +287,103 @@ async function showQuestions(ctx: ExtensionContext, initial: Question[]): Promis
 
 type ScreenAction = { key: string; answer: string } | undefined;
 
+/**
+ * The answer-mode state machine, kept pure so it is testable without a TUI.
+ *
+ * Nested dialogs are unusable inside a focused overlay (they render underneath),
+ * so text entry and option picking are handled here. `feed` takes one raw key
+ * chunk and returns the next state plus a completion when the user is done.
+ */
+export interface AnswerState {
+	mode: "list" | "option" | "text";
+	optCursor: number;
+	draft: string;
+}
+
+export interface AnswerStep {
+	state: AnswerState;
+	/** Set when the user finished answering. */
+	done?: { answer: string };
+	/** Set when the user asked to leave the screen. */
+	close?: true;
+	/** Set when the user wants to move the list cursor instead. */
+	move?: "up" | "down";
+}
+
+const KEY = {
+	esc: (d: string) => matchesKey(d, Key.escape),
+	enter: (d: string) => matchesKey(d, Key.enter) || matchesKey(d, Key.return) || d === "\r",
+	up: (d: string) => matchesKey(d, Key.up) || d === "k",
+	down: (d: string) => matchesKey(d, Key.down) || d === "j",
+	backspace: (d: string) => matchesKey(d, Key.backspace) || d === "\u007f",
+	/**
+	 * Printable text. Accepts a multi-character chunk too: a bracketed paste
+	 * arrives as one chunk, and dropping all but a single key would silently eat
+	 * most of a pasted answer.
+	 */
+	printable: (d: string) =>
+		d.length > 0 && [...d].every((c) => c.charCodeAt(0) >= 32 && c.charCodeAt(0) !== 127),
+};
+
+export function feedAnswer(
+	st: AnswerState,
+	data: string,
+	ctx: { canAnswer: boolean; optionCount: number },
+): AnswerStep {
+	if (st.mode === "option") {
+		if (KEY.esc(data) || data === "q") return { state: { ...st, mode: "list" } };
+		if (KEY.up(data)) return { state: { ...st, optCursor: Math.max(0, st.optCursor - 1) } };
+		if (KEY.down(data))
+			return { state: { ...st, optCursor: Math.min(ctx.optionCount - 1, st.optCursor + 1) } };
+		if (KEY.enter(data) && ctx.optionCount > 0) {
+			return { state: { ...st, mode: "list" }, done: { answer: String(st.optCursor) } };
+		}
+		return { state: st };
+	}
+
+	if (st.mode === "text") {
+		if (KEY.esc(data)) return { state: { mode: "list", optCursor: 0, draft: "" } };
+		if (KEY.enter(data)) {
+			const text = st.draft.trim();
+			if (text) return { state: { mode: "list", optCursor: 0, draft: "" }, done: { answer: text } };
+			return { state: { mode: "list", optCursor: 0, draft: "" } };
+		}
+		if (KEY.backspace(data))
+			return { state: { ...st, draft: st.draft.slice(0, -1) } };
+		if (KEY.printable(data)) return { state: { ...st, draft: st.draft + data } };
+		return { state: st };
+	}
+
+	// list mode
+	if (KEY.esc(data) || data === "q") return { state: st, close: true };
+	if (data === "a" && ctx.canAnswer) return { state: { mode: "text", optCursor: 0, draft: "" } };
+	if (data === "o" && ctx.canAnswer && ctx.optionCount > 0)
+		return { state: { mode: "option", optCursor: 0, draft: "" } };
+	if (/^[1-9]$/.test(data) && ctx.canAnswer) {
+		const i = Number(data) - 1;
+		if (i < ctx.optionCount) return { state: st, done: { answer: String(i) } };
+	}
+	if (KEY.up(data)) return { state: st, move: "up" };
+	if (KEY.down(data)) return { state: st, move: "down" };
+	return { state: st };
+}
+
+
 /** One pass of the list UI; resolves with an answer action or undefined to close. */
 async function runQuestionScreen(ctx: ExtensionContext, items: Question[]): Promise<ScreenAction> {
+	// The inbox is itself a full-screen overlay in orchestrator mode, so a plain
+	// `ui.custom()` screen renders UNDERNEATH it and never becomes visible. Match
+	// the inbox's own presentation: an overlay that covers the same area.
+	const opts = {
+		overlay: true,
+		overlayOptions: {
+			width: "100%" as const,
+			maxHeight: "100%" as const,
+			anchor: "top-left" as const,
+			margin: 0,
+		},
+	};
+
 	return ctx.ui.custom<ScreenAction>((tui, theme, _kb, done) => {
 		let selected = 0;
 		const open = items.filter((q) => q.state === "open");
@@ -346,43 +437,61 @@ async function runQuestionScreen(ctx: ExtensionContext, items: Question[]): Prom
 			return out;
 		};
 
+		// Two modes, both handled by THIS component. Nested dialogs (`ctx.ui.input`,
+		// `ctx.ui.select`) are not usable here: a focused overlay retains input
+		// ownership, so a dialog opened from inside it is drawn underneath and never
+		// appears. The inbox avoids them for the same reason and renders its own.
+		let st: AnswerState = { mode: "list", optCursor: 0, draft: "" };
+
+		const renderAnswerPrompt = () => {
+			const cur = rows[selected];
+			const w = 78;
+			const out: string[] = [];
+			out.push(theme.fg("accent", "─".repeat(w)));
+			out.push(` Answer ${theme.bold(cur?.key ?? "")}`);
+			out.push(theme.fg("accent", "─".repeat(w)));
+			if (st.mode === "option") {
+				(cur?.options ?? []).forEach((o, i) => {
+					const isSel = i === st.optCursor;
+					const label = `  ${o.id}: ${o.text}`;
+					out.push(isSel ? theme.bg("selectedBg", theme.bold(truncateToWidth(label, w)))
+						: truncateToWidth(label, w));
+				});
+				out.push("");
+				out.push(theme.fg("dim", " ↑↓ choose · enter answer · esc back"));
+			} else {
+				out.push("");
+				out.push(` ${st.draft}${theme.fg("accent", "▏")}`);
+				out.push("");
+				out.push(theme.fg("dim", " type your answer · enter save · esc back"));
+			}
+			return out;
+		};
+
 		return {
-			render: () => lines(),
+			render: () => (st.mode === "list" ? lines() : renderAnswerPrompt()),
 			invalidate: () => {},
 			handleInput: (data: string) => {
-				if (matchesKey(data, Key.escape) || data === "q") return done(undefined);
 				const cur = rows[selected];
-				if (data === "a") {
-					if (!cur || cur.state !== "open") return;
-					// Free-text answer; the dialog handles its own input loop.
-					ctx.ui.input(`Answer ${cur.key} (empty to cancel)`, "e.g. B — or your own reasoning")
-						.then((text) => {
-							if (text && text.trim()) done({ key: cur.key, answer: text.trim() });
-						});
-					return;
+				const step = feedAnswer(st, data, {
+					canAnswer: !!cur && cur.state === "open",
+					optionCount: cur?.options.length ?? 0,
+				});
+				st = step.state;
+				if (step.close) return done(undefined);
+				if (step.done) {
+					// Option picks come back as an index; resolve to the option id.
+					const a = /^\d+$/.test(step.done.answer)
+						? (cur?.options[Number(step.done.answer)]?.id ?? step.done.answer)
+						: step.done.answer;
+					return done({ key: cur!.key, answer: a });
 				}
-				if (data === "o") {
-					if (!cur || cur.state !== "open" || !cur.options.length) return;
-					done({ key: cur.key, answer: "\u0000option" });
-					return;
-				}
-				// Number keys answer with that option directly.
-				if (cur && cur.state === "open" && /^[1-9]$/.test(data)) {
-					const opt = cur.options[Number(data) - 1];
-					if (opt) {
-						done({ key: cur.key, answer: opt.id });
-						return;
-					}
-				}
-				if (matchesKey(data, Key.up) || data === "k") {
-					selected = Math.max(0, selected - 1);
-				} else if (matchesKey(data, Key.down) || data === "j") {
-					selected = Math.min(rows.length - 1, selected + 1);
-				} else return;
+				if (step.move === "up") selected = Math.max(0, selected - 1);
+				else if (step.move === "down") selected = Math.min(rows.length - 1, selected + 1);
 				tui.requestRender();
 			},
 		};
-	});
+	}, opts);
 }
 
 /**
@@ -400,6 +509,38 @@ function writeAnswer(q: Question, answer: string): void {
 	const tmp = `${dest}.tmp`;
 	fs.writeFileSync(tmp, JSON.stringify(rec, null, 1) + "\n");
 	fs.renameSync(tmp, dest);
+	// Keep the producer's markdown queue in step. `questions.md` is authoritative
+	// for sync, so an answer recorded only here would be reverted to open on the
+	// next pass — writing both sources means the answer survives either path.
+	recordAnswerInMarkdown(dest, q.key, answer);
+}
+
+/**
+ * Mirror an answer into the markdown queue that sits beside the records
+ * (`<state>/questions.md`, one dir up from `…/questions/`). Best effort: the
+ * JSON record is the machine contract, this is for the human and for `sync`.
+ */
+function recordAnswerInMarkdown(recordPath: string, key: string, answer: string): void {
+	try {
+		const md = path.join(path.dirname(path.dirname(recordPath)), "questions.md");
+		if (!fs.existsSync(md)) return;
+		const text = fs.readFileSync(md, "utf-8");
+		// Replace the placeholder inside this key's block only.
+		const head = `## ${key} `;
+		const start = text.indexOf(head);
+		if (start < 0) return;
+		const next = text.indexOf("\n## ", start + head.length);
+		const end = next < 0 ? text.length : next;
+		const block = text.slice(start, end);
+		if (!/^\*\*Answer:\*\*/m.test(block)) return;
+		const updated = block.replace(/^\*\*Answer:\*\*.*$/m, `**Answer:** ${answer}`);
+		if (updated === block) return;
+		const tmp = `${md}.tmp`;
+		fs.writeFileSync(tmp, text.slice(0, start) + updated + text.slice(end));
+		fs.renameSync(tmp, md);
+	} catch {
+		// Never fail an answer because the markdown mirror could not be written.
+	}
 }
 
 /** Small greedy wrapper so long context lines stay inside the panel. */
